@@ -25,8 +25,8 @@ export default function () {
 
     const { teams } = useContext(TeamsContext);
     const team = getCurrentTeam(location, teams);
-    const [projects, setProjects] = useState<Project[]>([]);
-    const [lastPrebuilds, setLastPrebuilds] = useState<Map<string, PrebuildInfo>>(new Map());
+    const [ projects, setProjects ] = useState<Project[]>([]);
+    const [ lastPrebuilds, setLastPrebuilds ] = useState<Map<string, PrebuildInfo>>(new Map());
 
     const { isDark } = useContext(ThemeContext);
 
@@ -35,16 +35,15 @@ export default function () {
     }, [team]);
 
     const updateProjects = async () => {
-        if (!team) {
-            return;
-        }
-        const infos = await getGitpodService().server.getProjects(team.id);
+        const infos = (!!team
+            ? await getGitpodService().server.getTeamProjects(team.id)
+            : await getGitpodService().server.getUserProjects());
         setProjects(infos);
 
         for (const p of infos) {
             const lastPrebuild = await getGitpodService().server.findPrebuilds({
                 projectName: p.name,
-                teamId: team.id,
+                teamId: team?.id || "", // FIXME
                 latest: true,
             });
             if (lastPrebuild[0]) {
@@ -53,9 +52,10 @@ export default function () {
         }
     }
 
+    const newProjectUrl = !!team ? `/new?team=${team.slug}` : '/new';
     const onSearchProjects = (searchString: string) => { }
     const onNewProject = () => {
-        history.push(`/new?team=${team?.slug}`);
+        history.push(newProjectUrl);
     }
 
     const viewAllPrebuilds = (p: Project) => {
@@ -75,8 +75,8 @@ export default function () {
                 <h3 className="text-center text-gray-500 mt-8">No Recent Projects</h3>
                 <p className="text-center text-base text-gray-500 mt-4">Add projects to enable and manage Prebuilds.<br /><a className="learn-more" href="https://www.gitpod.io/docs/prebuilds/">Learn more about Prebuilds</a></p>
                 <div className="flex space-x-2 justify-center mt-7">
-                    <Link to={`/new?team=${team?.slug}`}><button>New Project</button></Link>
-                    <Link to="./members"><button className="secondary">Invite Members</button></Link>
+                    <Link to={newProjectUrl}><button>New Project</button></Link>
+                    {team && <Link to="./members"><button className="secondary">Invite Members</button></Link>}
                 </div>
             </div>
 
@@ -140,7 +140,7 @@ export default function () {
                     </div>))}
                     <div key="new-project"
                         className="h-48 border-dashed border-2 border-gray-200 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl focus:bg-gitpod-kumquat-light transition ease-in-out group">
-                        <Link to={`/new?team=${team?.slug}`}>
+                        <Link to={newProjectUrl}>
                             <div className="flex h-full">
                                 <div className="m-auto">New Project</div>
                             </div>

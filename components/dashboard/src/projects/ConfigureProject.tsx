@@ -62,14 +62,13 @@ export default function () {
   const [ workspaceCreationResult, setWorkspaceCreationResult ] = useState<WorkspaceCreationResult | undefined>();
 
   useEffect(() => {
-    if (!team) {
-      return;
-    }
     // Disable editing while loading, or when the config comes from Git.
     setIsEditorDisabled(true);
     setEditorError(null);
     (async () => {
-      const projects = await getGitpodService().server.getProjects(team.id);
+      const projects = (!!team
+        ? await getGitpodService().server.getTeamProjects(team.id)
+        : await getGitpodService().server.getUserProjects());
       const project = projects.find(p => p.name === routeMatch?.params.projectSlug);
       if (project) {
         setProject(project);

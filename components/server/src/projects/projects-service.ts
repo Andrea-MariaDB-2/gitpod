@@ -6,7 +6,7 @@
 
 import { inject, injectable } from "inversify";
 import { DBWithTracing, ProjectDB, TeamDB, TracedWorkspaceDB, WorkspaceDB } from "@gitpod/gitpod-db/lib";
-import { Branch, CommitInfo, CreateProjectParams, FindPrebuildsParams, PrebuildInfo, PrebuiltWorkspace, Project, User } from "@gitpod/gitpod-protocol";
+import { Branch, CommitInfo, CreateProjectParams, FindPrebuildsParams, PrebuildInfo, PrebuiltWorkspace, Project, ProjectConfig, User } from "@gitpod/gitpod-protocol";
 import { HostContextProvider } from "../auth/host-context-provider";
 import { parseRepoUrl } from "../repohost";
 
@@ -22,16 +22,19 @@ export class ProjectsService {
         return this.projectDB.findProjectById(projectId);
     }
 
-    async getProjects(teamId: string): Promise<Project[]> {
-        const projects = await this.projectDB.findProjectsByTeam(teamId);
-        return projects;
+    async getTeamProjects(teamId: string): Promise<Project[]> {
+        return this.projectDB.findTeamProjects(teamId);
     }
 
-    async getProjectOverview(user: User, teamId: string, projectName: string): Promise<Project.Overview | undefined> {
-        const project = await this.projectDB.findProjectByTeamAndName(teamId, projectName);
-        if (!project) {
-            return undefined;
-        }
+    async getUserProjects(userId: string): Promise<Project[]> {
+        return this.projectDB.findUserProjects(userId);
+    }
+
+    async getProjectsByCloneUrls(cloneUrls: string[]): Promise<Project[]> {
+        return this.projectDB.findProjectsByCloneUrls(cloneUrls);
+    }
+
+    async getProjectOverview(user: User, project: Project): Promise<Project.Overview | undefined> {
         const branches = await this.getBranchDetails(user, project);
         return { branches };
     }
@@ -74,8 +77,14 @@ export class ProjectsService {
         return result;
     }
 
-    async createProject({ name, cloneUrl, teamId, appInstallationId }: CreateProjectParams): Promise<Project> {
-        return this.projectDB.storeProject(Project.create({ name, cloneUrl, teamId, appInstallationId }));
+    async createProject({ name, cloneUrl, teamId, userId, appInstallationId }: CreateProjectParams): Promise<Project> {
+        const project = Project.create({
+            name,
+            cloneUrl,
+            ...(!!userId ? { userId } : { teamId }),
+            appInstallationId
+        });
+        return this.projectDB.storeProject(project);
     }
 
     async deleteProject(projectId: string): Promise<void> {
@@ -143,7 +152,7 @@ export class ProjectsService {
             startedAt: prebuild.creationTime,
             startedBy: "", // TODO
             startedByAvatar: "", // TODO
-            teamId,
+            teamId: teamId || "", // TODO
             projectName,
             branch: prebuild.branch || "unknown",
             cloneUrl: prebuild.cloneURL,
@@ -157,6 +166,10 @@ export class ProjectsService {
             // changeUrl
             branchPrebuildNumber: "42"
         };
+    }
+
+    async setProjectConfiguration(projectId: string, config: ProjectConfig) {
+        return this.projectDB.setProjectConfiguration(projectId, config);
     }
 
 }

@@ -80,6 +80,10 @@ export default function Menu() {
     const leftMenu: Entry[] = (() => {
         if (!team) {
             return [
+                ...(showTeamsUI ? [{
+                    title: 'Projects',
+                    link: '/projects'
+                }] : []),
                 {
                     title: 'Workspaces',
                     link: '/workspaces',

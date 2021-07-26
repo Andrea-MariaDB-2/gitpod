@@ -159,6 +159,7 @@ function App() {
             <Switch>
                 <Route path="/new" exact component={NewProject} />
                 <Route path="/setup" exact component={Setup} />
+                <Route path="/projects" exact component={Projects} />
                 <Route path="/workspaces" exact component={Workspaces} />
                 <Route path="/account" exact component={Account} />
                 <Route path="/integrations" exact component={Integrations} />

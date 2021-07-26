@@ -79,7 +79,10 @@ const gitpodServiceMock = createServiceMock({
             teamId: "team1",
         }
     },
-    getProjects: async () => {
+    getTeamProjects: async () => {
+        return [pr1]
+    },
+    getUserProjects: async () => {
         return [pr1]
     },
     getProjectOverview: async () => {

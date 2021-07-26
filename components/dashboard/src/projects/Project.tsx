@@ -41,7 +41,7 @@ export default function () {
         if (!team || !projectName) {
             return;
         }
-        const projects = await getGitpodService().server.getProjects(team.id);
+        const projects = await getGitpodService().server.getTeamProjects(team.id);
 
         const project = projectName && projects.find(p => p.name === projectName);
         if (!project) {
@@ -50,7 +50,7 @@ export default function () {
 
         setProject(project);
 
-        const details = await getGitpodService().server.getProjectOverview(team.id, project.name);
+        const details = await getGitpodService().server.getProjectOverview(project.id);
         if (details) {
             // default branch on top of the rest
             const branches = details.branches.sort((a, b) => (b.isDefault as any) - (a.isDefault as any)) || [];

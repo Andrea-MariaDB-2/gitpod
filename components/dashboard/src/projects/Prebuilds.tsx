@@ -38,7 +38,7 @@ export default function () {
             return;
         }
         (async () => {
-            const projects = await getGitpodService().server.getProjects(team.id);
+            const projects = await getGitpodService().server.getTeamProjects(team.id);
 
             const project = projectName && projects.find(p => p.name === projectName);
             if (project) {
@@ -50,7 +50,7 @@ export default function () {
                 });
                 setPrebuilds(prebuilds);
 
-                const details = await getGitpodService().server.getProjectOverview(team.id, project.name);
+                const details = await getGitpodService().server.getProjectOverview(project.id);
                 if (details?.branches) {
                     setDefaultBranch(details.branches.find(b => b.isDefault)?.name);
                 }
