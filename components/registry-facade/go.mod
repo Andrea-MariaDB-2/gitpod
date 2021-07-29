@@ -22,7 +22,7 @@ require (
 	github.com/spf13/cobra v1.1.3
 	golang.org/x/net v0.0.0-20210226172049-e18ecbb05110
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1
-	google.golang.org/grpc v1.38.0
+	google.golang.org/grpc v1.39.0
 )
 
 replace github.com/gitpod-io/gitpod/common-go => ../common-go // leeway
