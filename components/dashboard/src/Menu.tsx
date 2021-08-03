@@ -103,10 +103,6 @@ export default function Menu() {
                 link: `/${team.slug}/${projectName}/prebuilds`
             },
             {
-                title: 'Settings',
-                link: `/${team.slug}/${projectName}/settings`
-            },
-            {
                 title: 'Configure',
                 link: `/${team.slug}/${projectName}/configure`
             }
@@ -201,7 +197,7 @@ export default function Menu() {
     }
 
     return <>
-        <header className={`lg:px-28 px-10 flex flex-col pt-4 space-y-4 ${isMinimalUI ? 'pb-4' : ''}`}>
+        <header className={`lg:px-28 px-10 flex flex-col pt-4 space-y-4 ${isMinimalUI || !!prebuildId ? 'pb-4' : ''}`}>
             <div className="flex h-10">
                 <div className="flex justify-between items-center pr-3">
                     <Link to="/">

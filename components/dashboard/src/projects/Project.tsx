@@ -5,17 +5,16 @@
  */
 
 import moment from "moment";
-import { PrebuildInfo, PrebuiltWorkspaceState, Project } from "@gitpod/gitpod-protocol";
+import { PrebuildInfo, Project } from "@gitpod/gitpod-protocol";
 import { useContext, useEffect, useState } from "react";
 import { useHistory, useLocation, useRouteMatch } from "react-router";
 import Header from "../components/Header";
-import DropDown, { DropDownEntry } from "../components/DropDown";
 import { ItemsList, Item, ItemField, ItemFieldContextMenu } from "../components/ItemsList";
 import { getGitpodService, gitpodHostUrl } from "../service/service";
 import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
 import { prebuildStatusIcon, prebuildStatusLabel } from "./Prebuilds";
 import { ContextMenuEntry } from "../components/ContextMenu";
-import { toRemoteURL } from "./render-utils";
+import { shortCommitMessage } from "./render-utils";
 
 export default function () {
     const history = useHistory();
@@ -31,7 +30,6 @@ export default function () {
     const [lastPrebuilds, setLastPrebuilds] = useState<Map<string, PrebuildInfo>>(new Map());
 
     const [searchFilter, setSearchFilter] = useState<string | undefined>();
-    const [statusFilter, setStatusFilter] = useState<PrebuiltWorkspaceState | undefined>();
 
     useEffect(() => {
         updateProject();
@@ -78,27 +76,8 @@ export default function () {
             onClick: () => onNewWorkspace(branch)
         });
         entries.push({
-            title: "Trigger Prebuild",
+            title: "Rerun Prebuild",
             onClick: () => triggerPrebuild(branch),
-            separator: true
-        });
-        entries.push({
-            title: "Cancel Prebuild",
-            customFontStyle: 'text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300',
-            onClick: () => { }
-        })
-        return entries;
-    }
-
-    const statusFilterEntries = () => {
-        const entries: DropDownEntry[] = [];
-        entries.push({
-            title: 'All',
-            onClick: () => setStatusFilter(undefined)
-        });
-        entries.push({
-            title: 'READY',
-            onClick: () => setStatusFilter("available")
         });
         return entries;
     }
@@ -106,10 +85,6 @@ export default function () {
     const lastPrebuild = (branch: Project.BranchDetails) => lastPrebuilds.get(branch.name);
 
     const filter = (branch: Project.BranchDetails) => {
-        const prebuild = lastPrebuild(branch);
-        if (statusFilter && prebuild && statusFilter !== prebuild.status) {
-            return false;
-        }
         if (searchFilter && `${branch.changeTitle} ${branch.name}`.toLowerCase().includes(searchFilter.toLowerCase()) === false) {
             return false;
         }
@@ -130,8 +105,12 @@ export default function () {
         history.push(`/${team?.slug}/${projectName}/${pb.id}`);
     }
 
+    const formatDate = (date: string | undefined) => {
+        return date ? moment(date).fromNow() : "";
+    }
+
     return <>
-        <Header title={project?.name || ""} subtitle={toRemoteURL(project?.cloneUrl || "")} />
+        <Header title={"Branches"} subtitle={<h2>View recent active branches for <a className="text-gray-400 hover:text-gray-600" href={project?.cloneUrl}>{project?.name}</a>.</h2>} />
         <div className="lg:px-28 px-10">
             <div className="flex mt-8">
                 <div className="flex">
@@ -142,7 +121,6 @@ export default function () {
                 </div>
                 <div className="flex-1" />
                 <div className="py-3 pl-3">
-                    <DropDown prefix="Prebuild Status: " contextMenuWidth="w-32" entries={statusFilterEntries()} />
                 </div>
             </div>
             <ItemsList className="mt-2">
@@ -159,40 +137,39 @@ export default function () {
                     </ItemField>
                 </Item>
                 {branches.map((branch, index) => {
+                    if (!filter(branch)) {
+                        return undefined;
+                    }
 
                     const branchName = branch.name;
                     const prebuild = lastPrebuild(branch);
 
                     const avatar = branch.changeAuthorAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={branch.changeAuthorAvatar || ''} alt={branch.changeAuthor} />;
-                    const fakeShortHash = branch.changeHash.substring(0, 10);
                     const statusIcon = prebuild?.status && prebuildStatusIcon(prebuild.status);
                     const status = prebuild?.status && prebuildStatusLabel(prebuild.status);
                     console.log(`status for ${branchName} is ${prebuild?.status} (${lastPrebuilds.size})`)
-                    if (!filter(branch)) {
-                        // return undefined;
-                    }
                     return <Item key={`branch-${index}-${branchName}`} className="grid grid-cols-3 group">
                         <ItemField className="flex items-center">
                             <div>
                                 <div className="text-base text-gray-900 dark:text-gray-50 font-medium mb-1">
                                     {branchName}
+                                    {branch.isDefault && (<span className="ml-2 self-center rounded-xl py-0.5 px-2 text-sm bg-blue-50 text-blue-400">DEFAULT</span>)}
                                 </div>
-                                <p>Updated _ minutes ago</p>
                             </div>
                         </ItemField>
                         <ItemField className="flex items-center">
                             <div>
-                                <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1">{branch.changeTitle}</div>
-                                <p>{avatar}Authored {moment(branch.changeDate).fromNow()} · {fakeShortHash}</p>
+                                <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1">{shortCommitMessage(branch.changeTitle)}</div>
+                                <p>{avatar}Authored {formatDate(branch.changeDate)} · {branch.changeHash?.substring(0, 8)}</p>
                             </div>
                         </ItemField>
                         <ItemField className="flex items-center">
                             <div className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1 cursor-pointer" onClick={() => prebuild && openPrebuild(prebuild)}>
-                                {prebuild ? (<><div className="inline-block align-text-bottom mr-2 w-4 h-4">{statusIcon}</div>{status}</>) : (<span>–</span>)}
+                                {prebuild ? (<><div className="inline-block align-text-bottom mr-2 w-4 h-4">{statusIcon}</div>{status}</>) : (<span> </span>)}
                             </div>
                             <span className="flex-grow" />
                             <a href={gitpodHostUrl.withContext(`${branch.url}`).toString()}>
-                                <button className={`primary mr-2 py-2 ${branch.isDefault ? "" : "opacity-0"} group-hover:opacity-100`}>New Workspace</button>
+                                <button className={`primary mr-2 py-2 opacity-0 group-hover:opacity-100`}>New Workspace</button>
                             </a>
                             <ItemFieldContextMenu className="py-0.5" menuEntries={branchContextMenu(branch)} />
                         </ItemField>
