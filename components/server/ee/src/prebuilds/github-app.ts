@@ -84,17 +84,35 @@ export class GithubApp {
         });
 
         app.on('installation.created', async ctx => {
-            const accountId: string = `${ctx.payload.installation.account.id}`;
+            const targetAccountName = `${ctx.payload.installation.account.login}`;
             const installationId = `${ctx.payload.installation.id}`;
-            const senderId = `${ctx.payload.sender.id}`;
-            const user = await this.userDB.findUserByIdentity({ authProviderId: this.env.githubAppAuthProviderId, authId: accountId });
+
+            // cf. https://docs.github.com/en/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#installation
+            const authId = `${ctx.payload.sender.id}`;
+
+            const user = await this.userDB.findUserByIdentity({ authProviderId: this.env.githubAppAuthProviderId, authId });
             const userId = user ? user.id : undefined;
-            await this.appInstallationDB.recordNewInstallation("github", 'platform', installationId, userId, senderId);
-            log.debug({ userId }, "New installation recorded", { userId, platformUserId: ctx.payload.sender.id })
+            await this.appInstallationDB.recordNewInstallation("github", 'platform', installationId, userId, authId);
+            log.debug({ userId }, "New installation recorded", { userId, authId, targetAccountName })
         });
         app.on('installation.deleted', async ctx => {
             const installationId = `${ctx.payload.installation.id}`;
             await this.appInstallationDB.recordUninstallation("github", 'platform', installationId);
+        });
+
+        app.on('repository.renamed', async ctx => {
+            const { action, repository, installation } = ctx.payload;
+            if (!installation) {
+                return;
+            }
+            if (action === "renamed") {
+                const project = await this.projectDB.findProjectByInstallationId(String(installation.id))
+                if (project) {
+                    project.cloneUrl = repository.clone_url;
+                    await this.projectDB.storeProject(project);
+                }
+            }
+            // TODO(at): handle deleted as well
         });
 
         app.on('push', async ctx => {
