@@ -52,6 +52,13 @@ import (
 	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
 )
 
+const (
+	gitpodUID       = 33333
+	gitpodUserName  = "gitpod"
+	gitpodGID       = 33333
+	gitpodGroupName = "gitpod"
+)
+
 var (
 	additionalServices []RegisterableService
 	apiEndpointOpts    []grpc.ServerOption
@@ -122,7 +129,11 @@ func Run(options ...RunOption) {
 		return
 	}
 
-	buildIDEEnv(&Config{})
+	err = AddGitpodUserIfNotExists()
+	if err != nil {
+		log.WithError(err).Fatal("cannot ensure Gitpod user exists")
+	}
+	symlinkBinaries(cfg)
 	configureGit(cfg)
 
 	tokenService := NewInMemoryTokenService()
@@ -183,10 +194,10 @@ func Run(options ...RunOption) {
 	go analyseConfigChanges(ctx, cfg, analytics, gitpodConfigService)
 
 	termMuxSrv.DefaultWorkdir = cfg.RepoRoot
-	termMuxSrv.Env = buildIDEEnv(cfg)
+	termMuxSrv.Env = buildChildProcEnv(cfg, nil)
 	termMuxSrv.DefaultCreds = &syscall.Credential{
-		Uid: 33333,
-		Gid: 33333,
+		Uid: gitpodUID,
+		Gid: gitpodGID,
 	}
 
 	apiServices := []RegisterableService{
@@ -318,6 +329,31 @@ func createExposedPortsImpl(cfg *Config, gitpodService *gitpod.APIoverJSONRPC) p
 	return ports.NewGitpodExposedPorts(cfg.WorkspaceID, cfg.WorkspaceInstanceID, gitpodService)
 }
 
+// supervisor ships some binaries we want in the PATH. We could just add some directory to the path, but
+// instead of producing a strange path setup, we symlink the binary to /usr/bin.
+func symlinkBinaries(cfg *Config) {
+	bin, err := os.Executable()
+	if err != nil {
+		log.WithError(err).Error("cannot get executable path - hence cannot symlink binaries")
+		return
+	}
+	base := filepath.Dir(bin)
+
+	binaries := map[string]string{
+		"gitpod-cli": "gp",
+	}
+	for k, v := range binaries {
+		var (
+			from = filepath.Join(base, k)
+			to   = filepath.Join("/usr/bin", v)
+		)
+		err = os.Symlink(from, to)
+		if err != nil {
+			log.WithError(err).WithField("from", from).WithField("to", to).Warn("cannot create symlink")
+		}
+	}
+}
+
 func configureGit(cfg *Config) {
 	settings := [][]string{
 		{"push.default", "simple"},
@@ -369,26 +405,43 @@ func hasMetadataAccess() bool {
 func reaper(terminatingReaper <-chan bool) {
 	defer log.Debug("reaper shutdown")
 
+	notifications := make(chan struct{}, 128)
+	go func() {
+		sigs := make(chan os.Signal, 3)
+		signal.Notify(sigs, syscall.SIGCHLD)
+		for {
+			<-sigs
+			select {
+			case notifications <- struct{}{}:
+			default:
+				// Notification channel is full, so we drop the notification.
+				// Because we're reaping with PID -1, we'll catch the child process for
+				// which we've missed the notification anyways.
+			}
+		}
+	}()
+
 	var terminating bool
-	sigs := make(chan os.Signal, 128)
-	signal.Notify(sigs, syscall.SIGCHLD)
 	for {
 		select {
-		case <-sigs:
+		case <-notifications:
 		case terminating = <-terminatingReaper:
 			continue
 		}
 
-		// "pid: 0, options: 0" to follow https://github.com/ramr/go-reaper/issues/11 to make agent-smith work again
-		pid, err := unix.Wait4(0, nil, 0, nil)
-
+		// wait on the process, hence remove it from the process table
+		pid, err := unix.Wait4(-1, nil, 0, nil)
+		// if we've been interrupted, try again until we're done
+		for err == syscall.EINTR {
+			pid, err = unix.Wait4(-1, nil, 0, nil)
+		}
 		if err == unix.ECHILD {
 			// The calling process does not have any unwaited-for children.
-			continue
+			// Not really an error for us
+			err = nil
 		}
 		if err != nil {
 			log.WithField("pid", pid).WithError(err).Debug("cannot call waitpid() for re-parented child")
-			continue
 		}
 
 		if !terminating {
@@ -514,18 +567,20 @@ func prepareIDELaunch(cfg *Config) *exec.Cmd {
 	log.WithField("args", args).WithField("entrypoint", cfg.Entrypoint).Info("launching IDE")
 
 	cmd := exec.Command(cfg.Entrypoint, args...)
-	cmd.Env = buildIDEEnv(cfg)
-
-	// We need the IDE to run in its own process group, s.t. we can suspend and resume
-	// IDE and its children.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
+		// We need the child process to run in its own process group, s.t. we can suspend and resume
+		// IDE and its children.
 		Setpgid:   true,
 		Pdeathsig: syscall.SIGKILL,
+
+		// All supervisor children run as gitpod user. The environment variables we produce are also
+		// gitpod user specific.
 		Credential: &syscall.Credential{
-			Uid: 33333,
-			Gid: 33333,
+			Uid: gitpodUID,
+			Gid: gitpodGID,
 		},
 	}
+	cmd.Env = buildChildProcEnv(cfg, nil)
 
 	// Here we must resist the temptation to "neaten up" the IDE output for headless builds.
 	// This would break the JSON parsing of the headless builds.
@@ -541,28 +596,55 @@ func prepareIDELaunch(cfg *Config) *exec.Cmd {
 	return cmd
 }
 
-func buildIDEEnv(cfg *Config) []string {
-	var env, envn []string
-	for _, e := range os.Environ() {
-		segs := strings.Split(e, "=")
+// buildChildProcEnv computes the environment variables passed to a child process, based on the total list
+// of envvars. If envvars is nil, os.Environ() is used.
+func buildChildProcEnv(cfg *Config, envvars []string) []string {
+	if envvars == nil {
+		envvars = os.Environ()
+	}
+
+	envs := make(map[string]string)
+	for _, e := range envvars {
+		segs := strings.SplitN(e, "=", 2)
 		if len(segs) < 2 {
 			log.Printf("\"%s\" has invalid format, not including in IDE environment", e)
 			continue
 		}
-		nme := segs[0]
+		nme, val := segs[0], segs[1]
 
 		if isBlacklistedEnvvar(nme) {
 			continue
 		}
 
-		env = append(env, e)
-		envn = append(envn, nme)
+		envs[nme] = val
+	}
+	envs["SUPERVISOR_ADDR"] = fmt.Sprintf("localhost:%d", cfg.APIEndpointPort)
+
+	// We're forcing basic environment variables here, because supervisor acts like a login process at this point.
+	// The gitpod user might not have existed when supervisor was started, hence the HOME coming
+	// from the container runtime is probably wrong ("/" to be exact).
+	//
+	// Wait, how does this env var stuff work on Linux?
+	//   First, the kernel does not care or set environment variables, it's all userland.
+	//   It's the login process (e.g. /bin/login called by e.g. getty) that sets conventional
+	//   environment variables such as HOME and sometimes PATH or TERM.
+	//
+	// Where can I read up on this, e.g. how others do it?
+	//   BusyBox is a good place to start, because it's small enough to be easy to understand.
+	//   Start here:
+	//     - https://github.com/mirror/busybox/blob/24198f652f10dca5603df7c704263358ca21f5ce/libbb/setup_environment.c#L32
+	//     - https://github.com/mirror/busybox/blob/24198f652f10dca5603df7c704263358ca21f5ce/libbb/login.c#L140-L170
+	//
+	envs["HOME"] = "/home/gitpod"
+	envs["USER"] = "gitpod"
+
+	// Particular Java optimisation: Java pre v10 did not gauge it's available memory correctly, and needed explicitly setting "-Xmx" for all Hotspot/openJDK VMs
+	if mem, ok := envs["GITPOD_MEMORY"]; ok {
+		envs["JAVA_TOOL_OPTIONS"] += fmt.Sprintf(" -Xmx%sm", mem)
 	}
 
-	ce := map[string]string{
-		"SUPERVISOR_ADDR": fmt.Sprintf("localhost:%d", cfg.APIEndpointPort),
-	}
-	for nme, val := range ce {
+	var env, envn []string
+	for nme, val := range envs {
 		log.WithField("envvar", nme).Debug("passing environment variable to IDE")
 		env = append(env, fmt.Sprintf("%s=%s", nme, val))
 		envn = append(envn, nme)
@@ -831,14 +913,28 @@ func startSSHServer(ctx context.Context, cfg *Config, wg *sync.WaitGroup) {
 	hostkeyFN.Close()
 	os.Remove(hostkeyFN.Name())
 
-	out, err := exec.Command(dropbearkey, "-t", "rsa", "-f", hostkeyFN.Name()).CombinedOutput()
+	keycmd := exec.Command(dropbearkey, "-t", "rsa", "-f", hostkeyFN.Name())
+	// We need to force HOME because the Gitpod user might not have existed at the start of the container
+	// which makes the container runtime set an invalid HOME value.
+	keycmd.Env = func() []string {
+		env := os.Environ()
+		res := make([]string, 0, len(env))
+		for _, e := range env {
+			if strings.HasPrefix(e, "HOME=") {
+				e = "HOME=/root"
+			}
+			res = append(res, e)
+		}
+		return res
+	}()
+	out, err := keycmd.CombinedOutput()
 	if err != nil {
 		log.WithError(err).WithField("out", string(out)).Error("cannot create hostkey file")
 		return
 	}
 
 	cmd := exec.Command(dropbear, "-F", "-E", "-w", "-s", "-p", fmt.Sprintf(":%d", cfg.SSHPort), "-r", hostkeyFN.Name())
-	cmd.Env = buildIDEEnv(cfg)
+	cmd.Env = buildChildProcEnv(cfg, nil)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Start()
@@ -1019,7 +1115,7 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 	if err != nil {
 		log.WithError(err).Error("cannot provide Docker activation socket")
 	}
-	_ = os.Chown(fn, 33333, 33333)
+	_ = os.Chown(fn, gitpodUID, gitpodGID)
 	err = activation.Listen(ctx, l, func(socketFD *os.File) error {
 		cmd := exec.Command("docker-up")
 		cmd.Env = append(os.Environ(), "LISTEN_FDS=1")
@@ -1117,7 +1213,7 @@ func runAsGitpodUser(cmd *exec.Cmd) *exec.Cmd {
 	if cmd.SysProcAttr.Credential == nil {
 		cmd.SysProcAttr.Credential = &syscall.Credential{}
 	}
-	cmd.SysProcAttr.Credential.Gid = 33333
-	cmd.SysProcAttr.Credential.Uid = 33333
+	cmd.SysProcAttr.Credential.Uid = gitpodUID
+	cmd.SysProcAttr.Credential.Gid = gitpodGID
 	return cmd
 }

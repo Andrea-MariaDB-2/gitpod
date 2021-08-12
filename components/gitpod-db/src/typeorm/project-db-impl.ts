@@ -33,7 +33,7 @@ export class ProjectDBImpl implements ProjectDB {
         return repo.findOne({ cloneUrl, markedDeleted: false });
     }
 
-    public async findProjectsByCloneUrl(cloneUrls: string[]): Promise<Project[]> {
+    public async findProjectsByCloneUrls(cloneUrls: string[]): Promise<Project[]> {
         if (cloneUrls.length === 0) {
             return [];
         }
@@ -46,18 +46,18 @@ export class ProjectDBImpl implements ProjectDB {
     }
 
     public async findProjectByTeamAndName(teamId: string, projectName: string): Promise<Project | undefined> {
-        const projects = await this.findProjectsByTeam(teamId);
+        const projects = await this.findTeamProjects(teamId);
         return projects.find(p => p.name === projectName);
     }
 
-    public async findProjectByInstallationId(appInstallationId: string): Promise<Project | undefined> {
-        const repo = await this.getRepo();
-        return repo.findOne({ appInstallationId, markedDeleted: false });
-    }
-
-    public async findProjectsByTeam(teamId: string): Promise<Project[]> {
+    public async findTeamProjects(teamId: string): Promise<Project[]> {
         const repo = await this.getRepo();
         return repo.find({ teamId, markedDeleted: false });
+    }
+
+    public async findUserProjects(userId: string): Promise<Project[]> {
+        const repo = await this.getRepo();
+        return repo.find({ userId, markedDeleted: false });
     }
 
     public async storeProject(project: Project): Promise<Project> {
@@ -67,7 +67,7 @@ export class ProjectDBImpl implements ProjectDB {
 
     public async setProjectConfiguration(projectId: string, config: ProjectConfig): Promise<void> {
         const repo = await this.getRepo();
-        const project = await repo.findOne({ id: projectId, deleted: false });
+        const project = await repo.findOne({ id: projectId, markedDeleted: false });
         if (!project) {
             throw new Error('A project with this ID could not be found');
         }

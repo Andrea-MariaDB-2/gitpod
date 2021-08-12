@@ -524,11 +524,9 @@ func findBindMountCandidates(procMounts io.Reader, readlink func(path string) (d
 		// test remaining candidates if they're a Kubernetes configMap or secret
 		ln, err := readlink(filepath.Join(path, "..data"))
 		if err != nil {
-			log.WithField("path", path).Debug("not bind-mounting because this doesn't look like a configMap")
 			continue
 		}
 		if !strings.HasPrefix(ln, "..") {
-			log.WithField("path", path).WithField("ln", ln).Debug("not bind-mounting because this doesn't look like a configMap")
 			continue
 		}
 
@@ -737,6 +735,10 @@ func handleExit(ec *int) {
 }
 
 func sleepForDebugging() {
+	if os.Getenv("GITPOD_WORKSPACEKIT_SLEEP_FOR_DEBUGGING") != "true" {
+		return
+	}
+
 	log.Info("sleeping five minutes to allow debugging")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

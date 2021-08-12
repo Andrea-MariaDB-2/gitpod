@@ -36,6 +36,7 @@ type TeamClaimModal = {
 
 export default function () {
     const { user } = useContext(UserContext);
+    const [ showPaymentUI, setShowPaymentUI ] = useState<boolean>(false);
     const [ accountStatement, setAccountStatement ] = useState<AccountStatement>();
     const [ isChargebeeCustomer, setIsChargebeeCustomer ] = useState<boolean>();
     const [ isStudent, setIsStudent ] = useState<boolean>();
@@ -43,7 +44,6 @@ export default function () {
     const [ availableCoupons, setAvailableCoupons ] = useState<PlanCoupon[]>();
     const [ appliedCoupons, setAppliedCoupons ] = useState<PlanCoupon[]>();
     const [ gitHubUpgradeUrls, setGitHubUpgradeUrls ] = useState<GithubUpgradeURL[]>();
-    const [ privateRepoTrialEndDate, setPrivateRepoTrialEndDate ] = useState<string>();
 
     const [ teamClaimModal, setTeamClaimModal ] = useState<TeamClaimModal | undefined>(undefined);
 
@@ -52,6 +52,7 @@ export default function () {
     useEffect(() => {
         const { server } = getGitpodService();
         Promise.all([
+            server.getShowPaymentUI().then(v => () => setShowPaymentUI(v)),
             server.getAccountStatement({}).then(v => () => setAccountStatement(v)),
             server.isChargebeeCustomer().then(v => () => setIsChargebeeCustomer(v)),
             server.isStudent().then(v => () => setIsStudent(v)),
@@ -61,16 +62,13 @@ export default function () {
             }),
             server.getAvailableCoupons().then(v => () => setAvailableCoupons(v)),
             server.getAppliedCoupons().then(v => () => setAppliedCoupons(v)),
-            server.getGithubUpgradeUrls().then(v => () => setGitHubUpgradeUrls(v)),
-            server.getPrivateRepoTrialEndDate().then(v => () => setPrivateRepoTrialEndDate(v)),
+            server.getGithubUpgradeUrls().then(v => () => setGitHubUpgradeUrls(v))
         ]).then(setters => setters.forEach(s => s()));
 
         return function cleanup() {
             clearTimeout(pollAccountStatementTimeout!);
         }
     }, []);
-
-    console.log('privateRepoTrialEndDate', privateRepoTrialEndDate);
 
     const activeSubscriptions = (accountStatement?.subscriptions || []).filter(s => Subscription.isActive(s, new Date().toISOString()));
     const freeSubscription =
@@ -333,7 +331,7 @@ export default function () {
 
     // Plan card: Free a.k.a. Open Source (or Professional Open Source)
     const openSourceFeatures = <>
-        <p className="truncate" title="Public Repositories">✓ Public Repositories</p>
+        <p className="truncate" title="Public Repositories">✓ Public &amp; Private Repositories</p>
         <p className="truncate" title="4 Parallel Workspaces">✓ 4 Parallel Workspaces</p>
         <p className="truncate" title="30 min Timeout">✓ 30 min Timeout</p>
     </>;
@@ -357,7 +355,6 @@ export default function () {
     // Plan card: Personal
     const personalFeatures = <>
         <p className="truncate" title={'Everything in ' + freePlan.name}>← Everything in {freePlan.name}</p>
-        <p className="truncate" title="Private Repositories">✓ Private Repositories</p>
     </>;
     if (currentPlan.chargebeeId === personalPlan.chargebeeId) {
         const bottomLabel = ('pendingSince' in currentPlan) ? <p className="text-green-600 animate-pulse">Upgrade in progress</p> : undefined;
@@ -429,10 +426,10 @@ export default function () {
 
     return <div>
         <PageWithSubMenu subMenu={settingsMenu}  title='Plans' subtitle='Manage account usage and billing.'>
-            <div className="w-full text-center">
+            {showPaymentUI && <div className="w-full text-center">
                 <p className="text-xl text-gray-500">You are currently using the <span className="font-bold">{Plans.getById(assignedTs?.planId)?.name || currentPlan.name}</span> plan.</p>
                 {!assignedTs && (
-                    <p className="text-base w-96 m-auto">Upgrade your plan to get access to private repositories or more parallel workspaces.</p>
+                    <p className="text-base w-96 m-auto">Upgrade your plan to get more hours and more parallel workspaces.</p>
                 )}
                 <Tooltip content={`Current billing cycle: ${guessCurrentBillingCycle(currentPlan, accountStatement).map(d => d.toLocaleDateString()).join(' - ')}`}>
                     <p className="mt-2 font-semibold text-gray-500">Remaining hours: {typeof(accountStatement?.remainingHours) === 'number'
@@ -449,7 +446,7 @@ export default function () {
                         : <><a className="text-blue-light hover:underline" href="javascript:void(0)" onClick={() => setCurrency('EUR')}>€</a> / $</>}
                     </span>}
                 </p>
-            </div>
+            </div>}
             <div className="mt-4 flex justify-center space-x-3 2xl:space-x-7">{planCards}</div>
             <InfoBox className="w-2/3 mt-14 mx-auto">
                 If you are interested in purchasing a plan for a team, purchase a Team plan with one centralized billing. <a className="underline" href="https://www.gitpod.io/docs/teams/">Learn more</a>
