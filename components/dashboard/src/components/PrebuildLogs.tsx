@@ -11,7 +11,12 @@ import { getGitpodService } from "../service/service";
 
 const WorkspaceLogs = React.lazy(() => import('./WorkspaceLogs'));
 
-export default function PrebuildLogs(props: { workspaceId?: string }) {
+export interface PrebuildLogsProps {
+  workspaceId?: string;
+  onInstanceUpdate?: (instance: WorkspaceInstance) => void;
+}
+
+export default function PrebuildLogs(props: PrebuildLogsProps) {
   const [ workspace, setWorkspace ] = useState<Workspace | undefined>();
   const [ workspaceInstance, setWorkspaceInstance ] = useState<WorkspaceInstance | undefined>();
   const [ error, setError ] = useState<Error | undefined>();
@@ -54,69 +59,65 @@ export default function PrebuildLogs(props: { workspaceId?: string }) {
   }, [ props.workspaceId ]);
 
   useEffect(() => {
+    if (props.onInstanceUpdate && workspaceInstance) {
+      props.onInstanceUpdate(workspaceInstance);
+    }
     switch (workspaceInstance?.status.phase) {
       // unknown indicates an issue within the system in that it cannot determine the actual phase of
       // a workspace. This phase is usually accompanied by an error.
       case "unknown":
         break;
 
-        // Preparing means that we haven't actually started the workspace instance just yet, but rather
-        // are still preparing for launch. This means we're building the Docker image for the workspace.
-        case "preparing":
-          getGitpodService().server.watchWorkspaceImageBuildLogs(workspace!.id);
-          break;
+      // Preparing means that we haven't actually started the workspace instance just yet, but rather
+      // are still preparing for launch. This means we're building the Docker image for the workspace.
+      case "preparing":
+        getGitpodService().server.watchWorkspaceImageBuildLogs(workspace!.id);
+        break;
 
-        // Pending means the workspace does not yet consume resources in the cluster, but rather is looking for
-        // some space within the cluster. If for example the cluster needs to scale up to accomodate the
-        // workspace, the workspace will be in Pending state until that happened.
-        case "pending":
-          break;
+      // Pending means the workspace does not yet consume resources in the cluster, but rather is looking for
+      // some space within the cluster. If for example the cluster needs to scale up to accomodate the
+      // workspace, the workspace will be in Pending state until that happened.
+      case "pending":
+        break;
 
-        // Creating means the workspace is currently being created. That includes downloading the images required
-        // to run the workspace over the network. The time spent in this phase varies widely and depends on the current
-        // network speed, image size and cache states.
-        case "creating":
-          break;
+      // Creating means the workspace is currently being created. That includes downloading the images required
+      // to run the workspace over the network. The time spent in this phase varies widely and depends on the current
+      // network speed, image size and cache states.
+      case "creating":
+        break;
 
-        // Initializing is the phase in which the workspace is executing the appropriate workspace initializer (e.g. Git
-        // clone or backup download). After this phase one can expect the workspace to either be Running or Failed.
-        case "initializing":
-          break;
+      // Initializing is the phase in which the workspace is executing the appropriate workspace initializer (e.g. Git
+      // clone or backup download). After this phase one can expect the workspace to either be Running or Failed.
+      case "initializing":
+        break;
 
-        // Running means the workspace is able to actively perform work, either by serving a user through Theia,
-        // or as a headless workspace.
-        case "running":
-          break;
+      // Running means the workspace is able to actively perform work, either by serving a user through Theia,
+      // or as a headless workspace.
+      case "running":
+        break;
 
-        // Interrupted is an exceptional state where the container should be running but is temporarily unavailable.
-        // When in this state, we expect it to become running or stopping anytime soon.
-        case "interrupted":
-          break;
+      // Interrupted is an exceptional state where the container should be running but is temporarily unavailable.
+      // When in this state, we expect it to become running or stopping anytime soon.
+      case "interrupted":
+        break;
 
-        // Stopping means that the workspace is currently shutting down. It could go to stopped every moment.
-        case "stopping":
-          break;
+      // Stopping means that the workspace is currently shutting down. It could go to stopped every moment.
+      case "stopping":
+        break;
 
-        // Stopped means the workspace ended regularly because it was shut down.
-        case "stopped":
-          getGitpodService().server.watchWorkspaceImageBuildLogs(workspace!.id);
-          break;
+      // Stopped means the workspace ended regularly because it was shut down.
+      case "stopped":
+        getGitpodService().server.watchWorkspaceImageBuildLogs(workspace!.id);
+        break;
     }
     if (workspaceInstance?.status.conditions.failed) {
       setError(new Error(workspaceInstance.status.conditions.failed));
     }
   }, [ workspaceInstance?.status.phase ]);
 
-  return <>
-    <Suspense fallback={<div />}>
-      <WorkspaceLogs classes="h-64 w-full" logsEmitter={logsEmitter} errorMessage={error?.message} />
-    </Suspense>
-    <div className="mt-2 flex justify-center space-x-2">
-      {workspaceInstance?.status.phase === 'stopped'
-        ? <a href={workspace?.contextURL ? '/#' + workspace.contextURL.replace(/^prebuild/, '') : undefined}><button>Open Workspace</button></a>
-        : <button className="secondary disabled" disabled={true}>Open Workspace</button> }
-    </div>
-  </>;
+  return <Suspense fallback={<div />}>
+    <WorkspaceLogs classes="h-full w-full" logsEmitter={logsEmitter} errorMessage={error?.message} />
+  </Suspense>;
 }
 
 export function watchHeadlessLogs(instanceId: string, onLog: (chunk: string) => void, checkIsDone: () => Promise<boolean>): DisposableCollection {
@@ -127,10 +128,16 @@ export function watchHeadlessLogs(instanceId: string, onLog: (chunk: string) => 
       return;
     }
 
-    const retry = async (reason: string, err?: Error) => {
+    const initialDelaySeconds = 1;
+    let delayInSeconds = initialDelaySeconds;
+    const retryBackoff = async (reason: string, err?: Error) => {
+      const backoffFactor = 1.2;
+      const maxBackoffSeconds = 5;
+      delayInSeconds = Math.min(delayInSeconds * backoffFactor, maxBackoffSeconds);
+
       console.debug("re-trying headless-logs because: " + reason, err);
       await new Promise((resolve) => {
-        setTimeout(resolve, 2000);
+        setTimeout(resolve, delayInSeconds * 1000);
       });
       startWatchingLogs().catch(console.error);
     };
@@ -142,7 +149,7 @@ export function watchHeadlessLogs(instanceId: string, onLog: (chunk: string) => 
       // TODO(gpl) Only listening on first stream for now
       const streamIds = Object.keys(logSources.streams);
       if (streamIds.length < 1) {
-        await retry("no streams");
+        await retryBackoff("no streams");
         return;
       }
 
@@ -159,7 +166,7 @@ export function watchHeadlessLogs(instanceId: string, onLog: (chunk: string) => 
       });
       reader = response.body?.getReader();
       if (!reader) {
-        await retry("no reader");
+        await retryBackoff("no reader");
         return;
       }
       disposables.push({ dispose: () => reader?.cancel() });
@@ -176,9 +183,9 @@ export function watchHeadlessLogs(instanceId: string, onLog: (chunk: string) => 
           if (matches.length < 2) {
             console.debug("error parsing log stream status code. msg: " + msg);
           } else {
-            const streamStatusCode = matches[1];
-            if (streamStatusCode !== "200") {
-              throw new Error("received status code: " + streamStatusCode);
+            const code = parseStatusCode(matches[1]);
+            if (code !== 200) {
+              throw new StreamError(code);
             }
           }
         } else {
@@ -194,10 +201,32 @@ export function watchHeadlessLogs(instanceId: string, onLog: (chunk: string) => 
       }
     } catch(err) {
       reader?.cancel().catch(console.debug);
-      await retry("error while listening to stream", err);
+      if (err.code === 400) {
+        // sth is really off, and we _should not_ retry
+        console.error("stopped watching headless logs", err);
+        return;
+      }
+      await retryBackoff("error while listening to stream", err);
     }
   };
   startWatchingLogs().catch(console.error);
 
   return disposables;
+}
+
+class StreamError extends Error {
+  constructor(readonly code?: number) {
+    super(`stream status code: ${code}`)
+  }
+}
+
+function parseStatusCode(code: string | undefined): number | undefined {
+  try {
+    if (!code) {
+      return undefined;
+    }
+    return Number.parseInt(code);
+  } catch(err) {
+    return undefined;
+  }
 }

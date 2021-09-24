@@ -40,7 +40,7 @@ func WorkspaceAuthHandler(domain string, info WorkspaceInfoProvider) mux.Middlew
 
 			ws := info.WorkspaceInfo(req.Context(), wsID)
 			if ws == nil {
-				log.Warn("did not find workspace info")
+				log.WithField("workspaceId", wsID).Warn("did not find workspace info")
 				resp.WriteHeader(http.StatusNotFound)
 				return
 			}
@@ -83,7 +83,7 @@ func WorkspaceAuthHandler(domain string, info WorkspaceInfoProvider) mux.Middlew
 				cn := fmt.Sprintf("%s%s_owner_", cookiePrefix, ws.InstanceID)
 				c, err := req.Cookie(cn)
 				if err != nil {
-					log.WithField("cookieName", cn).Warn("no owner cookie present")
+					log.WithField("cookieName", cn).Debug("no owner cookie present")
 					resp.WriteHeader(http.StatusUnauthorized)
 					return
 				}

@@ -227,12 +227,18 @@ func (ws InfringingWorkspace) VID() string {
 }
 
 // DescibeInfringements returns a string representation of all infringements of this workspace
-func (ws InfringingWorkspace) DescibeInfringements() string {
+func (ws InfringingWorkspace) DescribeInfringements(charCount int) string {
 	res := make([]string, len(ws.Infringements))
 	for i, v := range ws.Infringements {
 		res[i] = fmt.Sprintf("%s: %s", v.Kind, v.Description)
 	}
-	return strings.Join(res, "\n")
+
+	infringements := strings.Join(res, "\n")
+	if len(infringements) > charCount {
+		infringements = infringements[:charCount]
+	}
+
+	return infringements
 }
 
 // Infringement reports a users particular wrongdoing
@@ -321,7 +327,7 @@ func (g GradedInfringementKind) Kind() (InfringementKind, error) {
 		}
 	}
 
-	return "", fmt.Errorf("unknown kind")
+	return "", xerrors.Errorf("unknown kind")
 }
 
 // defaultRuleset is the name ("remote origin URL") of the default enforcement rules
@@ -334,7 +340,7 @@ type EnforcementRules map[GradedInfringementKind]PenaltyKind
 func (er EnforcementRules) Validate() error {
 	for k := range er {
 		if _, err := k.Kind(); err != nil {
-			return fmt.Errorf("%s: %w", k, err)
+			return xerrors.Errorf("%s: %w", k, err)
 		}
 	}
 
@@ -346,7 +352,7 @@ func (er EnforcementRules) Validate() error {
 	}
 	for _, v := range er {
 		if _, ok := validPenalties[v]; !ok {
-			return fmt.Errorf("%s: unknown penalty", v)
+			return xerrors.Errorf("%s: unknown penalty", v)
 		}
 	}
 
@@ -593,7 +599,6 @@ type Execve struct {
 	Filename string
 	Argv     []string
 	TID      int
-	Envp     []string
 }
 
 // todo(fntlnz): move this to a package for parsers and write a test
@@ -701,7 +706,10 @@ func (agent *Smith) handleExecveEvent(execve Execve) func() (*InfringingWorkspac
 
 			for _, b := range bl.Binaries {
 				if strings.Contains(execve.Filename, b) || strings.Contains(strings.Join(execve.Argv, "|"), b) {
-					infr := Infringement{Description: fmt.Sprintf("user ran %s blacklisted command: %s", s, execve.Filename), Kind: GradeKind(InfringementExecBlacklistedCmd, s)}
+					infr := Infringement{
+						Description: fmt.Sprintf("user ran %s blacklisted command: %s %v", s, execve.Filename, execve.Argv),
+						Kind:        GradeKind(InfringementExecBlacklistedCmd, s),
+					}
 					res = append(res, infr)
 				}
 			}
@@ -801,7 +809,7 @@ func getWorkspaceFromProcess(tid int) (res *InfringingWorkspace, err error) {
 		}
 	}
 	if supervisor.PID == 0 || workspacekit.PID == 0 {
-		return nil, fmt.Errorf("did not find supervisor or workspacekit parent")
+		return nil, xerrors.Errorf("did not find supervisor or workspacekit parent")
 	}
 
 	env, err := workspacekit.Environ()

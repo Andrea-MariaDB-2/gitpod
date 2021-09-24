@@ -19,17 +19,14 @@ import (
 	"time"
 
 	validation "github.com/go-ozzo/ozzo-validation"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/opentracing/opentracing-go"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -38,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	wsk8s "github.com/gitpod-io/gitpod/common-go/kubernetes"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
@@ -45,19 +43,19 @@ import (
 	regapi "github.com/gitpod-io/gitpod/registry-facade/api"
 	wsdaemon "github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
+	config "github.com/gitpod-io/gitpod/ws-manager/api/config"
 	"github.com/gitpod-io/gitpod/ws-manager/pkg/manager/internal/grpcpool"
 )
 
 // Manager is a kubernetes backed implementation of a workspace manager
 type Manager struct {
-	Config    Configuration
+	Config    config.Configuration
 	Clientset client.Client
 	RawClient kubernetes.Interface
 	Content   *layer.Provider
 	OnChange  func(context.Context, *api.WorkspaceStatus)
 
-	activity     map[string]time.Time
-	activityLock sync.Mutex
+	activity sync.Map
 
 	wsdaemonPool *grpcpool.Pool
 
@@ -109,16 +107,19 @@ const (
 )
 
 // New creates a new workspace manager
-func New(config Configuration, client client.Client, rawClient kubernetes.Interface, cp *layer.Provider) (*Manager, error) {
-	wsdaemonConnfactory, _ := newWssyncConnectionFactory(config)
+func New(config config.Configuration, client client.Client, rawClient kubernetes.Interface, cp *layer.Provider) (*Manager, error) {
+	wsdaemonConnfactory, err := newWssyncConnectionFactory(config)
+	if err != nil {
+		return nil, err
+	}
+
 	m := &Manager{
 		Config:       config,
 		Clientset:    client,
 		RawClient:    rawClient,
 		Content:      cp,
-		activity:     make(map[string]time.Time),
 		subscribers:  make(map[string]chan *api.SubscribeResponse),
-		wsdaemonPool: grpcpool.New(wsdaemonConnfactory),
+		wsdaemonPool: grpcpool.New(wsdaemonConnfactory, checkWSDaemonEndpoint(config.Namespace, client)),
 	}
 	m.metrics = newMetrics(m)
 	m.OnChange = m.onChange
@@ -166,7 +167,7 @@ func (m *Manager) StartWorkspace(ctx context.Context, req *api.StartWorkspaceReq
 		return nil, xerrors.Errorf("cannot create context: %w", err)
 	}
 	span.LogKV("event", "created start workspace context")
-	clog.Info("starting new workspace")
+	clog.Debug("starting new workspace")
 	// we must create the workspace pod first to make sure we don't clean up the services or configmap we're about to create
 	// because they're "dangling".
 	pod, err := m.createWorkspacePod(startContext)
@@ -179,7 +180,7 @@ func (m *Manager) StartWorkspace(ctx context.Context, req *api.StartWorkspaceReq
 		m, _ := json.Marshal(pod)
 		safePod, _ := log.RedactJSON(m)
 
-		if errors.IsAlreadyExists(err) {
+		if k8serr.IsAlreadyExists(err) {
 			clog.WithError(err).WithField("req", req).WithField("pod", safePod).Warn("was unable to start workspace which already exists")
 			return nil, status.Error(codes.AlreadyExists, "workspace instance already exists")
 		}
@@ -369,8 +370,8 @@ func (m *Manager) stopWorkspace(ctx context.Context, workspaceID string, gracePe
 	}
 
 	status, _ := m.getWorkspaceStatus(workspaceObjects{Pod: pod})
-	span.SetTag("phase", status.Phase)
 	if status != nil {
+		span.SetTag("phase", status.Phase)
 		// If the status is nil (e.g. because an error occured), we'll still try and stop the workspace
 		// This is merely an optimization that prevents deleting the workspace pod multiple times.
 		// If we do try and delete the pod a few times though, that's ok, too.
@@ -505,9 +506,7 @@ func (m *Manager) MarkActive(ctx context.Context, req *api.MarkActiveRequest) (r
 	// We do not keep the last activity as annotation on the workspace to limit the load we're placing
 	// on the K8S master in check. Thus, this state lives locally in a map.
 	now := time.Now().UTC()
-	m.activityLock.Lock()
-	m.activity[req.Id] = now
-	m.activityLock.Unlock()
+	m.activity.Store(req.Id, &now)
 
 	// We do however maintain the the "closed" flag as annotation on the workspace. This flag should not change
 	// very often and provides a better UX if it persists across ws-manager restarts.
@@ -533,13 +532,11 @@ func (m *Manager) MarkActive(ctx context.Context, req *api.MarkActiveRequest) (r
 }
 
 func (m *Manager) getWorkspaceActivity(workspaceID string) *time.Time {
-	m.activityLock.Lock()
-	lastActivity, hasActivity := m.activity[workspaceID]
-	m.activityLock.Unlock()
-
+	lastActivity, hasActivity := m.activity.Load(workspaceID)
 	if hasActivity {
-		return &lastActivity
+		return lastActivity.(*time.Time)
 	}
+
 	return nil
 }
 
@@ -554,7 +551,6 @@ func (m *Manager) markAllWorkspacesActive() error {
 		return xerrors.Errorf("markAllWorkspacesActive: %w", err)
 	}
 
-	m.activityLock.Lock()
 	for _, pod := range pods.Items {
 		wsid, ok := pod.Annotations[workspaceIDAnnotation]
 		if !ok {
@@ -562,9 +558,9 @@ func (m *Manager) markAllWorkspacesActive() error {
 			continue
 		}
 
-		m.activity[wsid] = time.Now()
+		now := time.Now().UTC()
+		m.activity.Store(wsid, &now)
 	}
-	m.activityLock.Unlock()
 	return nil
 }
 
@@ -714,7 +710,7 @@ func (m *Manager) ControlPort(ctx context.Context, req *api.ControlPortRequest) 
 		service.Spec = *spec
 
 		for _, p := range service.Spec.Ports {
-			url, err := renderWorkspacePortURL(m.Config.WorkspacePortURLTemplate, portURLContext{
+			url, err := config.RenderWorkspacePortURL(m.Config.WorkspacePortURLTemplate, config.PortURLContext{
 				Host:          m.Config.GitpodHostURL,
 				ID:            req.Id,
 				IngressPort:   fmt.Sprint(p.Port),
@@ -1176,19 +1172,10 @@ func (m *Manager) connectToWorkspaceDaemon(ctx context.Context, wso workspaceObj
 }
 
 // newWssyncConnectionFactory creates a new wsdaemon connection factory based on the wsmanager configuration
-func newWssyncConnectionFactory(managerConfig Configuration) (grpcpool.Factory, error) {
+func newWssyncConnectionFactory(managerConfig config.Configuration) (grpcpool.Factory, error) {
 	cfg := managerConfig.WorkspaceDaemon
-	opts := []grpc.DialOption{
-		grpc.WithUnaryInterceptor(grpc_opentracing.UnaryClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-		grpc.WithStreamInterceptor(grpc_opentracing.StreamClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-		grpc.WithBlock(),
-		grpc.WithBackoffMaxDelay(5 * time.Second),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                5 * time.Second,
-			Timeout:             time.Second,
-			PermitWithoutStream: true,
-		}),
-	}
+	// TODO(cw): add client-side gRPC metrics
+	grpcOpts := common_grpc.DefaultClientOptions()
 	if cfg.TLS.Authority != "" || cfg.TLS.Certificate != "" && cfg.TLS.PrivateKey != "" {
 		ca := cfg.TLS.Authority
 		crt := cfg.TLS.Certificate
@@ -1222,9 +1209,9 @@ func newWssyncConnectionFactory(managerConfig Configuration) (grpcpool.Factory, 
 			RootCAs:      certPool,
 			MinVersion:   tls.VersionTLS12,
 		})
-		opts = append(opts, grpc.WithTransportCredentials(creds))
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(creds))
 	} else {
-		opts = append(opts, grpc.WithInsecure())
+		grpcOpts = append(grpcOpts, grpc.WithInsecure())
 	}
 	port := cfg.Port
 
@@ -1238,7 +1225,7 @@ func newWssyncConnectionFactory(managerConfig Configuration) (grpcpool.Factory, 
 		// Hence upon leaving this function we can safely cancel the conctx.
 		defer cancel()
 
-		conn, err := grpc.DialContext(conctx, addr, opts...)
+		conn, err := grpc.DialContext(conctx, addr, grpcOpts...)
 		if err != nil {
 			log.WithError(err).WithField("addr", addr).Error("cannot connect to ws-daemon")
 
@@ -1247,4 +1234,35 @@ func newWssyncConnectionFactory(managerConfig Configuration) (grpcpool.Factory, 
 		}
 		return conn, nil
 	}, nil
+}
+
+func checkWSDaemonEndpoint(namespace string, clientset client.Client) func(string) bool {
+	return func(address string) bool {
+		var endpointsList corev1.EndpointsList
+		err := clientset.List(context.Background(), &endpointsList,
+			&client.ListOptions{
+				Namespace: namespace,
+				LabelSelector: labels.SelectorFromSet(labels.Set{
+					"component": "ws-daemon",
+					"kind":      "service",
+				}),
+			},
+		)
+		if err != nil {
+			log.WithError(err).Error("cannot list ws-daemon endpoints")
+			return false
+		}
+
+		for _, endpoints := range endpointsList.Items {
+			for _, subset := range endpoints.Subsets {
+				for _, endpointAddress := range subset.Addresses {
+					if address == endpointAddress.IP {
+						return true
+					}
+				}
+			}
+		}
+
+		return false
+	}
 }

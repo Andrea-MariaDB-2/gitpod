@@ -5,7 +5,7 @@
  */
 
 import moment from "moment";
-import { PrebuildInfo, Project } from "@gitpod/gitpod-protocol";
+import { PrebuildInfo, PrebuildWithStatus, Project } from "@gitpod/gitpod-protocol";
 import { useContext, useEffect, useState } from "react";
 import { useHistory, useLocation, useRouteMatch } from "react-router";
 import Header from "../components/Header";
@@ -15,26 +15,30 @@ import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
 import { prebuildStatusIcon, prebuildStatusLabel } from "./Prebuilds";
 import { ContextMenuEntry } from "../components/ContextMenu";
 import { shortCommitMessage } from "./render-utils";
+import Spinner from "../icons/Spinner.svg";
 
 export default function () {
     const history = useHistory();
-    const { teams } = useContext(TeamsContext);
     const location = useLocation();
-    const match = useRouteMatch<{ team: string, resource: string }>("/:team/:resource");
-    const projectName = match?.params?.resource;
+
+    const { teams } = useContext(TeamsContext);
     const team = getCurrentTeam(location, teams);
+
+    const match = useRouteMatch<{ team: string, resource: string }>("/(t/)?:team/:resource");
+    const projectName = match?.params?.resource;
 
     const [project, setProject] = useState<Project | undefined>();
 
+    const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
     const [branches, setBranches] = useState<Project.BranchDetails[]>([]);
-    const [lastPrebuilds, setLastPrebuilds] = useState<Map<string, PrebuildInfo | undefined>>(new Map());
+    const [lastPrebuilds, setLastPrebuilds] = useState<Map<string, PrebuildWithStatus | undefined>>(new Map());
     const [prebuildLoaders] = useState<Set<string>>(new Set());
 
     const [searchFilter, setSearchFilter] = useState<string | undefined>();
 
     useEffect(() => {
         updateProject();
-    }, [ teams, team ]);
+    }, [ teams ]);
 
     const updateProject = async () => {
         if (!teams || !projectName) {
@@ -51,20 +55,23 @@ export default function () {
 
         setProject(project);
 
-        const details = await getGitpodService().server.getProjectOverview(project.id);
-        if (details) {
-            // default branch on top of the rest
-            const branches = details.branches.sort((a, b) => (b.isDefault as any) - (a.isDefault as any)) || [];
-            setBranches(branches);
+        setIsLoadingBranches(true);
+        try {
+            const details = await getGitpodService().server.getProjectOverview(project.id);
+            if (details) {
+                // default branch on top of the rest
+                const branches = details.branches.sort((a, b) => (b.isDefault as any) - (a.isDefault as any)) || [];
+                setBranches(branches);
+            }
+        } catch (error) {
+            console.error('Error getting project overview', error);
+        } finally {
+            setIsLoadingBranches(false);
         }
     }
 
     const branchContextMenu = (branch: Project.BranchDetails) => {
         const entries: ContextMenuEntry[] = [];
-        entries.push({
-            title: "New Workspace",
-            onClick: () => onNewWorkspace(branch)
-        });
         entries.push({
             title: "Rerun Prebuild",
             onClick: () => triggerPrebuild(branch),
@@ -87,7 +94,7 @@ export default function () {
             // TODO(at): this need to be revised once prebuild events are integrated
             return;
         }
-        if (!team || !project) {
+        if (!project) {
             return;
         }
         prebuildLoaders.add(branch.name);
@@ -107,10 +114,6 @@ export default function () {
         return true;
     }
 
-    const onNewWorkspace = (branch: Project.BranchDetails) => {
-        window.location.href = gitpodHostUrl.withContext(`${branch.url}`).toString();
-    }
-
     const triggerPrebuild = (branch: Project.BranchDetails) => {
         if (project) {
             getGitpodService().server.triggerPrebuild(project.id, branch.name)
@@ -118,7 +121,7 @@ export default function () {
     }
 
     const openPrebuild = (pb: PrebuildInfo) => {
-        history.push(`/${!!team ? team.slug : 'projects'}/${projectName}/${pb.id}`);
+        history.push(`/${!!team ? 't/'+team.slug : 'projects'}/${projectName}/${pb.id}`);
     }
 
     const formatDate = (date: string | undefined) => {
@@ -152,21 +155,25 @@ export default function () {
                         <ItemFieldContextMenu />
                     </ItemField>
                 </Item>
+                {isLoadingBranches && <div className="flex items-center justify-center space-x-2 text-gray-400 text-sm pt-16">
+                    <img className="h-4 w-4 animate-spin" src={Spinner} />
+                    <span>Fetching repository branches...</span>
+                </div>}
                 {branches.filter(filter).slice(0, 10).map((branch, index) => {
 
                     const branchName = branch.name;
                     const prebuild = lastPrebuild(branch); // this might lazily trigger fetching of prebuild details
 
                     const avatar = branch.changeAuthorAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={branch.changeAuthorAvatar || ''} alt={branch.changeAuthor} />;
-                    const statusIcon = prebuild?.status && prebuildStatusIcon(prebuild.status);
-                    const status = prebuild?.status && prebuildStatusLabel(prebuild.status);
+                    const statusIcon = prebuildStatusIcon(prebuild?.status);
+                    const status = prebuildStatusLabel(prebuild?.status);
 
                     return <Item key={`branch-${index}-${branchName}`} className="grid grid-cols-3 group">
                         <ItemField className="flex items-center">
                             <div>
                                 <div className="text-base text-gray-900 dark:text-gray-50 font-medium mb-1">
                                     {branchName}
-                                    {branch.isDefault && (<span className="ml-2 self-center rounded-xl py-0.5 px-2 text-sm bg-blue-50 text-blue-400">DEFAULT</span>)}
+                                    {branch.isDefault && (<span className="ml-2 self-center rounded-xl py-0.5 px-2 text-sm bg-blue-50 text-blue-40 dark:bg-blue-500 dark:text-blue-100">DEFAULT</span>)}
                                 </div>
                             </div>
                         </ItemField>
@@ -177,7 +184,7 @@ export default function () {
                             </div>
                         </ItemField>
                         <ItemField className="flex items-center">
-                            <div className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1 cursor-pointer" onClick={() => prebuild && openPrebuild(prebuild)}>
+                            <div className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1 cursor-pointer" onClick={() => prebuild && openPrebuild(prebuild.info)}>
                                 {prebuild ? (<><div className="inline-block align-text-bottom mr-2 w-4 h-4">{statusIcon}</div>{status}</>) : (<span> </span>)}
                             </div>
                             <span className="flex-grow" />

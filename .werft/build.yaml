@@ -4,6 +4,9 @@ pod:
   nodeSelector:
     cloud.google.com/gke-nodepool: builds
   volumes:
+  - name: monitoring-satellite-preview-token
+    secret:
+      secretName: monitoring-satellite-preview-token
   - name: gcp-sa
     secret:
       secretName: gcp-sa-gitpod-dev-deployer
@@ -43,10 +46,12 @@ pod:
     - name: MYSQL_TCP_PORT
       value: 23306
   - name: build
-    image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:geropl-move-qemu-image-build-to-4945.3
+    image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:aledbf-libsecov.2
     workingDir: /workspace
     imagePullPolicy: Always
     volumeMounts:
+    - name: monitoring-satellite-preview-token
+      mountPath: /mnt/secrets/monitoring-satellite-preview-token
     - name: gcp-sa
       mountPath: /mnt/secrets/gcp-sa
       readOnly: true

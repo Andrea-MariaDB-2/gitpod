@@ -10,8 +10,6 @@ import * as crypto from 'crypto';
 import * as express from 'express';
 import { IncomingHttpHeaders } from 'http';
 import { inject, injectable } from 'inversify';
-import * as websocket from 'ws';
-import { WsNextFunction, WsRequestHandler } from '../express/ws-handler';
 import { AllAccessFunctionGuard, ExplicitFunctionAccessGuard, WithFunctionAccessGuard } from './function-access';
 import { TokenResourceGuard, WithResourceAccessGuard } from './resource-access';
 
@@ -33,8 +31,8 @@ const bearerAuthCode = 'BearerAuth';
 interface BearerAuthError extends Error {
     code: typeof bearerAuthCode
 }
-function isBearerAuthError(error: Error): error is BearerAuthError {
-    return 'code' in error && error['code'] === bearerAuthCode;
+export function isBearerAuthError(error: Error): error is BearerAuthError {
+    return 'code' in error && (error as any)['code'] === bearerAuthCode;
 }
 function createBearerAuthError(message: string): BearerAuthError {
     return Object.assign(new Error(message), { code: bearerAuthCode } as { code: typeof bearerAuthCode });
@@ -47,37 +45,30 @@ export class BearerAuth {
     get restHandler(): express.RequestHandler {
         return async (req, res, next) => {
             try {
-                await this.doAuth(req);
+                await this.auth(req);
             } catch (e) {
                 if (isBearerAuthError(e)) {
                     res.status(401).send(e.message);
                     return;
                 }
-                throw e;
+                return next(e);
             }
             return next();
-        }
+        };
     }
 
     get restHandlerOptionally(): express.RequestHandler {
         return async (req, res, next) => {
             try {
-                await this.doAuth(req);
+                await this.auth(req);
             } catch (e) {
                 // don't error the request, we just have not bearer authentication token
             }
             return next();
-        }
+        };
     }
 
-    public get websocketHandler(): WsRequestHandler {
-        return async (ws: websocket, req: express.Request, next: WsNextFunction): Promise<void> => {
-            await this.doAuth(req);
-            return next();
-        }
-    }
-
-    private async doAuth(req: express.Request): Promise<void> {
+    async auth(req: express.Request): Promise<void> {
         const token = getBearerToken(req.headers)
         if (!token) {
             throw createBearerAuthError('missing Bearer token');

@@ -13,19 +13,19 @@ import (
 	"syscall"
 	"time"
 
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/pprof"
 	"github.com/gitpod-io/gitpod/image-builder/api"
 	"github.com/gitpod-io/gitpod/image-builder/pkg/orchestrator"
 	"github.com/gitpod-io/gitpod/image-builder/pkg/resolve"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/keepalive"
 )
 
 // runCmd represents the run command
@@ -34,6 +34,36 @@ var runCmd = &cobra.Command{
 	Short: "Starts the image-builder service",
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg := getConfig()
+
+		common_grpc.SetupLogging()
+		var promreg prometheus.Registerer
+		if cfg.Prometheus.Addr != "" {
+			reg := prometheus.NewRegistry()
+			promreg = reg
+
+			handler := http.NewServeMux()
+			handler.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+
+			// BEWARE: for the gRPC client side metrics to work it's important to call common_grpc.ClientMetrics()
+			//         before NewOrchestratingBuilder as the latter produces the gRPC client.
+			reg.MustRegister(
+				collectors.NewGoCollector(),
+				collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+				common_grpc.ClientMetrics(),
+			)
+
+			go func() {
+				err := http.ListenAndServe(cfg.Prometheus.Addr, handler)
+				if err != nil {
+					log.WithError(err).Error("Prometheus metrics server failed")
+				}
+			}()
+			log.WithField("addr", cfg.Prometheus.Addr).Info("started Prometheus metrics server")
+		}
+
+		if cfg.PProf.Addr != "" {
+			go pprof.Serve(cfg.PProf.Addr)
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -57,28 +87,19 @@ var runCmd = &cobra.Command{
 			go resolver.StartCaching(ctx, interval)
 			service.RefResolver = resolver
 		}
+		if promreg != nil {
+			err = service.RegisterMetrics(promreg)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
 
 		err = service.Start(ctx)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		grpcOpts := []grpc.ServerOption{
-			// terminate the connection if the client pings more than once every 2 seconds
-			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-				MinTime:             2 * time.Second,
-				PermitWithoutStream: true,
-			}),
-			// We don't know how good our cients are at closing connections. If they don't close them properly
-			// we'll be leaking goroutines left and right. Closing Idle connections should prevent that.
-			grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 30 * time.Minute}),
-			grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-				grpc_opentracing.StreamServerInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer())),
-			)),
-			grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-				grpc_opentracing.UnaryServerInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer())),
-			)),
-		}
+		grpcOpts := common_grpc.DefaultServerOptions()
 		tlsOpt, err := cfg.Service.TLS.ServerOption()
 		if err != nil {
 			log.WithError(err).Fatal("cannot use TLS config")
@@ -103,23 +124,6 @@ var runCmd = &cobra.Command{
 			}
 		}()
 		log.WithField("addr", cfg.Service.Addr).Info("started workspace content server")
-
-		if cfg.Prometheus.Addr != "" {
-			handler := http.NewServeMux()
-			handler.Handle("/metrics", promhttp.Handler())
-
-			go func() {
-				err := http.ListenAndServe(cfg.Prometheus.Addr, handler)
-				if err != nil {
-					log.WithError(err).Error("Prometheus metrics server failed")
-				}
-			}()
-			log.WithField("addr", cfg.Prometheus.Addr).Info("started Prometheus metrics server")
-		}
-
-		if cfg.PProf.Addr != "" {
-			go pprof.Serve(cfg.PProf.Addr)
-		}
 
 		// run until we're told to stop
 		sigChan := make(chan os.Signal, 1)

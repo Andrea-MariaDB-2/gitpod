@@ -13,7 +13,7 @@ import {
 } from './protocol';
 import {
     Team, TeamMemberInfo,
-    TeamMembershipInvite, Project, PrebuildInfo, TeamMemberRole
+    TeamMembershipInvite, Project, TeamMemberRole, PrebuildWithStatus, StartPrebuildResult
 } from './teams-projects-protocol';
 import { JsonRpcProxy, JsonRpcServer } from './messaging/proxy-factory';
 import { Disposable, CancellationTokenSource } from 'vscode-jsonrpc';
@@ -28,11 +28,13 @@ import { Emitter } from './util/event';
 import { AccountStatement, CreditAlert } from './accounting-protocol';
 import { GithubUpgradeURL, PlanCoupon } from './payment-protocol';
 import { TeamSubscription, TeamSubscriptionSlot, TeamSubscriptionSlotResolved } from './team-subscription-protocol';
-import { RemoteTrackMessage } from './analytics';
+import { RemotePageMessage, RemoteTrackMessage } from './analytics';
 
 export interface GitpodClient {
     onInstanceUpdate(instance: WorkspaceInstance): void;
     onWorkspaceImageBuildLogs: WorkspaceImageBuild.LogCallback;
+
+    onPrebuildUpdate(update: PrebuildWithStatus): void;
 
     onCreditAlert(creditAlert: CreditAlert): void;
 
@@ -55,6 +57,7 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getBranding(): Promise<Branding>;
     getConfiguration(): Promise<Configuration>;
     getToken(query: GitpodServer.GetTokenSearchOptions): Promise<Token | undefined>;
+    getGitpodTokenScopes(tokenHash: string): Promise<string[]>;
     /**
      * @deprecated
      */
@@ -128,10 +131,11 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getTeamProjects(teamId: string): Promise<Project[]>;
     getUserProjects(): Promise<Project[]>;
     getProjectOverview(projectId: string): Promise<Project.Overview | undefined>;
-    findPrebuilds(params: FindPrebuildsParams): Promise<PrebuildInfo[]>;
-    triggerPrebuild(projectId: string, branch: string): Promise<void>;
+    findPrebuilds(params: FindPrebuildsParams): Promise<PrebuildWithStatus[]>;
+    triggerPrebuild(projectId: string, branchName: string | null): Promise<StartPrebuildResult>;
     setProjectConfiguration(projectId: string, configString: string): Promise<void>;
     fetchProjectRepositoryConfiguration(projectId: string): Promise<string | undefined>;
+    guessProjectConfiguration(projectId: string): Promise<string | undefined>;
 
     // content service
     getContentBlobUploadUrl(name: string): Promise<string>
@@ -223,6 +227,7 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
      * Analytics
      */
     trackEvent(event: RemoteTrackMessage): Promise<void>;
+    trackLocation(event: RemotePageMessage): Promise<void>;
 }
 
 export interface CreateProjectParams {
@@ -239,6 +244,8 @@ export interface FindPrebuildsParams {
     branch?: string;
     latest?: boolean;
     prebuildId?: string;
+    // default: 30
+    limit?: number;
 }
 export interface GetProviderRepositoriesParams {
     provider: string;
@@ -254,6 +261,13 @@ export interface ProviderRepository {
     installationUpdatedAt?: string;
 
     inUse?: boolean;
+}
+
+export interface ClientHeaderFields{
+    ip?:string;
+    userAgent?:string;
+    dnt?:number;
+    clientRegion?:string;
 }
 
 export const WorkspaceTimeoutValues = ["30m", "60m", "180m"] as const;
@@ -369,6 +383,18 @@ export class GitpodCompositeClient<Client extends GitpodClient> implements Gitpo
             if (client.onInstanceUpdate) {
                 try {
                     client.onInstanceUpdate(instance);
+                } catch (error) {
+                    console.error(error)
+                }
+            }
+        }
+    }
+
+    onPrebuildUpdate(update: PrebuildWithStatus): void {
+        for (const client of this.clients) {
+            if (client.onPrebuildUpdate) {
+                try {
+                    client.onPrebuildUpdate(update);
                 } catch (error) {
                     console.error(error)
                 }

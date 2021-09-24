@@ -11,7 +11,7 @@ import { DateInterval, ExtraAccessTokenFields, GrantIdentifier, OAuthClient, OAu
 import { inject, injectable, postConstruct } from "inversify";
 import { EntityManager, Repository } from "typeorm";
 import * as uuidv4 from 'uuid/v4';
-import { BUILTIN_WORKSPACE_PROBE_USER_NAME, MaybeUser, PartialUserUpdate, UserDB } from "../user-db";
+import { BUILTIN_WORKSPACE_PROBE_USER_ID, MaybeUser, PartialUserUpdate, UserDB } from "../user-db";
 import { DBGitpodToken } from "./entity/db-gitpod-token";
 import { DBIdentity } from "./entity/db-identity";
 import { DBTokenEntry } from "./entity/db-token-entry";
@@ -77,8 +77,10 @@ export class TypeORMUserDBImpl implements UserDB {
             id: uuidv4(),
             creationDate: new Date().toISOString(),
             identities: [],
-            allowsMarketingCommunication: true,
-            additionalData: { ideSettings: { defaultIde: 'code' } },
+            additionalData: {
+                ideSettings: { defaultIde: 'code' },
+                emailNotificationSettings: { allowsChangelogMail: true, allowsDevXMail: true, allowsOnboardingMail: true }
+            },
         };
         await this.storeUser(user);
         return user;
@@ -170,6 +172,14 @@ export class TypeORMUserDBImpl implements UserDB {
         }
 
         return { user: token.user, token };
+    }
+
+    public async findGitpodTokensOfUser(userId: string, tokenHash: string): Promise<GitpodToken | undefined> {
+        const repo = await this.getGitpodTokenRepo()
+        const qBuilder = repo.createQueryBuilder('gitpodToken')
+            .leftJoinAndSelect("gitpodToken.user", "user");
+        qBuilder.where('user.id = :userId AND gitpodToken.tokenHash = :tokenHash', { userId, tokenHash });
+        return qBuilder.getOne();
     }
 
     public async findAllGitpodTokensOfUser(userId: string): Promise<GitpodToken[]> {
@@ -300,7 +310,7 @@ export class TypeORMUserDBImpl implements UserDB {
             WHERE markedDeleted != true`;
         if (excludeBuiltinUsers) {
             query = `${query}
-                AND name <> '${BUILTIN_WORKSPACE_PROBE_USER_NAME}'`
+                AND id <> '${BUILTIN_WORKSPACE_PROBE_USER_ID}'`
         }
         const res = await userRepo.query(query);
         const count = res[0].cnt;
@@ -344,7 +354,7 @@ export class TypeORMUserDBImpl implements UserDB {
             qBuilder.andWhere("user.creationDate < :maxCreationDate", { maxCreationDate: maxCreationDate.toISOString() });
         }
         if (excludeBuiltinUsers) {
-            qBuilder.andWhere("user.name <> :username", { username: BUILTIN_WORKSPACE_PROBE_USER_NAME })
+            qBuilder.andWhere("user.id <> :userId", { userId: BUILTIN_WORKSPACE_PROBE_USER_ID })
         }
         qBuilder.orderBy("user." + orderBy, orderDir);
         qBuilder.skip(offset).take(limit).select();

@@ -35,6 +35,7 @@ spec:
         kind: pod
         stage: {{ .Values.installation.stage }}
       annotations:
+{{ include "gitpod.pod.dependsOn" $this | indent 8 }}
         checksum/tlskey: {{ include (print $.Template.BasePath "/ws-daemon-tlssecret.yaml") $ | sha256sum }}
     spec:
       priorityClassName: system-node-critical
@@ -62,7 +63,7 @@ spec:
       containers:
 {{ include "gitpod.kube-rbac-proxy" $this | indent 6 }}
       - name: ws-manager
-        args: ["run", "-v", "--config", "/config/config.json"]
+        args: ["run", "--config", "/config/config.json"]
         image: {{ template "gitpod.comp.imageFull" $this }}
 {{ include "gitpod.container.imagePullPolicy" $this | indent 8 }}
 {{ include "gitpod.container.resources" $this | indent 8 }}

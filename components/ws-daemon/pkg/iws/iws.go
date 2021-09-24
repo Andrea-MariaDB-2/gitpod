@@ -5,6 +5,7 @@
 package iws
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -96,7 +97,7 @@ func ServeWorkspace(uidmapper *Uidmapper, fsshift api.FSShiftMethod) func(ctx co
 			return xerrors.Errorf("cannot start in-workspace-helper server: %w", err)
 		}
 
-		log.WithFields(ws.OWI()).Info("established IWS server")
+		log.WithFields(ws.OWI()).Debug("established IWS server")
 		ws.NonPersistentAttrs[session.AttrWorkspaceServer] = helper.Stop
 
 		return nil
@@ -120,7 +121,7 @@ func StopServingWorkspace(ctx context.Context, ws *session.Workspace) (err error
 	}
 
 	stopFn()
-	log.WithFields(ws.OWI()).Info("stopped IWS server")
+	log.WithFields(ws.OWI()).Debug("stopped IWS server")
 	return nil
 }
 
@@ -277,7 +278,6 @@ func (wbs *InWorkspaceServiceServer) PrepareForUserNS(ctx context.Context, req *
 		log.WithField("containerPID", containerPID).WithError(err).Error("cannot make container's rootfs shared")
 		return nil, status.Errorf(codes.Internal, "cannot make container's rootfs shared")
 	}
-	log.WithField("containerPID", containerPID).Info("mount shared")
 
 	err = nsinsider(wbs.Session.InstanceID, int(1), func(c *exec.Cmd) {
 		c.Args = append(c.Args, "mount-shiftfs-mark", "--source", rootfs, "--target", mountpoint)
@@ -451,7 +451,7 @@ func (wbs *InWorkspaceServiceServer) UmountProc(ctx context.Context, req *api.Um
 			return
 		}
 		if len(msgs) != 1 {
-			fdrecv <- fdresp{Err: fmt.Errorf("expected a single socket control message")}
+			fdrecv <- fdresp{Err: xerrors.Errorf("expected a single socket control message")}
 			return
 		}
 
@@ -461,7 +461,7 @@ func (wbs *InWorkspaceServiceServer) UmountProc(ctx context.Context, req *api.Um
 			return
 		}
 		if len(fds) == 0 {
-			fdrecv <- fdresp{Err: fmt.Errorf("expected a single socket FD")}
+			fdrecv <- fdresp{Err: xerrors.Errorf("expected a single socket FD")}
 			return
 		}
 
@@ -660,21 +660,21 @@ func nsinsider(instanceID string, targetPid int, mod func(*exec.Cmd), opts ...ns
 	for _, ns := range nss {
 		f, err := os.OpenFile(ns.Source, ns.Flags, 0)
 		if err != nil {
-			return fmt.Errorf("cannot open %s: %w", ns.Source, err)
+			return xerrors.Errorf("cannot open %s: %w", ns.Source, err)
 		}
 		defer f.Close()
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", ns.Env, stdioFdCount+len(cmd.ExtraFiles)))
 		cmd.ExtraFiles = append(cmd.ExtraFiles, f)
 	}
 
-	rw := log.Writer(log.WithFields(log.OWI("", "", instanceID)))
-	defer rw.Close()
-
-	cmd.Stdout = rw
-	cmd.Stderr = rw
+	var cmdOut bytes.Buffer
+	cmd.Stdout = &cmdOut
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
 	err = cmd.Run()
+	log.FromBuffer(&cmdOut, log.WithFields(log.OWI("", "", instanceID)))
 	if err != nil {
-		return fmt.Errorf("cannot run nsinsider: %w", err)
+		return xerrors.Errorf("cannot run nsinsider: %w", err)
 	}
 	return nil
 }

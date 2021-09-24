@@ -13,6 +13,9 @@ import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 import { TLSConfig, WorkspaceClusterDB, WorkspaceClusterWoTLS } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
 import { WorkspaceCluster } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
 import { Queue } from "@gitpod/gitpod-protocol";
+import { defaultGRPCOptions } from '@gitpod/gitpod-protocol/lib/util/grpc';
+import * as grpc from '@grpc/grpc-js';
+import { PrometheusMetricsExporter } from "./prometheus-metrics-exporter";
 
 @injectable()
 export class BridgeController {
@@ -27,6 +30,9 @@ export class BridgeController {
 
     @inject(WorkspaceClusterDB)
     protected readonly db: WorkspaceClusterDB;
+
+    @inject(PrometheusMetricsExporter)
+    protected readonly metrics: PrometheusMetricsExporter;
 
     protected readonly bridges: Map<string, WorkspaceManagerBridge> = new Map();
     protected readonly reconcileQueue: Queue = new Queue();
@@ -55,16 +61,17 @@ export class BridgeController {
     protected async reconcile() {
         return this.reconcileQueue.enqueue(async () => {
             const allClusters = await this.getAllWorkspaceClusters();
+            log.info("reconciling clusters...", { allClusters });
             const toDelete: string[] = [];
             try {
                 for (const [name, bridge] of this.bridges) {
                     let cluster = allClusters.get(name);
                     if (!cluster) {
-                        log.info("reconcile: cluster not present anymore, stopping", { name });
+                        log.debug("reconcile: cluster not present anymore, stopping", { name });
                         bridge.stop();
                         toDelete.push(name);
                     } else {
-                        log.info("reconcile: cluster already present, doing nothing", { name });
+                        log.debug("reconcile: cluster already present, doing nothing", { name });
                         allClusters.delete(name);
                     }
                 }
@@ -74,24 +81,22 @@ export class BridgeController {
                 }
             }
 
+            this.metrics.updateClusterMetrics(Array.from(allClusters).map(c => c[1]));
             for (const [name, newCluster] of allClusters) {
-                log.info("reconcile: create bridge for new cluster", { name });
+                log.debug("reconcile: create bridge for new cluster", { name });
                 const bridge = await this.createAndStartBridge(newCluster);
                 this.bridges.set(newCluster.name, bridge);
             }
+            log.info("done reconciling.", { allClusters });
         });
     }
 
     protected async createAndStartBridge(cluster: WorkspaceClusterInfo): Promise<WorkspaceManagerBridge> {
         const bridge = this.bridgeFactory() as WorkspaceManagerBridge;
+        const grpcOptions: grpc.ClientOptions = {
+            ...defaultGRPCOptions,
+        };
         const clientProvider = async () => {
-            const grpcOptions = {
-                "grpc.keepalive_timeout_ms": 20000,
-                "grpc.http2.min_time_between_pings_ms": 1000,
-                "grpc.keepalive_time_ms": 30000,
-                "grpc.keepalive_permit_without_calls": 1,
-                "grpc-node.max_session_memory": 50,
-            };
             return this.clientProvider.get(cluster.name, grpcOptions);
         }
         bridge.start(cluster, clientProvider);

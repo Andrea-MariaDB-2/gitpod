@@ -21,9 +21,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/namegen"
 	"github.com/gitpod-io/gitpod/common-go/util"
@@ -79,16 +79,7 @@ func NewWorkspaceManagerPrescaleDriver(config WorkspaceManagerPrescaleDriverConf
 	}
 	config.WorkspaceImage = imgRef.String()
 
-	grpcOpts := []grpc.DialOption{
-		grpc.WithBlock(),
-		grpc.WithBackoffMaxDelay(5 * time.Second),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                5 * time.Second,
-			Timeout:             time.Second,
-			PermitWithoutStream: true,
-		}),
-	}
-
+	grpcOpts := common_grpc.DefaultClientOptions()
 	if config.WsManager.TLS != nil {
 		ca := config.WsManager.TLS.CA
 		crt := config.WsManager.TLS.Certificate
@@ -202,7 +193,7 @@ func (wspd *WorkspaceManagerPrescaleDriver) Run() {
 		defer stop()
 		renewal = tc
 
-		log.WithField("percentage", wspd.Config.Renewal.Percentage).WithField("interval", wspd.Config.Renewal.Interval.String()).Info("enabled ghost workspace renewal")
+		log.WithField("percentage", wspd.Config.Renewal.Percentage).WithField("interval", wspd.Config.Renewal.Interval.String()).Debug("enabled ghost workspace renewal")
 	}
 	scheduleGhosts, stopSchedulingGhosts := wspd.time.NewTicker(time.Duration(wspd.Config.SchedulerInterval))
 	defer stopSchedulingGhosts()
@@ -265,7 +256,7 @@ func (wspd *WorkspaceManagerPrescaleDriver) Run() {
 				log.WithError(err).Error("cannot stop ghost workspaces during renewal")
 				continue
 			}
-			log.WithField("delta", d).WithField("ghostCount", status.Count.Ghost).Info("deleted ghost workspaces for renewal")
+			log.WithField("delta", d).WithField("ghostCount", status.Count.Ghost).Debug("deleted ghost workspaces for renewal")
 		case setpoint = <-cchan:
 			// we've already set the new setpoint - wait for scheduleGhosts to act on it.
 			wspd.metrics.OnSetpointChange(setpoint)
@@ -288,7 +279,7 @@ func (wspd *WorkspaceManagerPrescaleDriver) Run() {
 				log.WithError(err).Error("failed to realise ghost workspace delta")
 				continue
 			}
-			log.WithField("setpoint", setpoint).WithField("delta", d).Info("(de)scheduled ghost workspaces")
+			log.WithField("setpoint", setpoint).WithField("delta", d).Debug("(de)scheduled ghost workspaces")
 		}
 	}
 }

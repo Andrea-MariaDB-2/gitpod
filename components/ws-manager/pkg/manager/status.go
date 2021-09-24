@@ -393,6 +393,20 @@ func (m *Manager) extractStatusFromPod(result *api.WorkspaceStatus, wso workspac
 			result.Conditions.Failed = ""
 		}
 
+		var hasFinalizer bool
+		for _, f := range wso.Pod.Finalizers {
+			if f == gitpodFinalizerName {
+				hasFinalizer = true
+				break
+			}
+		}
+		if !hasFinalizer {
+			// We do this independently of the dispostal status because pods only get their finalizer
+			// once they're running. If they fail before they reach the running phase we'll never see
+			// a disposal status, hence would never stop the workspace.
+			result.Phase = api.WorkspacePhase_STOPPED
+		}
+
 		if rawDisposalStatus, ok := pod.Annotations[disposalStatusAnnotation]; ok {
 			var ds workspaceDisposalStatus
 			err := json.Unmarshal([]byte(rawDisposalStatus), &ds)
@@ -419,17 +433,6 @@ func (m *Manager) extractStatusFromPod(result *api.WorkspaceStatus, wso workspac
 					result.Conditions.Failed += "; "
 				}
 				result.Conditions.Failed += fmt.Sprintf("last backup failed: %s. Please contact support if you need the workspace data.", ds.BackupFailure)
-			}
-
-			var hasFinalizer bool
-			for _, f := range wso.Pod.Finalizers {
-				if f == gitpodFinalizerName {
-					hasFinalizer = true
-					break
-				}
-			}
-			if !hasFinalizer {
-				result.Phase = api.WorkspacePhase_STOPPED
 			}
 		}
 
@@ -588,13 +591,17 @@ func extractFailure(wso workspaceObjects) (string, *api.WorkspacePhase) {
 			if cs.State.Waiting.Reason == "ImagePullBackOff" || cs.State.Waiting.Reason == "ErrImagePull" {
 				// If the image pull failed we were definitely in the api.WorkspacePhase_CREATING phase,
 				// unless of course this pod has been deleted already.
-				var res api.WorkspacePhase
+				var res *api.WorkspacePhase
 				if isPodBeingDeleted(pod) {
-					res = api.WorkspacePhase_STOPPING
+					// The pod is being deleted already and we have to decide the phase based on the presence of the
+					// finalizer and disposal status annotation. That code already exists in the remainder of getStatus,
+					// hence we defer the decision.
+					res = nil
 				} else {
-					res = api.WorkspacePhase_CREATING
+					c := api.WorkspacePhase_CREATING
+					res = &c
 				}
-				return fmt.Sprintf("cannot pull image: %s", cs.State.Waiting.Message), &res
+				return fmt.Sprintf("cannot pull image: %s", cs.State.Waiting.Message), res
 			}
 		}
 
@@ -608,11 +615,21 @@ func extractFailure(wso workspaceObjects) (string, *api.WorkspacePhase) {
 			// we would not be here as we've checked for a DeletionTimestamp prior. So let's find out why the
 			// container is terminating.
 			if terminationState.ExitCode != 0 && terminationState.Message != "" {
+				var phase *api.WorkspacePhase
+				if !isPodBeingDeleted(pod) {
+					// If the wrote a termination message and is not currently being deleted,
+					// then it must have been/be running. If we did not force the phase here,
+					// we'd be in unknown.
+					c := api.WorkspacePhase_RUNNING
+					phase = &c
+				}
+
 				// the container itself told us why it was terminated - use that as failure reason
-				return extractFailureFromLogs([]byte(terminationState.Message)), nil
+				return extractFailureFromLogs([]byte(terminationState.Message)), phase
 			} else if terminationState.Reason == "Error" {
 				if !isPodBeingDeleted(pod) && terminationState.ExitCode != containerKilledExitCode {
-					return fmt.Sprintf("container %s ran with an error: exit code %d", cs.Name, terminationState.ExitCode), nil
+					phase := api.WorkspacePhase_RUNNING
+					return fmt.Sprintf("container %s ran with an error: exit code %d", cs.Name, terminationState.ExitCode), &phase
 				}
 			} else if terminationState.Reason == "Completed" {
 				if wso.IsWorkspaceHeadless() {

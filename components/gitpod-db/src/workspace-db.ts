@@ -6,7 +6,7 @@
 
 import { DeepPartial } from 'typeorm';
 
-import { Workspace, WorkspaceInfo, WorkspaceInstance, WorkspaceInstanceUser, WhitelistedRepository, Snapshot, LayoutData, PrebuiltWorkspace, PrebuiltWorkspaceUpdatable, RunningWorkspaceInfo, WorkspaceAndInstance, WorkspaceType } from '@gitpod/gitpod-protocol';
+import { Workspace, WorkspaceInfo, WorkspaceInstance, WorkspaceInstanceUser, WhitelistedRepository, Snapshot, LayoutData, PrebuiltWorkspace, PrebuiltWorkspaceUpdatable, RunningWorkspaceInfo, WorkspaceAndInstance, WorkspaceType, PrebuildInfo } from '@gitpod/gitpod-protocol';
 
 export type MaybeWorkspace = Workspace | undefined;
 export type MaybeWorkspaceInstance = WorkspaceInstance | undefined;
@@ -95,7 +95,6 @@ export interface WorkspaceDB {
     findSnapshotsByWorkspaceId(workspaceId: string): Promise<Snapshot[]>;
     storeSnapshot(snapshot: Snapshot): Promise<Snapshot>;
 
-    getTotalPrebuildUseSeconds(forDays: number): Promise<number | undefined>;
     storePrebuiltWorkspace(pws: PrebuiltWorkspace): Promise<PrebuiltWorkspace>;
     findPrebuiltWorkspaceByCommit(cloneURL: string, commit: string): Promise<PrebuiltWorkspace | undefined>;
     findPrebuildsWithWorkpace(cloneURL: string): Promise<PrebuildWithWorkspace[]>;
@@ -114,5 +113,8 @@ export interface WorkspaceDB {
     hardDeleteWorkspace(workspaceID: string): Promise<void>;
 
     findPrebuiltWorkspacesByProject(projectId: string, branch?: string, limit?: number): Promise<PrebuiltWorkspace[]>;
-    findPrebuiltWorkspacesById(prebuildId: string): Promise<PrebuiltWorkspace | undefined>;
+    findPrebuiltWorkspaceById(prebuildId: string): Promise<PrebuiltWorkspace | undefined>;
+
+    storePrebuildInfo(prebuildInfo: PrebuildInfo): Promise<void>;
+    findPrebuildInfos(prebuildIds: string[]): Promise<PrebuildInfo[]>;
 }

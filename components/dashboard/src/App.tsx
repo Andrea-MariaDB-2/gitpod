@@ -6,7 +6,6 @@
 
 import React, { Suspense, useContext, useEffect, useState } from 'react';
 import Menu from './Menu';
-import { BrowserRouter } from "react-router-dom";
 import { Redirect, Route, Switch } from "react-router";
 
 import { Login } from './Login';
@@ -17,6 +16,9 @@ import { getGitpodService } from './service/service';
 import { shouldSeeWhatsNew, WhatsNew } from './whatsnew/WhatsNew';
 import gitpodIcon from './icons/gitpod.svg';
 import { ErrorCodes } from '@gitpod/gitpod-protocol/lib/messaging/error';
+import { useHistory } from 'react-router-dom';
+import { trackButtonOrAnchor, trackPathChange, trackLocation } from './Analytics';
+import { User } from '@gitpod/gitpod-protocol';
 
 const Setup = React.lazy(() => import(/* webpackPrefetch: true */ './Setup'));
 const Workspaces = React.lazy(() => import(/* webpackPrefetch: true */ './workspaces/Workspaces'));
@@ -53,6 +55,15 @@ function isGitpodIo() {
     return window.location.hostname === 'gitpod.io' || window.location.hostname === 'gitpod-staging.com' || window.location.hostname.endsWith('gitpod-dev.com') || window.location.hostname.endsWith('gitpod-io-dev.com')
 }
 
+function isWebsiteSlug(pathName: string) {
+    const slugs = ['chat', 'code-of-conduct', 'features', 'screencasts', 'blog', 'docs', 'changelog', 'pricing', 'self-hosted', 'gitpod-vs-github-codespaces', 'support', 'about', 'careers', 'contact', 'media-kit', 'imprint', 'terms', 'privacy', 'values']
+    return slugs.some(slug => pathName.startsWith('/' + slug + '/') || pathName === ('/' + slug));
+}
+
+function getURLHash() {
+    return window.location.hash.replace(/^[#/]+/, '');
+}
+
 function App() {
     const { user, setUser } = useContext(UserContext);
     const { teams, setTeams } = useContext(TeamsContext);
@@ -61,13 +72,15 @@ function App() {
     const [ loading, setLoading ] = useState<boolean>(true);
     const [ isWhatsNewShown, setWhatsNewShown ] = useState(false);
     const [ isSetupRequired, setSetupRequired ] = useState(false);
+    const history = useHistory();
 
     useEffect(() => {
         (async () => {
+            var user: User | undefined;
             try {
                 const teamsPromise = getGitpodService().server.getTeams();
 
-                const user = await getGitpodService().server.getLoggedInUser();
+                user = await getGitpodService().server.getLoggedInUser();
                 setUser(user);
 
                 const teams = await teamsPromise;
@@ -79,8 +92,11 @@ function App() {
                         setSetupRequired(true);
                     }
                 }
+            } finally {
+                trackLocation(!!user);
             }
             setLoading(false);
+            (window as any)._gp.path = window.location.pathname; //store current path to have access to previous when path changes
         })();
     }, []);
 
@@ -108,6 +124,40 @@ function App() {
             window.removeEventListener('storage', updateTheme);
         }
     }, []);
+
+    // listen and notify Segment of client-side path updates
+    useEffect(() => {
+        return history.listen((location: any) => {
+            const path = window.location.pathname;
+            trackPathChange({
+                prev: (window as any)._gp.path,
+                path: path
+            });
+            (window as any)._gp.path = path;
+        })
+    }, [history])
+
+    useEffect(() => {
+        const handleButtonOrAnchorTracking = (props: MouseEvent) => {
+            var curr = props.target as HTMLElement;
+            //check if current target or any ancestor up to document is button or anchor
+            while (!(curr instanceof Document)) {
+                if (curr instanceof HTMLButtonElement || curr instanceof HTMLAnchorElement || (curr instanceof HTMLDivElement && curr.onclick)) {
+                    trackButtonOrAnchor(curr, !!user);
+                    break; //finding first ancestor is sufficient
+                }
+                curr = curr.parentNode as HTMLElement;
+            }
+        }
+        window.addEventListener("click", handleButtonOrAnchorTracking);
+        return () => window.removeEventListener("click", handleButtonOrAnchorTracking, true);
+    }, []);
+
+    // redirect to website for any website slugs
+    if (isGitpodIo() && isWebsiteSlug(window.location.pathname)) {
+        window.location.host = 'www.gitpod.io';
+        return <div></div>;
+    }
 
     if (isGitpodIo() && window.location.pathname === '/' && window.location.hash === '' && !loading && !user) {
         window.location.href = `https://www.gitpod.io`;
@@ -210,11 +260,11 @@ function App() {
                     <Route exact path="/teams/new" component={NewTeam} />
                     <Route exact path="/teams/join" component={JoinTeam} />
                 </Route>
-                {(teams || []).map(team => <Route path={`/${team.slug}`}>
-                    <Route exact path={`/${team.slug}`}>
-                        <Redirect to={`/${team.slug}/projects`} />
+                {(teams || []).map(team => <Route path={`/t/${team.slug}`}>
+                    <Route exact path={`/t/${team.slug}`}>
+                        <Redirect to={`/t/${team.slug}/projects`} />
                     </Route>
-                    <Route exact path={`/${team.slug}/:maybeProject/:resourceOrPrebuild?`} render={(props) => {
+                    <Route exact path={`/t/${team.slug}/:maybeProject/:resourceOrPrebuild?`} render={(props) => {
                         const { maybeProject, resourceOrPrebuild } = props.match.params;
                         if (maybeProject === "projects") {
                             return <Projects />;
@@ -237,11 +287,11 @@ function App() {
                         return isGitpodIo() ?
                             // delegate to our website to handle the request
                             (window.location.host = 'www.gitpod.io') :
-                                <div className="mt-48 text-center">
-                                    <h1 className="text-gray-500 text-3xl">404</h1>
-                                    <p className="mt-4 text-lg">Page not found.</p>
-                                </div>;
-                }}>
+                            <div className="mt-48 text-center">
+                                <h1 className="text-gray-500 text-3xl">404</h1>
+                                <p className="mt-4 text-lg">Page not found.</p>
+                            </div>;
+                    }}>
                 </Route>
             </Switch>
         </div>
@@ -259,16 +309,10 @@ function App() {
     }
 
     return (
-        <BrowserRouter>
-            <Suspense fallback={<Loading />}>
-                {toRender}
-            </Suspense>
-        </BrowserRouter>
+        <Suspense fallback={<Loading />}>
+            {toRender}
+        </Suspense>
     );
-}
-
-function getURLHash() {
-    return window.location.hash.replace(/^[#/]+/, '');
 }
 
 export default App;

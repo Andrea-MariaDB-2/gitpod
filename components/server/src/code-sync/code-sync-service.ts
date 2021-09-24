@@ -4,7 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { status } from '@grpc/grpc-js';
+import { status, ServiceError } from '@grpc/grpc-js';
 import fetch from "node-fetch";
 import { User } from '@gitpod/gitpod-protocol/lib/protocol';
 import bodyParser = require('body-parser');
@@ -21,7 +21,7 @@ import uuid = require('uuid');
 import { accessCodeSyncStorage, UserRateLimiter } from '../auth/rate-limiter';
 import { increaseApiCallUserCounter } from '../prometheus-metrics';
 import { TheiaPluginService } from '../theia-plugin/theia-plugin-service';
-import { Env } from '../env';
+import { Config } from '../config';
 
 // By default: 5 kind of resources * 20 revs * 1Mb = 100Mb max in the content service for user data.
 const defautltRevLimit = 20;
@@ -56,8 +56,8 @@ const userSettingsUri = 'user_storage:settings.json';
 @injectable()
 export class CodeSyncService {
 
-    @inject(Env)
-    private readonly env: Env;
+    @inject(Config)
+    private readonly config: Config;
 
     @inject(BearerAuth)
     private readonly auth: BearerAuth;
@@ -75,7 +75,7 @@ export class CodeSyncService {
     private readonly userStorageResourcesDB: UserStorageResourcesDB;
 
     get apiRouter(): express.Router {
-        const config = this.env.codeSyncConfig;
+        const config = this.config.codeSync;
         const router = express.Router();
         router.use((_, res, next) => {
             // to correlate errors reported by users with errors logged by the server
@@ -92,7 +92,7 @@ export class CodeSyncService {
             const id = req.user.id;
             increaseApiCallUserCounter(accessCodeSyncStorage, id);
             try {
-                await UserRateLimiter.instance(this.env.rateLimiter).consume(id, accessCodeSyncStorage);
+                await UserRateLimiter.instance(this.config.rateLimiter).consume(id, accessCodeSyncStorage);
             } catch (e) {
                 if (e instanceof Error) {
                     throw e;
@@ -108,7 +108,6 @@ export class CodeSyncService {
             }
             return next();
         });
-        router.use(bodyParser.text());
         router.get('/v1/manifest', async (req, res) => {
             if (!User.is(req.user)) {
                 res.sendStatus(204);
@@ -256,8 +255,12 @@ export class CodeSyncService {
                 const request = new DeleteRequest();
                 request.setOwnerId(userId);
                 request.setExact(oldObject);
-                this.blobs.delete(request, (err: any) => {
+                this.blobs.delete(request, (err: ServiceError | null) => {
                     if (err) {
+                        if (err.code === status.NOT_FOUND) {
+                            // we're good here
+                            return;
+                        }
                         log.error({ userId }, 'code sync: failed to delete', err, { object: oldObject });
                     }
                 });

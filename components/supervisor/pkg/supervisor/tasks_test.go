@@ -24,6 +24,11 @@ import (
 var skipCommand = "echo \"skip\""
 var failCommand = "exit 1"
 
+var testEnv = &map[string]interface{}{
+	"object": map[string]interface{}{"baz": 3},
+}
+var testEnvCommand = `test $object == "{\"baz\":3}"`
+
 func TestTaskManager(t *testing.T) {
 	log.Log.Logger.SetLevel(logrus.FatalLevel)
 	tests := []struct {
@@ -99,6 +104,17 @@ func TestTaskManager(t *testing.T) {
 				Success: false,
 			},
 		},
+		{
+			Desc:        "env var parsing",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testEnvCommand, Env: testEnv}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.Desc, func(t *testing.T) {
@@ -132,7 +148,7 @@ func TestTaskManager(t *testing.T) {
 			contentState.MarkContentReady(test.Source)
 			var wg sync.WaitGroup
 			wg.Add(1)
-			tasksSuccessChan := make(chan bool, 1)
+			tasksSuccessChan := make(chan taskSuccess, 1)
 			go taskManager.Run(context.Background(), &wg, tasksSuccessChan)
 			wg.Wait()
 			if diff := cmp.Diff(test.ExpectedReporter, reporter); diff != "" {
@@ -151,9 +167,9 @@ type testHeadlessTaskProgressReporter struct {
 func (r *testHeadlessTaskProgressReporter) write(data string, task *task, terminal *terminal.Term) {
 }
 
-func (r *testHeadlessTaskProgressReporter) done(success bool) {
+func (r *testHeadlessTaskProgressReporter) done(success taskSuccess) {
 	r.Done = true
-	r.Success = success
+	r.Success = !success.Failed()
 }
 
 func TestGetTask(t *testing.T) {
@@ -204,6 +220,52 @@ func TestGetTask(t *testing.T) {
 			command := getCommand(&task{config: test.Task, TaskStatus: api.TaskStatus{Id: "0"}}, test.IsHeadless, test.ContentSource, "/")
 			if diff := cmp.Diff(test.Expectation, command); diff != "" {
 				t.Errorf("unexpected getCommand() (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestTaskSuccess(t *testing.T) {
+	type Expectation struct {
+		Failed bool
+		Msg    string
+	}
+
+	tests := []struct {
+		Name        string
+		Input       taskSuccess
+		Expectation Expectation
+	}{
+		{
+			Name:        "task success",
+			Input:       taskSuccessful,
+			Expectation: Expectation{},
+		},
+		{
+			Name:  "task failed",
+			Input: taskFailed("failure"),
+			Expectation: Expectation{
+				Failed: true,
+				Msg:    "failure",
+			},
+		},
+		{
+			Name:  "task composite failed",
+			Input: taskSuccessful.Fail("failed").Fail("some more"),
+			Expectation: Expectation{
+				Failed: true,
+				Msg:    "failed; some more",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			act := Expectation{
+				Failed: test.Input.Failed(),
+				Msg:    string(test.Input),
+			}
+			if diff := cmp.Diff(test.Expectation, act); diff != "" {
+				t.Errorf("unexpected taskStatus (-want +got):\n%s", diff)
 			}
 		})
 	}

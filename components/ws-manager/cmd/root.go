@@ -14,11 +14,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
-	"github.com/gitpod-io/gitpod/content-service/pkg/storage"
-	"github.com/gitpod-io/gitpod/ws-manager/pkg/manager"
+	config "github.com/gitpod-io/gitpod/ws-manager/api/config"
 )
 
 var (
@@ -31,13 +29,14 @@ var (
 var cfgFile string
 var kubeconfig string
 var jsonLog bool
+var verbose bool
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "ws-manager",
 	Short: "ws-manager starts/stops/controls workspace deployments in Kubernetes",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		log.Init(ServiceName, Version, jsonLog, jsonLog)
+		log.Init(ServiceName, Version, jsonLog, verbose)
 	},
 }
 
@@ -67,18 +66,19 @@ func Execute() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.kedgei.yaml)")
-	rootCmd.PersistentFlags().BoolVarP(&jsonLog, "json-log", "v", false, "produce JSON log output on verbose level")
+	rootCmd.PersistentFlags().BoolVarP(&jsonLog, "json-log", "j", true, "produce JSON log output on verbose level")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose JSON logging")
 
 	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "path to the kubeconfig file to use (defaults to in-cluster config)")
 }
 
-func getConfig() *config {
+func getConfig() *config.ServiceConfiguration {
 	ctnt, err := os.ReadFile(cfgFile)
 	if err != nil {
 		log.WithError(err).Fatal("cannot read configuration. Maybe missing --config?")
 	}
 
-	var cfg config
+	var cfg config.ServiceConfiguration
 	dec := json.NewDecoder(bytes.NewReader(ctnt))
 	dec.DisallowUnknownFields()
 	err = dec.Decode(&cfg)
@@ -87,27 +87,4 @@ func getConfig() *config {
 	}
 
 	return &cfg
-}
-
-type config struct {
-	Manager manager.Configuration `json:"manager"`
-	Content struct {
-		Storage storage.Config `json:"storage"`
-	} `json:"content"`
-	RPCServer struct {
-		Addr string `json:"addr"`
-		TLS  struct {
-			CA          string `json:"ca"`
-			Certificate string `json:"crt"`
-			PrivateKey  string `json:"key"`
-		} `json:"tls"`
-		RateLimits map[string]grpc.RateLimit `json:"ratelimits"`
-	} `json:"rpcServer"`
-
-	PProf struct {
-		Addr string `json:"addr"`
-	} `json:"pprof"`
-	Prometheus struct {
-		Addr string `json:"addr"`
-	} `json:"prometheus"`
 }

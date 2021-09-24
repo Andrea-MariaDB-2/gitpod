@@ -6,17 +6,17 @@ package integration
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gitpod-io/gitpod/common-go/namegen"
@@ -128,28 +128,20 @@ func LaunchWorkspaceDirectly(it *Test, opts ...LaunchWorkspaceDirectlyOpt) (res 
 			return
 		}
 	}
+	if workspaceImage == "" {
+		it.t.Fatalf("cannot start workspaces without a workspace image (required by registry-facade resolver)")
+	}
 
 	ideImage := options.IdeImage
 	if ideImage == "" {
-		pods, err := it.clientset.CoreV1().Pods(it.namespace).List(context.Background(), metav1.ListOptions{
-			LabelSelector: "component=server",
-		})
+		cfg, err := it.GetServerIDEConfig()
 		if err != nil {
-			it.t.Fatalf("cannot find server pod: %q", err)
+			it.t.Fatalf("cannot find server IDE config: %q", err)
 		}
-		imageAliases, err := envvarFromPod(pods, "IDE_IMAGE_ALIASES", "server")
-		if err != nil {
-			it.t.Fatal(err)
+		ideImage = cfg.IDEImageAliases.Code
+		if ideImage == "" {
+			it.t.Fatalf("cannot start workspaces without an IDE image (required by registry-facade resolver)")
 		}
-		var aliases struct {
-			Code string `json:"code"`
-		}
-		err = json.Unmarshal([]byte(imageAliases), &aliases)
-		if err != nil {
-			it.t.Fatalf("cannot unmarshal image aliases from server: %v", err)
-		}
-
-		ideImage = aliases.Code
 	}
 
 	req := &wsmanapi.StartWorkspaceRequest{
@@ -249,7 +241,7 @@ func LaunchWorkspaceFromContextURL(it *Test, contextURL string, serverOpts ...Gi
 		it.t.Fatalf("cannot get workspace: %q", err)
 	}
 	if nfo.LatestInstance == nil {
-		err = fmt.Errorf("CreateWorkspace did not start the workspace")
+		err = xerrors.Errorf("CreateWorkspace did not start the workspace")
 		it.t.Fatal(err)
 	}
 
@@ -428,13 +420,14 @@ func (it *Test) WaitForWorkspaceStop(instanceID string) (lastStatus *wsmanapi.Wo
 	if desc != nil {
 		switch desc.Status.Phase {
 		case wsmanapi.WorkspacePhase_STOPPED:
-			return desc.Status
+			// ensure theia service is cleaned up
+			lastStatus = desc.Status
 		}
 	}
 
 	select {
 	case <-it.ctx.Done():
-		it.t.Fatalf("cannot wait for workspace: %q", it.ctx.Err())
+		it.t.Fatalf("cannot wait for workspace stop: %q", it.ctx.Err())
 		return
 	case <-done:
 	}
@@ -447,8 +440,12 @@ func (it *Test) WaitForWorkspaceStop(instanceID string) (lastStatus *wsmanapi.Wo
 		serviceGone bool
 		k8s, ns     = it.API().Kubernetes()
 	)
+
+	// NOTE: this needs to be kept in sync with components/ws-manager/pkg/manager/manager.go:getTheiaServiceName()
+	// TODO(rl) expose it?
+	theiaName := fmt.Sprintf("ws-%s-theia", strings.TrimSpace(strings.ToLower(workspaceID)))
 	for time.Since(start) < 1*time.Minute {
-		_, err := k8s.CoreV1().Services(ns).Get(ctx, fmt.Sprintf("ws-%s-theia", workspaceID), v1.GetOptions{})
+		_, err := k8s.CoreV1().Services(ns).Get(ctx, theiaName, v1.GetOptions{})
 		if errors.IsNotFound(err) {
 			serviceGone = true
 			break
@@ -456,7 +453,21 @@ func (it *Test) WaitForWorkspaceStop(instanceID string) (lastStatus *wsmanapi.Wo
 		time.Sleep(200 * time.Millisecond)
 	}
 	if !serviceGone {
-		it.t.Fatalf("Theia service did not disappear in time")
+		it.t.Fatalf("Theia service:%s did not disappear in time", theiaName)
+		return
+	}
+	// Wait for the theia endpoints to be properly deleted (i.e. syncing)
+	var endpointGone bool
+	for time.Since(start) < 1*time.Minute {
+		_, err := k8s.CoreV1().Endpoints(ns).Get(ctx, theiaName, v1.GetOptions{})
+		if errors.IsNotFound(err) {
+			endpointGone = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !endpointGone {
+		it.t.Fatalf("Theia endpoint:%s did not disappear in time", theiaName)
 		return
 	}
 
@@ -588,7 +599,7 @@ func (it *Test) resolveOrBuildImage(baseRef string) (absref string, err error) {
 		if resp.Status == imgbldr.BuildStatus_done_success {
 			break
 		} else if resp.Status == imgbldr.BuildStatus_done_failure {
-			return "", fmt.Errorf("cannot build workspace image: %s", resp.Message)
+			return "", xerrors.Errorf("cannot build workspace image: %s", resp.Message)
 		}
 	}
 

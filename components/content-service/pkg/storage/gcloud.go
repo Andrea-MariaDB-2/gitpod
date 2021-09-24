@@ -31,21 +31,12 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
+	config "github.com/gitpod-io/gitpod/content-service/api/config"
 	"github.com/gitpod-io/gitpod/content-service/pkg/archive"
 	"github.com/opentracing/opentracing-go"
 )
 
 var _ DirectAccess = &DirectGCPStorage{}
-
-// GCPConfig controls the access to GCloud resources/buckets
-type GCPConfig struct {
-	CredentialsFile string `json:"credentialsFile"`
-	Region          string `json:"region"`
-	Project         string `json:"projectId"`
-	ParallelUpload  int    `json:"parallelUpload"`
-
-	MaximumBackupCount int `json:"maximumBackupCount"`
-}
 
 var validateExistsInFilesystem = validation.By(func(o interface{}) error {
 	s, ok := o.(string)
@@ -63,7 +54,7 @@ var validateExistsInFilesystem = validation.By(func(o interface{}) error {
 })
 
 // Validate checks if the GCloud storage GCPconfig is valid
-func (c *GCPConfig) Validate() error {
+func ValidateGCPConfig(c *config.GCPConfig) error {
 	return validation.ValidateStruct(c,
 		validation.Field(&c.CredentialsFile, validateExistsInFilesystem),
 		validation.Field(&c.Region, validation.Required),
@@ -72,8 +63,8 @@ func (c *GCPConfig) Validate() error {
 }
 
 // newDirectGCPAccess provides direct access to the remote storage system
-func newDirectGCPAccess(cfg GCPConfig, stage Stage) (*DirectGCPStorage, error) {
-	if err := cfg.Validate(); err != nil {
+func newDirectGCPAccess(cfg config.GCPConfig, stage config.Stage) (*DirectGCPStorage, error) {
+	if err := ValidateGCPConfig(&cfg); err != nil {
 		return nil, err
 	}
 
@@ -88,8 +79,8 @@ type DirectGCPStorage struct {
 	Username      string
 	WorkspaceName string
 	InstanceID    string
-	GCPConfig     GCPConfig
-	Stage         Stage
+	GCPConfig     config.GCPConfig
+	Stage         config.Stage
 
 	client *gcpstorage.Client
 
@@ -99,7 +90,7 @@ type DirectGCPStorage struct {
 
 // Validate checks if the GCloud storage is GCPconfigured properly
 func (rs *DirectGCPStorage) Validate() error {
-	err := rs.GCPConfig.Validate()
+	err := ValidateGCPConfig(&rs.GCPConfig)
 	if err != nil {
 		return err
 	}
@@ -145,7 +136,7 @@ func (rs *DirectGCPStorage) EnsureExists(ctx context.Context) (err error) {
 	return gcpEnsureExists(ctx, rs.client, rs.bucketName(), rs.GCPConfig)
 }
 
-func gcpEnsureExists(ctx context.Context, client *gcpstorage.Client, bucketName string, gcpConfig GCPConfig) (err error) {
+func gcpEnsureExists(ctx context.Context, client *gcpstorage.Client, bucketName string, gcpConfig config.GCPConfig) (err error) {
 	//nolint:ineffassign
 	span, ctx := opentracing.StartSpanFromContext(ctx, "GCloudBucketRemotegcpStorage.EnsureExists")
 	defer tracing.FinishSpan(span, &err)
@@ -290,7 +281,7 @@ func ParseSnapshotName(name string) (bkt, obj string, err error) {
 func (rs *DirectGCPStorage) ListObjects(ctx context.Context, prefix string) (objects []string, err error) {
 	bkt := rs.client.Bucket(rs.bucketName())
 	_, err = bkt.Attrs(ctx)
-	if err == gcpstorage.ErrBucketNotExist {
+	if errors.Is(err, gcpstorage.ErrBucketNotExist) {
 		// bucket does not exist: nothing to list
 		return nil, nil
 	}
@@ -318,7 +309,7 @@ func (rs *DirectGCPStorage) Qualify(name string) string {
 // UploadInstance takes all files from a local location and uploads it to the per-instance remote storage
 func (rs *DirectGCPStorage) UploadInstance(ctx context.Context, source string, name string, opts ...UploadOption) (bucket, object string, err error) {
 	if rs.InstanceID == "" {
-		return "", "", fmt.Errorf("instanceID is required to comput object name")
+		return "", "", xerrors.Errorf("instanceID is required to comput object name")
 	}
 	return rs.Upload(ctx, source, InstanceObjectName(rs.InstanceID, name), opts...)
 }
@@ -686,7 +677,7 @@ func (rs *DirectGCPStorage) BackupObject(name string) string {
 	return rs.objectName(name)
 }
 
-func gcpBucketName(stage Stage, ownerID string) string {
+func gcpBucketName(stage config.Stage, ownerID string) string {
 	return fmt.Sprintf("gitpod-%s-user-%s", stage, ownerID)
 }
 
@@ -710,7 +701,7 @@ func (rs *DirectGCPStorage) trailingObjectName(id string, t time.Time) string {
 	return fmt.Sprintf("%s%d-%s", rs.trailPrefix(), t.Unix(), id)
 }
 
-func newGCPClient(ctx context.Context, cfg GCPConfig) (*gcpstorage.Client, error) {
+func newGCPClient(ctx context.Context, cfg config.GCPConfig) (*gcpstorage.Client, error) {
 	credfile := cfg.CredentialsFile
 	if tproot := os.Getenv("TELEPRESENCE_ROOT"); tproot != "" {
 		credfile = filepath.Join(tproot, credfile)
@@ -723,8 +714,8 @@ func newGCPClient(ctx context.Context, cfg GCPConfig) (*gcpstorage.Client, error
 	return client, nil
 }
 
-func newPresignedGCPAccess(config GCPConfig, stage Stage) (*PresignedGCPStorage, error) {
-	err := config.Validate()
+func newPresignedGCPAccess(config config.GCPConfig, stage config.Stage) (*PresignedGCPStorage, error) {
+	err := ValidateGCPConfig(&config)
 	if err != nil {
 		return nil, xerrors.Errorf("invalid config: %w", err)
 	}
@@ -767,8 +758,8 @@ func newPresignedGCPAccess(config GCPConfig, stage Stage) (*PresignedGCPStorage,
 
 // PresignedGCPStorage provides presigned URLs to access GCP storage objects
 type PresignedGCPStorage struct {
-	config     GCPConfig
-	stage      Stage
+	config     config.GCPConfig
+	stage      config.Stage
 	privateKey []byte
 	accessID   string
 }
@@ -840,7 +831,7 @@ func (p *PresignedGCPStorage) SignDownload(ctx context.Context, bucket, object s
 
 	bkt := client.Bucket(bucket)
 	_, err = bkt.Attrs(ctx)
-	if err == gcpstorage.ErrBucketNotExist {
+	if errors.Is(err, gcpstorage.ErrBucketNotExist) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -849,7 +840,7 @@ func (p *PresignedGCPStorage) SignDownload(ctx context.Context, bucket, object s
 
 	obj := bkt.Object(object)
 	attrs, err := obj.Attrs(ctx)
-	if err == gcpstorage.ErrObjectNotExist {
+	if errors.Is(err, gcpstorage.ErrObjectNotExist) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -899,7 +890,7 @@ func (p *PresignedGCPStorage) SignUpload(ctx context.Context, bucket, object str
 
 	bkt := client.Bucket(bucket)
 	_, err = bkt.Attrs(ctx)
-	if err == gcpstorage.ErrBucketNotExist {
+	if errors.Is(err, gcpstorage.ErrBucketNotExist) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -925,20 +916,20 @@ func (p *PresignedGCPStorage) SignUpload(ctx context.Context, bucket, object str
 // DeleteObject deletes objects in the given bucket specified by the given query
 func (p *PresignedGCPStorage) DeleteObject(ctx context.Context, bucket string, query *DeleteObjectQuery) (err error) {
 	client, err := newGCPClient(ctx, p.config)
+	if err != nil {
+		return err
+	}
 	//nolint:staticcheck
 	defer client.Close()
 
 	if query.Name != "" {
 		err = client.Bucket(bucket).Object(query.Name).Delete(ctx)
 		if err != nil {
-			if !errors.Is(err, gcpstorage.ErrBucketNotExist) {
-				log.WithField("bucket", bucket).WithField("object", query.Name).WithError(err).Error("cannot delete objects")
-			}
-
-			if err == gcpstorage.ErrBucketNotExist || err == gcpstorage.ErrObjectNotExist {
+			if errors.Is(err, gcpstorage.ErrBucketNotExist) || errors.Is(err, gcpstorage.ErrObjectNotExist) {
 				return ErrNotFound
 			}
 
+			log.WithField("bucket", bucket).WithField("object", query.Name).WithError(err).Warn("cannot delete object")
 			return err
 		}
 		return nil
@@ -959,17 +950,21 @@ func (p *PresignedGCPStorage) DeleteObject(ctx context.Context, bucket string, q
 		if err == iterator.Done {
 			break
 		}
+		// if we get any error besides "done" the iterator is broken: make sure we don't use it again.
 		if err != nil {
-			log.WithField("bucket", bucket).WithError(err).Error("cannot delete objects")
-			return err
+			log.WithField("bucket", bucket).WithError(err).Error("error iterating object")
+			break
 		}
 		err = b.Object(attrs.Name).Delete(ctx)
 		if err != nil {
-			log.WithField("bucket", bucket).WithField("object", attrs.Name).WithError(err).Error("cannot delete objects")
+			if errors.Is(err, gcpstorage.ErrBucketNotExist) || errors.Is(err, gcpstorage.ErrObjectNotExist) {
+				continue
+			}
+			log.WithField("bucket", bucket).WithField("object", attrs.Name).WithError(err).Warn("cannot delete object, continue deleting objects")
 		}
 	}
 
-	if err == gcpstorage.ErrBucketNotExist {
+	if errors.Is(err, gcpstorage.ErrBucketNotExist) || errors.Is(err, gcpstorage.ErrObjectNotExist) {
 		return ErrNotFound
 	}
 	return err
@@ -978,20 +973,20 @@ func (p *PresignedGCPStorage) DeleteObject(ctx context.Context, bucket string, q
 // DeleteBucket deletes a bucket
 func (p *PresignedGCPStorage) DeleteBucket(ctx context.Context, bucket string) (err error) {
 	client, err := newGCPClient(ctx, p.config)
+	if err != nil {
+		return err
+	}
 	//nolint:staticcheck
 	defer client.Close()
 
 	err = p.DeleteObject(ctx, bucket, &DeleteObjectQuery{})
 	if err != nil {
-		if err == gcpstorage.ErrBucketNotExist {
-			return ErrNotFound
-		}
 		return err
 	}
 
 	err = client.Bucket(bucket).Delete(ctx)
 	if err != nil {
-		if err == gcpstorage.ErrBucketNotExist {
+		if errors.Is(err, gcpstorage.ErrBucketNotExist) {
 			return ErrNotFound
 		}
 		return err
@@ -1002,12 +997,15 @@ func (p *PresignedGCPStorage) DeleteBucket(ctx context.Context, bucket string) (
 // ObjectHash gets a hash value of an object
 func (p *PresignedGCPStorage) ObjectHash(ctx context.Context, bucket string, obj string) (hash string, err error) {
 	client, err := newGCPClient(ctx, p.config)
+	if err != nil {
+		return "", err
+	}
 	//nolint:staticcheck
 	defer client.Close()
 
 	attr, err := client.Bucket(bucket).Object(obj).Attrs(ctx)
 	if err != nil {
-		if err == gcpstorage.ErrBucketNotExist {
+		if errors.Is(err, gcpstorage.ErrBucketNotExist) {
 			return "", ErrNotFound
 		}
 		return "", err

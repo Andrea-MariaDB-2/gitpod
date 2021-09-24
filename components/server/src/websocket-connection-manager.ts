@@ -4,7 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { Disposable, GitpodClient, GitpodServer, GitpodServerPath, User } from "@gitpod/gitpod-protocol";
+import { ClientHeaderFields, Disposable, GitpodClient, GitpodServer, GitpodServerPath, User } from "@gitpod/gitpod-protocol";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { ConnectionHandler } from "@gitpod/gitpod-protocol/lib/messaging/handler";
 import { JsonRpcConnectionHandler, JsonRpcProxy, JsonRpcProxyFactory } from "@gitpod/gitpod-protocol/lib/messaging/proxy-factory";
@@ -15,7 +15,7 @@ import { ErrorCodes as RPCErrorCodes, MessageConnection, ResponseError } from "v
 import { AllAccessFunctionGuard, FunctionAccessGuard, WithFunctionAccessGuard } from "./auth/function-access";
 import { HostContextProvider } from "./auth/host-context-provider";
 import { RateLimiter, RateLimiterConfig, UserRateLimiter } from "./auth/rate-limiter";
-import { CompositeResourceAccessGuard, OwnerResourceGuard, ResourceAccessGuard, SharedWorkspaceAccessGuard, WithResourceAccessGuard, WorkspaceLogAccessGuard } from "./auth/resource-access";
+import { CompositeResourceAccessGuard, OwnerResourceGuard, ResourceAccessGuard, SharedWorkspaceAccessGuard, TeamMemberResourceGuard, WithResourceAccessGuard, WorkspaceLogAccessGuard } from "./auth/resource-access";
 import { increaseApiCallCounter, increaseApiConnectionClosedCounter, increaseApiConnectionCounter, increaseApiCallUserCounter } from "./prometheus-metrics";
 import { GitpodServerImpl } from "./workspace/gitpod-server-impl";
 
@@ -60,7 +60,6 @@ export class WebsocketConnectionManager<C extends GitpodClient, S extends Gitpod
         const session = expressReq.session;
 
         const gitpodServer = this.serverFactory();
-        const clientRegion = (expressReq as any).headers["x-glb-client-region"];
         const user = expressReq.user as User;
 
         let resourceGuard: ResourceAccessGuard;
@@ -70,6 +69,7 @@ export class WebsocketConnectionManager<C extends GitpodClient, S extends Gitpod
         } else if (!!user) {
             resourceGuard = new CompositeResourceAccessGuard([
                 new OwnerResourceGuard(user.id),
+                new TeamMemberResourceGuard(user.id),
                 new SharedWorkspaceAccessGuard(),
                 new WorkspaceLogAccessGuard(user, this.hostContextProvider),
             ]);
@@ -77,7 +77,15 @@ export class WebsocketConnectionManager<C extends GitpodClient, S extends Gitpod
             resourceGuard = { canAccess: async () => false };
         }
 
-        gitpodServer.initialize(client, clientRegion, user, resourceGuard);
+        const dnt = (expressReq as any)['dnt']
+        const clientHeaderFields:ClientHeaderFields = {
+            ip: (expressReq as any).headers['x-real-ip'],
+            userAgent: (expressReq as any).headers['user-agent'],
+            dnt: dnt ? +dnt : undefined,
+            clientRegion: (expressReq as any).headers["x-glb-client-region"]
+        }
+
+        gitpodServer.initialize(client, user, resourceGuard, clientHeaderFields);
         client.onDidCloseConnection(() => {
             increaseApiConnectionClosedCounter();
             gitpodServer.dispose();

@@ -5,13 +5,17 @@
 package content
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,9 +24,12 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
@@ -142,7 +149,7 @@ func (s *WorkspaceService) InitWorkspace(ctx context.Context, req *api.InitWorks
 	owi := log.OWI(req.Metadata.Owner, req.Metadata.MetaId, req.Id)
 	tracing.ApplyOWI(span, owi)
 	log := log.WithFields(owi)
-	log.Info("InitWorkspace called")
+	log.Debug("InitWorkspace called")
 
 	var (
 		wsloc string
@@ -218,6 +225,11 @@ func (s *WorkspaceService) InitWorkspace(ctx context.Context, req *api.InitWorks
 			IdMappings: []archive.IDMapping{
 				{ContainerID: 0, HostID: wsinit.GitpodUID, Size: 1},
 				{ContainerID: 1, HostID: 100000, Size: 65534},
+			},
+			OWI: OWI{
+				Owner:       req.Metadata.Owner,
+				WorkspaceID: req.Metadata.MetaId,
+				InstanceID:  req.Id,
 			},
 		}
 
@@ -358,9 +370,18 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 		return nil, status.Error(codes.Internal, "cannot delete workspace from store")
 	}
 
+	// Important:
+	// If ws-daemon is killed or restarts, the new ws-daemon pod mount table contains the
+	// node's current state, i.e., it has all the running workspaces running in the node.
+	// Unmounting the mark in Teardown (nsenter) works from inside the workspace,
+	// but the mount is still present in ws-daemon mount table. Unmounting the mark from
+	// ws-daemon is required to ensure the proper termination of the workspace pod.
+	if err := unmountMark(sess.ServiceLocDaemon); err != nil {
+		log.WithError(err).WithField("workspaceId", req.Id).Error("cannot unmount mark mount")
+	}
+
 	// remove workspace daemon directory in the node
-	err = os.RemoveAll(sess.ServiceLocDaemon)
-	if err != nil {
+	if err := os.RemoveAll(sess.ServiceLocDaemon); err != nil {
 		log.WithError(err).WithField("workspaceId", req.Id).Error("cannot delete workspace daemon directory")
 	}
 
@@ -451,7 +472,7 @@ func (s *WorkspaceService) uploadWorkspaceContent(ctx context.Context, sess *ses
 			return
 		}
 		tmpfSize = stat.Size()
-		log.WithField("size", tmpfSize).WithFields(sess.OWI()).Debug("created temp file for workspace backup upload")
+		log.WithField("size", tmpfSize).WithField("location", tmpf.Name()).WithFields(sess.OWI()).Debug("created temp file for workspace backup upload")
 
 		return
 	})
@@ -763,6 +784,51 @@ func workspaceLifecycleHooks(cfg Config, kubernetesNamespace string, workspaceEx
 	return map[session.WorkspaceState][]session.WorkspaceLivecycleHook{
 		session.WorkspaceInitializing: {setupWorkspace, startIWS},
 		session.WorkspaceReady:        {setupWorkspace, startIWS},
-		session.WorkspaceDisposing:    {iws.StopServingWorkspace},
+		session.WorkspaceDisposed:     {iws.StopServingWorkspace},
 	}
+}
+
+// if the mark mount still exists in /proc/mounts it means we failed to unmount it and
+// we cannot remove the content. As a side effect the pod will stay in Terminating state
+func unmountMark(dir string) error {
+	mounts, err := ioutil.ReadFile("/proc/mounts")
+	if err != nil {
+		return xerrors.Errorf("cannot read /proc/mounts: %w", err)
+	}
+
+	path := fromPartialMount(filepath.Join(dir, "mark"), mounts)
+	// empty path means no mount found
+	if path == "" {
+		return nil
+	}
+
+	// in some scenarios we need to wait for the unmount
+	var errorFn = func(err error) bool {
+		return strings.Contains(err.Error(), "device or resource busy")
+	}
+
+	return retry.OnError(wait.Backoff{
+		Steps:    5,
+		Duration: 1 * time.Second,
+		Factor:   5.0,
+		Jitter:   0.1,
+	}, errorFn, func() error {
+		return unix.Unmount(path, 0)
+	})
+}
+
+func fromPartialMount(path string, info []byte) string {
+	scanner := bufio.NewScanner(bytes.NewReader(info))
+	for scanner.Scan() {
+		mount := strings.Split(scanner.Text(), " ")
+		if len(mount) < 2 {
+			continue
+		}
+
+		if strings.Contains(mount[1], path) {
+			return mount[1]
+		}
+	}
+
+	return ""
 }

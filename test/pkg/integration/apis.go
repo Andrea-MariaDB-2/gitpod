@@ -38,7 +38,7 @@ import (
 )
 
 var (
-	errNoSuitableUser = fmt.Errorf("no suitable user found: make sure there's at least one non-builtin user in the database (e.g. login)")
+	errNoSuitableUser = xerrors.Errorf("no suitable user found: make sure there's at least one non-builtin user in the database (e.g. login)")
 )
 
 // API provides access to the individual component's API
@@ -167,18 +167,13 @@ func (c *ComponentAPI) GitpodServer(opts ...GitpodServerOpt) (res gitpod.APIInte
 			c.serverStatus.Token[options.User] = tkn
 		}
 
-		pods, err := c.t.clientset.CoreV1().Pods(c.t.namespace).List(context.Background(), metav1.ListOptions{
-			LabelSelector: "component=server",
-		})
+		cfg, err := c.t.GetServerConfig()
 		if err != nil {
 			return err
 		}
-		hostURL, err := envvarFromPod(pods, "HOST_URL", "server")
-		if err != nil {
-			return err
-		}
+		hostURL := cfg.HostURL
 		if hostURL == "" {
-			return xerrors.Errorf("did not find HOST_URL env var on server pod")
+			return xerrors.Errorf("server config: empty HostURL")
 		}
 		hostURL = strings.ReplaceAll(hostURL, "http://", "ws://")
 		hostURL = strings.ReplaceAll(hostURL, "https://", "wss://")
@@ -325,7 +320,7 @@ func (c *ComponentAPI) WorkspaceManager() wsmanapi.WorkspaceManagerClient {
 	log.Debug("using TLS config to connect ws-manager")
 	certPool := x509.NewCertPool()
 	if !certPool.AppendCertsFromPEM(caCrt) {
-		rerr = fmt.Errorf("failed appending CA cert")
+		rerr = xerrors.Errorf("failed appending CA cert")
 		return nil
 	}
 	cert, err := tls.X509KeyPair(tlsCrt, tlsKey)
@@ -476,7 +471,7 @@ func (c *ComponentAPI) findDBConfig() (*DBConfig, error) {
 		}
 	}
 	if remotePort == 0 {
-		return nil, fmt.Errorf("no ports found on service: %s", svc.Name)
+		return nil, xerrors.Errorf("no ports found on service: %s", svc.Name)
 	}
 
 	// find pod to forward to
@@ -487,7 +482,7 @@ func (c *ComponentAPI) findDBConfig() (*DBConfig, error) {
 		return nil, err
 	}
 	if len(pods.Items) == 0 {
-		return nil, fmt.Errorf("no pods for service %s found", svc.Name)
+		return nil, xerrors.Errorf("no pods for service %s found", svc.Name)
 	}
 	var pod *corev1.Pod
 	for _, p := range pods.Items {
@@ -510,7 +505,7 @@ func (c *ComponentAPI) findDBConfig() (*DBConfig, error) {
 		break
 	}
 	if pod == nil {
-		return nil, fmt.Errorf("no active pod for service %s found", svc.Name)
+		return nil, xerrors.Errorf("no active pod for service %s found", svc.Name)
 	}
 
 	localPort, err := getFreePort()
@@ -536,7 +531,7 @@ func (c *ComponentAPI) findDBConfigFromPodEnv(componentName string) (*DBConfig, 
 		return nil, err
 	}
 	if len(list.Items) == 0 {
-		return nil, fmt.Errorf("no pods found for: %s", lblSelector)
+		return nil, xerrors.Errorf("no pods found for: %s", lblSelector)
 	}
 	pod := list.Items[0]
 
@@ -551,7 +546,7 @@ OuterLoop:
 			} else if v.Name == "DB_PORT" {
 				pPort, err := strconv.ParseUint(v.Value, 10, 16)
 				if err != nil {
-					return nil, fmt.Errorf("error parsing DB_PORT '%s' on pod %s!", v.Value, pod.Name)
+					return nil, xerrors.Errorf("error parsing DB_PORT '%s' on pod %s!", v.Value, pod.Name)
 				}
 				port = int32(pPort)
 			} else if v.Name == "DB_HOST" {
@@ -563,7 +558,7 @@ OuterLoop:
 		}
 	}
 	if password == "" || port == 0 || host == "" {
-		return nil, fmt.Errorf("could not find complete DBConfig on pod %s!", pod.Name)
+		return nil, xerrors.Errorf("could not find complete DBConfig on pod %s!", pod.Name)
 	}
 	config := DBConfig{
 		Host:     host,

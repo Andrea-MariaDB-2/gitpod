@@ -28,8 +28,10 @@ import (
 	libseccomp "github.com/seccomp/libseccomp-golang"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
+	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/workspacekit/pkg/lift"
 	"github.com/gitpod-io/gitpod/workspacekit/pkg/seccomp"
@@ -55,35 +57,46 @@ var ring0Cmd = &cobra.Command{
 	Use:   "ring0",
 	Short: "starts ring0 - enter here",
 	Run: func(_ *cobra.Command, args []string) {
-		log.Init(ServiceName, Version, true, true)
+		log.Init(ServiceName, Version, true, false)
 		log := log.WithField("ring", 0)
+
+		common_grpc.SetupLogging()
 
 		exitCode := 1
 		defer handleExit(&exitCode)
 
+		defer log.Info("done")
+
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		client, conn, err := connectToInWorkspaceDaemonService(ctx)
+		client, err := connectToInWorkspaceDaemonService(ctx)
 		if err != nil {
 			log.WithError(err).Error("cannot connect to daemon")
 			return
 		}
-		defer conn.Close()
 
 		prep, err := client.PrepareForUserNS(ctx, &daemonapi.PrepareForUserNSRequest{})
 		if err != nil {
 			log.WithError(err).Fatal("cannot prepare for user namespaces")
 			return
 		}
+		client.Close()
+
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
+			client, err := connectToInWorkspaceDaemonService(ctx)
+			if err != nil {
+				log.WithError(err).Error("cannot connect to daemon")
+				return
+			}
+			defer client.Close()
+
 			_, err = client.Teardown(ctx, &daemonapi.TeardownRequest{})
 			if err != nil {
 				log.WithError(err).Error("cannot trigger teardown")
-				return
 			}
 		}()
 
@@ -133,6 +146,11 @@ var ring0Cmd = &cobra.Command{
 				log.Warn("ring1 did not shut down in time - sending sigkill")
 				err = cmd.Process.Kill()
 				if err != nil {
+					if isProcessAlreadyFinished(err) {
+						err = nil
+						return
+					}
+
 					log.WithError(err).Error("cannot kill ring1")
 				}
 				return
@@ -165,28 +183,31 @@ var ring1Cmd = &cobra.Command{
 	Use:   "ring1",
 	Short: "starts ring1",
 	Run: func(_cmd *cobra.Command, args []string) {
-		log.Init(ServiceName, Version, true, true)
+		log.Init(ServiceName, Version, true, false)
 		log := log.WithField("ring", 1)
-		defer log.Info("done")
+
+		common_grpc.SetupLogging()
 
 		exitCode := 1
 		defer handleExit(&exitCode)
 
+		defer log.Info("done")
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-
-		client, conn, err := connectToInWorkspaceDaemonService(ctx)
-		if err != nil {
-			log.WithError(err).Error("cannot connect to daemon")
-			return
-		}
-		defer conn.Close()
 
 		mapping := []*daemonapi.WriteIDMappingRequest_Mapping{
 			{ContainerId: 0, HostId: 33333, Size: 1},
 			{ContainerId: 1, HostId: 100000, Size: 65534},
 		}
 		if !ring1Opts.MappingEstablished {
+			client, err := connectToInWorkspaceDaemonService(ctx)
+			if err != nil {
+				log.WithError(err).Error("cannot connect to daemon")
+				return
+			}
+			defer client.Close()
+
 			_, err = client.WriteIDMapping(ctx, &daemonapi.WriteIDMappingRequest{Pid: int64(os.Getpid()), Gid: false, Mapping: mapping})
 			if err != nil {
 				log.WithError(err).Error("cannot establish UID mapping")
@@ -202,6 +223,7 @@ var ring1Cmd = &cobra.Command{
 				log.WithError(err).Error("cannot exec /proc/self/exe")
 				return
 			}
+
 			return
 		}
 
@@ -344,10 +366,18 @@ var ring1Cmd = &cobra.Command{
 			log.WithError(err).Error("cannot mount proc")
 			return
 		}
+
+		client, err := connectToInWorkspaceDaemonService(ctx)
+		if err != nil {
+			log.WithError(err).Error("cannot connect to daemon")
+			return
+		}
 		_, err = client.MountProc(ctx, &daemonapi.MountProcRequest{
 			Target: procLoc,
 			Pid:    int64(cmd.Process.Pid),
 		})
+		client.Close()
+
 		if err != nil {
 			log.WithError(err).Error("cannot mount proc")
 			return
@@ -387,7 +417,7 @@ var ring1Cmd = &cobra.Command{
 				ring2Conn = c.(*net.UnixConn)
 				brek = true
 			case <-time.After(ring2StartupTimeout):
-				err = fmt.Errorf("ring2 did not connect in time")
+				err = xerrors.Errorf("ring2 did not connect in time")
 				brek = true
 			}
 			if brek {
@@ -421,8 +451,10 @@ var ring1Cmd = &cobra.Command{
 			log.Warn("received 0 as ring2 seccomp fd - syscall handling is broken")
 		} else {
 			handler := &seccomp.InWorkspaceHandler{
-				FD:          scmpfd,
-				Daemon:      client,
+				FD: scmpfd,
+				Daemon: func(ctx context.Context) (seccomp.InWorkspaceServiceClient, error) {
+					return connectToInWorkspaceDaemonService(ctx)
+				},
 				Ring2PID:    cmd.Process.Pid,
 				Ring2Rootfs: ring2Root,
 				BindEvents:  make(chan seccomp.BindEvent),
@@ -448,7 +480,7 @@ var ring1Cmd = &cobra.Command{
 		}
 
 		go func() {
-			err := lift.ServeLift(lift.DefaultSocketPath)
+			err := lift.ServeLift(ctx, lift.DefaultSocketPath)
 			if err != nil {
 				log.WithError(err).Error("failed to serve ring1 command lift")
 			}
@@ -560,7 +592,7 @@ func receiveSeccmpFd(conn *net.UnixConn) (libseccomp.ScmpFd, error) {
 		return 0, err
 	}
 	if len(msgs) != 1 {
-		return 0, fmt.Errorf("expected a single socket control message")
+		return 0, xerrors.Errorf("expected a single socket control message")
 	}
 
 	fds, err := unix.ParseUnixRights(&msgs[0])
@@ -568,7 +600,7 @@ func receiveSeccmpFd(conn *net.UnixConn) (libseccomp.ScmpFd, error) {
 		return 0, err
 	}
 	if len(fds) == 0 {
-		return 0, fmt.Errorf("expected a single socket FD")
+		return 0, xerrors.Errorf("expected a single socket FD")
 	}
 
 	return libseccomp.ScmpFd(fds[0]), nil
@@ -582,12 +614,15 @@ var ring2Cmd = &cobra.Command{
 	Short: "starts ring2",
 	Args:  cobra.ExactArgs(1),
 	Run: func(_cmd *cobra.Command, args []string) {
-		log.Init(ServiceName, Version, true, true)
+		log.Init(ServiceName, Version, true, false)
 		log := log.WithField("ring", 2)
-		defer log.Info("done")
+
+		common_grpc.SetupLogging()
 
 		exitCode := 1
 		defer handleExit(&exitCode)
+
+		defer log.Info("done")
 
 		// we talk to ring1 using a Unix socket, so that we can send the seccomp fd across.
 		rconn, err := net.Dial("unix", args[0])
@@ -596,6 +631,8 @@ var ring2Cmd = &cobra.Command{
 			return
 		}
 		conn := rconn.(*net.UnixConn)
+		defer conn.Close()
+
 		log.Info("connected to parent socket")
 
 		// Before we do anything, we wait for the parent to make /proc available to us.
@@ -632,7 +669,6 @@ var ring2Cmd = &cobra.Command{
 
 		sktfd := int(connf.Fd())
 		err = unix.Sendmsg(sktfd, nil, unix.UnixRights(int(scmpFd)), nil, 0)
-		connf.Close()
 		if err != nil {
 			log.WithError(err).Error("cannot send seccomp fd")
 			return
@@ -664,12 +700,12 @@ func pivotRoot(rootfs string, fsshift api.FSShiftMethod) error {
 	if fsshift == api.FSShiftMethod_FUSE {
 		err := unix.Chroot(rootfs)
 		if err != nil {
-			return fmt.Errorf("cannot chroot: %v", err)
+			return xerrors.Errorf("cannot chroot: %v", err)
 		}
 
 		err = unix.Chdir("/")
 		if err != nil {
-			return fmt.Errorf("cannot chdir to new root :%v", err)
+			return xerrors.Errorf("cannot chdir to new root :%v", err)
 		}
 
 		return nil
@@ -693,7 +729,7 @@ func pivotRoot(rootfs string, fsshift api.FSShiftMethod) error {
 	}
 
 	if err := unix.PivotRoot(".", "."); err != nil {
-		return fmt.Errorf("pivot_root %s", err)
+		return xerrors.Errorf("pivot_root %s", err)
 	}
 
 	// Currently our "." is oldroot (according to the current kernel code).
@@ -720,7 +756,7 @@ func pivotRoot(rootfs string, fsshift api.FSShiftMethod) error {
 
 	// Switch back to our shiny new root.
 	if err := unix.Chdir("/"); err != nil {
-		return fmt.Errorf("chdir / %s", err)
+		return xerrors.Errorf("chdir / %s", err)
 	}
 
 	return nil
@@ -754,8 +790,22 @@ type ringSyncMsg struct {
 	FSShift api.FSShiftMethod `json:"fsshift"`
 }
 
+type inWorkspaceServiceClient struct {
+	daemonapi.InWorkspaceServiceClient
+
+	conn *grpc.ClientConn
+}
+
+func (iwsc *inWorkspaceServiceClient) Close() error {
+	if iwsc.conn == nil {
+		return nil
+	}
+
+	return iwsc.conn.Close()
+}
+
 // ConnectToInWorkspaceDaemonService attempts to connect to the InWorkspaceService offered by the ws-daemon.
-func connectToInWorkspaceDaemonService(ctx context.Context) (daemonapi.InWorkspaceServiceClient, *grpc.ClientConn, error) {
+func connectToInWorkspaceDaemonService(ctx context.Context) (*inWorkspaceServiceClient, error) {
 	const socketFN = "/.workspace/daemon.sock"
 
 	t := time.NewTicker(500 * time.Millisecond)
@@ -769,15 +819,19 @@ func connectToInWorkspaceDaemonService(ctx context.Context) (daemonapi.InWorkspa
 		case <-t.C:
 			continue
 		case <-ctx.Done():
-			return nil, nil, fmt.Errorf("socket did not appear before context was canceled")
+			return nil, xerrors.Errorf("socket did not appear before context was canceled")
 		}
 	}
 
 	conn, err := grpc.DialContext(ctx, "unix://"+socketFN, grpc.WithInsecure())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return daemonapi.NewInWorkspaceServiceClient(conn), conn, nil
+
+	return &inWorkspaceServiceClient{
+		InWorkspaceServiceClient: daemonapi.NewInWorkspaceServiceClient(conn),
+		conn:                     conn,
+	}, nil
 }
 
 func init() {
@@ -798,4 +852,8 @@ func init() {
 
 	ring1Cmd.Flags().BoolVar(&ring1Opts.MappingEstablished, "mapping-established", false, "true if the UID/GID mapping has already been established")
 	ring2Cmd.Flags().StringVar(&ring2Opts.SupervisorPath, "supervisor-path", supervisorPath, "path to the supervisor binary (taken from $GITPOD_WORKSPACEKIT_SUPERVISOR_PATH, defaults to '$PWD/supervisor')")
+}
+
+func isProcessAlreadyFinished(err error) bool {
+	return strings.Contains(err.Error(), "os: process already finished")
 }

@@ -4,7 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { GitpodToken, GitpodTokenType, Identity, IdentityLookup, Token, TokenEntry, User, UserEnvVar } from "@gitpod/gitpod-protocol";
+import { AdditionalUserData, GitpodToken, GitpodTokenType, Identity, IdentityLookup, Token, TokenEntry, User, UserEnvVar } from "@gitpod/gitpod-protocol";
 import { OAuthTokenRepository, OAuthUserRepository } from "@jmondi/oauth2-server";
 import { Repository } from "typeorm";
 import { DBUser } from "./typeorm/entity/db-user";
@@ -111,6 +111,7 @@ export interface UserDB extends OAuthUserRepository, OAuthTokenRepository {
     findUserByName(name: string): Promise<User | undefined>;
 
     findUserByGitpodToken(tokenHash: string, tokenType?: GitpodTokenType): Promise<{ user: User, token: GitpodToken } | undefined>;
+    findGitpodTokensOfUser(userId: string, tokenHash: string): Promise<GitpodToken | undefined>;
     findAllGitpodTokensOfUser(userId: string): Promise<GitpodToken[]>;
     storeGitpodToken(token: GitpodToken & { user: DBUser }): Promise<void>;
     deleteGitpodToken(tokenHash: string): Promise<void>;
@@ -118,13 +119,13 @@ export interface UserDB extends OAuthUserRepository, OAuthTokenRepository {
 }
 export type PartialUserUpdate = Partial<Omit<User, "identities">> & Pick<User, "id">
 
-export const BUILTIN_WORKSPACE_PROBE_USER_NAME = "builtin-workspace-prober";
+export const BUILTIN_WORKSPACE_PROBE_USER_ID = "builtin-user-workspace-probe-0000000";
 
 export interface OwnerAndRepo {
     owner: string
     repo: string
 }
 
-export type UserEmailContact = Pick<User, 'id' | 'name' | 'allowsMarketingCommunication'> & {
-    primaryEmail: string
-}
+export type UserEmailContact = Pick<User, 'id' | 'name'>
+    & { primaryEmail: string }
+    & { additionalData?: Pick<AdditionalUserData, 'emailNotificationSettings'> }

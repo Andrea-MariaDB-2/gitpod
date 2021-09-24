@@ -14,7 +14,6 @@ const u1: User = {
     "avatarUrl": "https://avatars.githubusercontent.com/u/10137?v=4",
     "name": "gp-test",
     "fullName": "Alex",
-    "allowsMarketingCommunication": true,
     "identities": [
         {
             "authProviderId": "Public-GitHub",
@@ -28,6 +27,10 @@ const u1: User = {
         whatsNewSeen: {
             "April-2021": "true",
             "June-2021": "true",
+        },
+        emailNotificationSettings: {
+            allowsChangelogMail: true,
+            allowsDevXMail: true
         }
     }
 }
@@ -103,45 +106,45 @@ const gitpodServiceMock = createServiceMock({
     findPrebuilds: async (p) => {
         const { projectId } = p;
         return [{
-            id: "pb1",
-            branch: "main",
-            buildWorkspaceId: "123",
-            branchPrebuildNumber: "123342",
-            teamId: "t1",
-            projectId,
-            projectName: "pb1",
-            cloneUrl: pr1.cloneUrl,
-            startedAt: t1,
-            startedBy: u1.id,
-            startedByAvatar: u1.avatarUrl,
-            status: "available",
-            changeTitle: "[Comp] Add new functionality for",
-            changeDate: t1,
-            changeAuthor: u1.fullName!,
-            changeAuthorAvatar: u1.avatarUrl,
-            changePR: "4647",
-            changeUrl: "https://github.com/gitpod-io/gitpod/pull/4738",
-            changeHash: "2C0FFE"
+            info: {
+                id: "pb1",
+                branch: "main",
+                buildWorkspaceId: "123",
+                teamId: "t1",
+                projectId,
+                projectName: "pb1",
+                cloneUrl: pr1.cloneUrl,
+                startedAt: t1,
+                startedBy: u1.id,
+                startedByAvatar: u1.avatarUrl,
+                changeTitle: "[Comp] Add new functionality for",
+                changeDate: t1,
+                changeAuthor: u1.fullName!,
+                changeAuthorAvatar: u1.avatarUrl,
+                changePR: "4647",
+                changeUrl: "https://github.com/gitpod-io/gitpod/pull/4738",
+                changeHash: "2C0FFE"
+            }, status: "available"
         }, {
-            id: "pb1",
-            branch: "foo/bar",
-            buildWorkspaceId: "1234",
-            branchPrebuildNumber: "3",
-            teamId: "t1",
-            projectId,
-            projectName: "pb1",
-            cloneUrl: pr1.cloneUrl,
-            startedAt: t1,
-            startedBy: u1.id,
-            startedByAvatar: u1.avatarUrl,
-            status: "aborted",
-            changeTitle: "Fix Bug Nr 1",
-            changeDate: t1,
-            changeAuthor: u1.fullName!,
-            changeAuthorAvatar: u1.avatarUrl,
-            changePR: "4245",
-            changeUrl: "https://github.com/gitpod-io/gitpod/pull/4738",
-            changeHash: "1C0FFE"
+            info: {
+                id: "pb1",
+                branch: "foo/bar",
+                buildWorkspaceId: "1234",
+                teamId: "t1",
+                projectId,
+                projectName: "pb1",
+                cloneUrl: pr1.cloneUrl,
+                startedAt: t1,
+                startedBy: u1.id,
+                startedByAvatar: u1.avatarUrl,
+                changeTitle: "Fix Bug Nr 1",
+                changeDate: t1,
+                changeAuthor: u1.fullName!,
+                changeAuthorAvatar: u1.avatarUrl,
+                changePR: "4245",
+                changeUrl: "https://github.com/gitpod-io/gitpod/pull/4738",
+                changeHash: "1C0FFE"
+            }, status: "available"
         }
         ]
     },

@@ -18,6 +18,7 @@ import (
 	ctesting "github.com/gitpod-io/gitpod/common-go/testing"
 	"github.com/gitpod-io/gitpod/common-go/util"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
+	config "github.com/gitpod-io/gitpod/ws-manager/api/config"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -39,9 +40,8 @@ func TestIsWorkspaceTimedout(t *testing.T) {
 		Test: func(t *testing.T, input interface{}) interface{} {
 			fixture := input.(*fixture)
 			manager := Manager{
-				activity: make(map[string]time.Time),
-				Config: Configuration{
-					Timeouts: WorkspaceTimeoutConfiguration{
+				Config: config.Configuration{
+					Timeouts: config.WorkspaceTimeoutConfiguration{
 						AfterClose:          util.Duration(1 * time.Minute),
 						Initialization:      util.Duration(30 * time.Minute),
 						TotalStartup:        util.Duration(45 * time.Minute),
@@ -66,7 +66,8 @@ func TestIsWorkspaceTimedout(t *testing.T) {
 					return nil
 				}
 
-				manager.activity[workspaceID] = time.Now().Add(-dt)
+				delta := time.Now().Add(-dt)
+				manager.activity.Store(workspaceID, &delta)
 			}
 
 			if fixture.CreationDelta != "" && fixture.WSO.Pod != nil {
@@ -145,10 +146,9 @@ func BenchmarkGetStatus(b *testing.B) {
 
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
-				r, err := manager.getWorkspaceStatus(wso)
+				_, err := manager.getWorkspaceStatus(wso)
 				if err != nil {
 					b.Fatal(err)
-					r.Auth = nil
 				}
 			}
 		})

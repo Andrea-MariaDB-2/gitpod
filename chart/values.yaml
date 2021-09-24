@@ -24,7 +24,7 @@ imagePullPolicy: IfNotPresent
 
 # configure default log level
 log:
-  level: trace
+  level: info
 
 resources:
   default:
@@ -131,8 +131,10 @@ branding:
       - name: Terms of Service
         url: https://www.gitpod.io/terms/
 workspaceScheduler: workspace-scheduler
-serverProxyApiKey: "fF7+aCPvF9Pa0AEjmoZ+yWVh6PqBjM5VEA0wyQs3FH4="
-previewFeatureFlags: []
+
+vsxRegistry:
+  proxy: false
+  host: open-vsx.org
 
 components:
 
@@ -238,7 +240,7 @@ components:
     name: "image-builder-mk3"
     dependsOn:
     - "image-builder-mk3-configmap.yaml"
-    alpineImage: alpine:3.13
+    alpineImage: alpine:3.14
     builderImage:
       imageName: "image-builder-mk3/bob"
     ports:
@@ -291,19 +293,26 @@ components:
   server:
     name: "server"
     dependsOn:
-    - "server-proxy-apikey-secret.yaml"
-    - "auth-providers-configmap.yaml"
-    sessionSecret: Important!Really-Change-This-Key!
+    - "server-configmap.yaml"
     resources:
       cpu: "200m"
-    github:
-      app: {}
-    blockNewUsers: false
-    blockNewUsersPasslist: []
+    githubApp:
+      enabled: false
+      authProviderId: "Public-GitHub"
+    blockNewUsers:
+      enabled: false
+      passlist: []
     runDbDeleter: true
+    serverIdeConfigDeploy:
+      enabled: true
     storage: {}
     wsman: []
     defaultBaseImageRegistryWhitelist: []
+    session:
+      # 3 days
+      maxAgeMs: 259200000
+      secret: Important!Really-Change-This-Key!
+    previewFeatureFlags: []
     defaultFeatureFlags: []
     incrementalPrebuilds:
       repositoryPasslist: []
@@ -316,17 +325,57 @@ components:
       metrics:
         expose: true
         containerPort: 9500
-      debug:
+      debugNode:
         expose: false
         containerPort: 9229
+      debug:
+        expose: false
+        containerPort: 6060
     serviceSessionAffinity: None
     serverContainer:
       volumeMounts: null
       env: null
     volumes: null
     garbageCollection:
-      disabled: "false"
+      disabled: false
+      startDate: null
+      chunkLimit: 1000
+      minAgeDays: 14
+      minAgePrebuildDays: 7
+      contentRetentionPeriodDays: 21
+      contentChunkLimit: 1000
     definitelyGpDisabled: "false"
+    enableLocalApp: false
+    disableDynamicAuthProviderLogin: false
+    maxEnvvarPerUserCount: 4048
+    maxConcurrentPrebuildsPerRef: 10
+    makeNewUsersAdmin: false
+    theiaPluginsBucketNameOverride: null
+    oauthServer:
+      enabled: false
+    rateLimiter:
+      groups:
+        inWorkspaceUserAction:
+          points: 10
+          durationsSec: 2
+      functions:
+        openPort:
+          group: inWorkspaceUserAction
+        closePort:
+          group: inWorkspaceUserAction
+        controlAdmission:
+          group: inWorkspaceUserAction
+        shareSnapshot:
+          group: inWorkspaceUserAction
+    contentServiceAddr: "content-service:8080"
+    imageBuilderAddr: "image-builder-mk3:8080"
+    codeSync: {}
+    enablePayment: false
+    workspaceHeartbeat:
+      intervalSeconds: 60
+      timeoutSeconds: 300
+    insecureNoDomain: false
+    chargebeeProviderOptionsFile: "/chargebee/providerOptions"
 
   serviceWaiter:
     imageName: "service-waiter"
@@ -353,6 +402,7 @@ components:
       imageName: "ide/theia"
     codeImage:
       imageName: "ide/code"
+      stableVersion: "commit-2f069ca3b646ab8099c05f7efd181004c08e95cb"
     supervisor:
       imageName: "supervisor"
     dockerUp:
@@ -374,13 +424,15 @@ components:
     svcName: "proxy"
     dependsOn:
     - "proxy-configmap.yaml"
-    - "server-proxy-apikey-secret.yaml"
     ports:
       http:
         containerPort: 80
       https:
         expose: true
         containerPort: 443
+      metrics:
+        expose: false
+        containerPort: 9500
     loadBalancerIP: null
     serviceType: "LoadBalancer"
     serviceSessionAffinity: "None"
@@ -388,6 +440,8 @@ components:
 
   wsManager:
     name: "ws-manager"
+    dependsOn:
+    - "ws-manager-configmap.yaml"
     resources:
       cpu: 100m
       memory: 32Mi
@@ -477,12 +531,6 @@ components:
       memory: 64Mi
     replicas: 1
     hostHeader: "x-wsproxy-host"
-    wsManagerProxy:
-      enabled: false
-      listenAddress: ":8081"
-      ratelimit:
-        # Limits the # of requests (per second)
-        maxRPS: 10
     ports:
       httpProxy:
         expose: true

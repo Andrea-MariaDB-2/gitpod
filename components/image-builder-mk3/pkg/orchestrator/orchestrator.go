@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/opentracing/opentracing-go"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
@@ -33,6 +32,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
@@ -112,16 +112,13 @@ func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
 			return
 		}
 		if len(data) != 32 {
-			err = fmt.Errorf("builder auth key must be exactly 32 bytes long")
+			err = xerrors.Errorf("builder auth key must be exactly 32 bytes long")
 			return
 		}
 		copy(builderAuthKey[:], data)
 	}
 
-	opts := []grpc.DialOption{
-		grpc.WithUnaryInterceptor(grpc_opentracing.UnaryClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-		grpc.WithStreamInterceptor(grpc_opentracing.StreamClientInterceptor(grpc_opentracing.WithTracer(opentracing.GlobalTracer()))),
-	}
+	grpcOpts := common_grpc.DefaultClientOptions()
 	if cfg.WorkspaceManager.TLS.Authority != "" || cfg.WorkspaceManager.TLS.Certificate != "" && cfg.WorkspaceManager.TLS.PrivateKey != "" {
 		ca := cfg.WorkspaceManager.TLS.Authority
 		crt := cfg.WorkspaceManager.TLS.Certificate
@@ -155,11 +152,11 @@ func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
 			RootCAs:      certPool,
 			MinVersion:   tls.VersionTLS12,
 		})
-		opts = append(opts, grpc.WithTransportCredentials(creds))
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(creds))
 	} else {
-		opts = append(opts, grpc.WithInsecure())
+		grpcOpts = append(grpcOpts, grpc.WithInsecure())
 	}
-	conn, err := grpc.Dial(cfg.WorkspaceManager.Address, opts...)
+	conn, err := grpc.Dial(cfg.WorkspaceManager.Address, grpcOpts...)
 	if err != nil {
 		return
 	}
@@ -178,6 +175,7 @@ func NewOrchestratingBuilder(cfg Configuration) (res *Orchestrator, err error) {
 		logListener:    make(map[string]map[logListener]struct{}),
 		censorship:     make(map[string][]string),
 		builderAuthKey: builderAuthKey,
+		metrics:        newMetrics(),
 	}
 	o.monitor = newBuildMonitor(o, o.wsman)
 
@@ -200,6 +198,8 @@ type Orchestrator struct {
 	mu             sync.RWMutex
 
 	monitor *buildMonitor
+
+	metrics *metrics
 
 	protocol.UnimplementedImageBuilderServer
 }

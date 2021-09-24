@@ -97,10 +97,14 @@ export namespace log {
     /**
      * Do not use in frontend.
      */
-    export function enableJSONLogging(componentArg: string, versionArg: string | undefined): void {
+    export function enableJSONLogging(componentArg: string, versionArg: string | undefined, logLevel?: LogrusLogLevel): void {
         component = componentArg;
         version = versionArg;
 
+        setLogLevel(logLevel);
+    }
+
+    export function setLogLevel(logLevel: LogrusLogLevel | undefined) {
         jsonLogging = true;
 
         console.error = function (...args: any[]): void {
@@ -115,8 +119,26 @@ export namespace log {
         console.debug = function (...args: any[]): void {
             debugLog(true, args);
         }
+
         console.log = console.info;
         // FIXME wrap also other console methods (e.g. trace())
+
+        // set/unset log functions based on loglevel so we only have to evaluate once, not every call
+        const noop = () => {};
+        const setLog = (logFunc: (calleViaConsole: boolean, args: any[]) => void, funcLvl: LogrusLogLevel): (() => void) => {
+            if (LogrusLogLevel.isGreatherOrEqual(funcLvl, logLevel)) {
+                return function (...args: any[]): void {
+                    logFunc(true, args);
+                };
+            } else {
+                return noop;
+            }
+        };
+
+        errorLog = setLog(doErrorLog, "error");
+        warnLog = setLog(doWarnLog, "warning");
+        infoLog = setLog(doInfoLog, "info");
+        debugLog = setLog(doDebugLog, "debug");
     }
 
     export function resetToDefaultLogging(): void {
@@ -128,22 +150,69 @@ export namespace log {
         console.info = infoConsoleLog;
         console.debug = debugConsoleLog;
     }
+
+    export function setVersion(versionArg: string) {
+        version = versionArg;
+    }
 }
 
-function errorLog(calledViaConsole: boolean, args: any[]): void {
+let errorLog = doErrorLog;
+function doErrorLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, errorConsoleLog, 'ERROR', args);
 }
 
-function warnLog(calledViaConsole: boolean, args: any[]): void {
+let warnLog = doWarnLog;
+function doWarnLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, warnConsoleLog, 'WARNING', args);
 }
 
-function infoLog(calledViaConsole: boolean, args: any[]): void {
+let infoLog = doInfoLog;
+function doInfoLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, infoConsoleLog, 'INFO', args);
 }
 
-function debugLog(calledViaConsole: boolean, args: any[]): void {
+let debugLog = doDebugLog;
+function doDebugLog(calledViaConsole: boolean, args: any[]): void {
     doLog(calledViaConsole, debugConsoleLog, 'DEBUG', args);
+}
+
+// Ref: https://github.com/sirupsen/logrus#level-logging
+export type LogrusLogLevel = keyof (typeof LogrusLogLevels);
+export const LogrusLogLevels = {
+    trace: true,
+    debug: true,
+    info: true,
+    warning: true,
+    error: true,
+    fatal: true,
+    panic: true,
+}
+export namespace LogrusLogLevel {
+    export function isGreatherOrEqual(lvl: LogrusLogLevel | undefined, ref: LogrusLogLevel | undefined): boolean {
+        if (lvl === undefined) {
+            return false;
+        }
+        if (ref === undefined) {
+            return true;
+        }
+        return getLevelArity(lvl) >= getLevelArity(ref);
+    }
+    function getLevelArity(lvl: LogrusLogLevel): number {
+        return Object.keys(LogrusLogLevels)
+            .findIndex((l) => l === lvl);
+    }
+    export function getFromEnv(): LogrusLogLevel | undefined {
+        const lvlStr = process.env.LOG_LEVEL;
+        if (!lvlStr) {
+            return undefined;
+        }
+        const lvl = lvlStr as LogrusLogLevel;
+        const exists = LogrusLogLevels[lvl]
+        if (!exists) {
+            return undefined;
+        }
+        return lvl;
+    }
 }
 
 // Source: https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#LogSeverity

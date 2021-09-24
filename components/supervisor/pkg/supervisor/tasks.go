@@ -7,6 +7,7 @@ package supervisor
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -65,13 +66,32 @@ type task struct {
 	api.TaskStatus
 	config      TaskConfig
 	command     string
-	successChan chan bool
+	successChan chan taskSuccess
 	title       string
 }
 
 type headlessTaskProgressReporter interface {
 	write(data string, task *task, terminal *terminal.Term)
-	done(success bool)
+	done(success taskSuccess)
+}
+
+type taskSuccess string
+
+func (t taskSuccess) Failed() bool { return t != "" }
+
+var taskSuccessful taskSuccess = ""
+
+func (t taskSuccess) Fail(msg string) taskSuccess {
+	res := string(t)
+	if res != "" {
+		res += "; "
+	}
+	res += msg
+	return taskSuccess(res)
+}
+
+func taskFailed(msg string) taskSuccess {
+	return taskSuccessful.Fail(msg)
 }
 
 type tasksManager struct {
@@ -194,19 +214,19 @@ func (tm *tasksManager) init(ctx context.Context) {
 				Presentation: presentation,
 			},
 			config:      config,
-			successChan: make(chan bool, 1),
+			successChan: make(chan taskSuccess, 1),
 			title:       title,
 		}
 		task.command = getCommand(task, tm.config.isHeadless(), tm.contentSource, tm.storeLocation)
 		if tm.config.isHeadless() && task.command == "exit" {
 			task.State = api.TaskState_closed
-			task.successChan <- true
+			task.successChan <- taskSuccessful
 		}
 		tm.tasks = append(tm.tasks, task)
 	}
 }
 
-func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan chan bool) {
+func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan chan taskSuccess) {
 	defer wg.Done()
 	defer log.Debug("tasksManager shutdown")
 
@@ -220,7 +240,15 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		taskLog.Info("starting a task terminal...")
 		openRequest := &api.OpenTerminalRequest{}
 		if t.config.Env != nil {
-			openRequest.Env = *t.config.Env
+			openRequest.Env = make(map[string]string, len(*t.config.Env))
+			for key, value := range *t.config.Env {
+				v, err := json.Marshal(value)
+				if err != nil {
+					taskLog.WithError(err).WithField("key", key).Error("cannot marshal env var")
+				} else {
+					openRequest.Env[key] = string(v)
+				}
+			}
 		}
 		var readTimeout time.Duration
 		if !tm.config.isHeadless() {
@@ -232,7 +260,7 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		})
 		if err != nil {
 			taskLog.WithError(err).Error("cannot open new task terminal")
-			t.successChan <- false
+			t.successChan <- taskFailed("cannot open new task terminal")
 			tm.setTaskState(t, api.TaskState_closed)
 			continue
 		}
@@ -241,7 +269,7 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		term, ok := tm.terminalService.Mux.Get(resp.Terminal.Alias)
 		if !ok {
 			taskLog.Error("cannot find a task terminal")
-			t.successChan <- false
+			t.successChan <- taskFailed("cannot find a task terminal")
 			tm.setTaskState(t, api.TaskState_closed)
 			continue
 		}
@@ -255,11 +283,23 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		})
 
 		go func(t *task, term *terminal.Term) {
-			state, _ := term.Wait()
+			state, err := term.Wait()
 			if state != nil {
-				t.successChan <- state.Success()
+				if state.Success() {
+					t.successChan <- taskSuccessful
+				} else {
+					t.successChan <- taskFailed(state.String())
+				}
+			} else if err != nil && strings.Contains(err.Error(), "no child process") {
+				// our own reaper broke Go's child process handling
+				t.successChan <- taskSuccessful
 			} else {
-				t.successChan <- false
+				msg := "cannot wait for task"
+				if err != nil {
+					msg = err.Error()
+				}
+
+				t.successChan <- taskFailed(msg)
 			}
 			taskLog.Info("task terminal has been closed")
 			tm.setTaskState(t, api.TaskState_closed)
@@ -272,20 +312,20 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		}
 	}
 
-	success := true
+	var success taskSuccess
 	for _, task := range tm.tasks {
 		select {
 		case <-ctx.Done():
-			success = false
+			success = taskFailed(ctx.Err().Error())
 			break
-		case taskSuccess := <-task.successChan:
-			if !taskSuccess {
-				success = false
+		case taskResult := <-task.successChan:
+			if taskResult.Failed() {
+				success = success.Fail(string(taskResult))
 			}
 		}
 	}
 
-	if tm.config.isHeadless() {
+	if tm.config.isHeadless() && tm.reporter != nil {
 		tm.reporter.done(success)
 	}
 	successChan <- success
@@ -423,7 +463,9 @@ func (tm *tasksManager) watch(task *task, terminal *terminal.Term) {
 				}
 				data := string(buf[:n])
 				fileWriter.Write(buf[:n])
-				tm.reporter.write(data, task, terminal)
+				if tm.reporter != nil {
+					tm.reporter.write(data, task, terminal)
+				}
 
 				endMessage := "\n🤙 This task ran as a workspace prebuild\n" + duration + "\n"
 				fileWriter.WriteString(endMessage)
@@ -435,7 +477,9 @@ func (tm *tasksManager) watch(task *task, terminal *terminal.Term) {
 			}
 			data := string(buf[:n])
 			fileWriter.Write(buf[:n])
-			tm.reporter.write(data, task, terminal)
+			if tm.reporter != nil {
+				tm.reporter.write(data, task, terminal)
+			}
 		}
 	}()
 }
@@ -494,28 +538,4 @@ func composeCommand(options composeCommandOptions) string {
 		}
 	}
 	return strings.Join(commands, options.sep)
-}
-
-type loggingHeadlessTaskProgressReporter struct {
-}
-
-func (r *loggingHeadlessTaskProgressReporter) write(data string, task *task, terminal *terminal.Term) {
-	log.WithField("component", "workspace").WithField("pid", terminal.Command.Process.Pid).
-		WithField("taskLogMsg", taskLogMessage{Type: "workspaceTaskOutput", Data: data}).Info()
-}
-
-func (r *loggingHeadlessTaskProgressReporter) done(success bool) {
-	workspaceLog := log.WithField("component", "workspace")
-	workspaceLog.WithField("taskLogMsg", taskLogMessage{Type: "workspaceTaskOutput", Data: "🚛 uploading workspace image"}).Info()
-	if !success {
-		workspaceLog.WithField("error", "one of the tasks failed with non-zero exit code").
-			WithField("taskLogMsg", taskLogMessage{Type: "workspaceTaskFailed"}).Info()
-		return
-	}
-	workspaceLog.WithField("taskLogMsg", taskLogMessage{Type: "workspaceTaskDone"}).Info()
-}
-
-type taskLogMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data"`
 }

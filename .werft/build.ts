@@ -9,6 +9,8 @@ import * as semver from 'semver';
 import * as util from 'util';
 import { sleep } from './util/util';
 import * as gpctl from './util/gpctl';
+import { createHash } from "crypto";
+import { InstallMonitoringSatelliteParams, installMonitoringSatellite } from './util/observability';
 
 const readDir = util.promisify(fs.readdir)
 
@@ -89,9 +91,15 @@ export async function build(context, version) {
     const dontTest = "no-test" in buildConfig;
     const cacheLevel = "no-cache" in buildConfig ? "remote-push" : "remote";
     const publishRelease = "publish-release" in buildConfig;
-    const workspaceFeatureFlags = (buildConfig["ws-feature-flags"] || "").split(",").map(e => e.trim())
+    const workspaceFeatureFlags: string[] = ((): string[] => {
+        const raw: string = buildConfig["ws-feature-flags"] || "";
+        if (!raw) {
+            return [];
+        }
+        return raw.split(",").map(e => e.trim());
+    })();
     const dynamicCPULimits = "dynamic-cpu-limits" in buildConfig;
-    const withInstaller = "with-installer" in buildConfig || mainBuild;
+    const withContrib = "with-contrib" in buildConfig || mainBuild;
     const noPreview = ("no-preview" in buildConfig && buildConfig["no-preview"] !== "false") || publishRelease;
     const storage = buildConfig["storage"] || "";
     const withIntegrationTests = "with-integration-tests" in buildConfig;
@@ -102,6 +110,7 @@ export async function build(context, version) {
     const cleanSlateDeployment = mainBuild || ("with-clean-slate-deployment" in buildConfig);
     const installEELicense = !("without-ee-license" in buildConfig);
     const withPayment= "with-payment" in buildConfig;
+    const withObservability = "with-observability" in buildConfig;
 
     werft.log("job config", JSON.stringify({
         buildConfig,
@@ -122,6 +131,7 @@ export async function build(context, version) {
         retag,
         cleanSlateDeployment,
         installEELicense,
+        withObservability,
     }));
 
     /**
@@ -139,8 +149,8 @@ export async function build(context, version) {
     if (publishRelease) {
         exec(`gcloud auth activate-service-account --key-file "/mnt/secrets/gcp-sa-release/service-account.json"`);
     }
-    if (withInstaller || publishRelease) {
-        exec(`leeway build --werft=true -c ${cacheLevel} ${dontTest ? '--dont-test' : ''} -Dversion=${version} -DimageRepoBase=${imageRepo} install:all`);
+    if (withContrib || publishRelease) {
+        exec(`leeway build --werft=true -c ${cacheLevel} ${dontTest ? '--dont-test' : ''} -Dversion=${version} -DimageRepoBase=${imageRepo} contrib:all`);
     }
     exec(`leeway build --werft=true -c ${cacheLevel} ${retag} --coverage-output-path=${coverageOutput} -Dversion=${version} -DremoveSources=false -DimageRepoBase=${imageRepo} -DlocalAppVersion=${localAppVersion} -DnpmPublishTrigger=${publishToNpm ? Date.now() : 'false'}`);
     if (publishRelease) {
@@ -221,12 +231,14 @@ export async function build(context, version) {
     const destname = version.split(".")[0];
     const namespace = `staging-${destname}`;
     const domain = `${destname}.staging.gitpod-dev.com`;
+    const monitoringDomain = `${destname}.preview.gitpod-dev.com`;
     const url = `https://${domain}`;
-    const deploymentConfig = {
+    const deploymentConfig: DeploymentConfig = {
         version,
         destname,
         namespace,
         domain,
+        monitoringDomain,
         url,
         analytics,
         cleanSlateDeployment,
@@ -234,6 +246,7 @@ export async function build(context, version) {
         installEELicense,
         k3sWsCluster,
         withPayment,
+        withObservability,
     };
     await deployToDev(deploymentConfig, workspaceFeatureFlags, dynamicCPULimits, storage);
     await triggerIntegrationTests(deploymentConfig.version, deploymentConfig.namespace, context.Owner, !withIntegrationTests)
@@ -244,6 +257,7 @@ interface DeploymentConfig {
     destname: string;
     namespace: string;
     domain: string;
+    monitoringDomain: string,
     url: string;
     k3sWsCluster?: boolean;
     analytics?: string;
@@ -251,17 +265,19 @@ interface DeploymentConfig {
     sweeperImage: string;
     installEELicense: boolean;
     withPayment: boolean;
+    withObservability: boolean;
 }
 
 /**
  * Deploy dev
  */
-export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceFeatureFlags, dynamicCPULimits, storage) {
+export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceFeatureFlags: string[], dynamicCPULimits, storage) {
     werft.phase("deploy", "deploying to dev");
-    const { version, destname, namespace, domain, url, k3sWsCluster } = deploymentConfig;
-    const [wsdaemonPortMeta, registryNodePortMeta] = findFreeHostPorts("", [
+    const { version, destname, namespace, domain, monitoringDomain, url, k3sWsCluster } = deploymentConfig;
+    const [wsdaemonPortMeta, registryNodePortMeta, nodeExporterPort] = findFreeHostPorts("", [
         { start: 10000, end: 11000 },
         { start: 30000, end: 31000 },
+        { start: 31001, end: 32000 },
     ], 'hostports');
     const [wsdaemonPortK3sWs, registryNodePortK3sWs] = !k3sWsCluster ? [0, 0] : findFreeHostPorts(getK3sWsKubeConfigPath(), [
         { start: 10000, end: 11000 },
@@ -323,7 +339,6 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
             await issueK3sWsCerts(k3sWsProxyIP);
             await installWsCertificates();
         }
-
         werft.done('certificate');
 
         werft.done('prep');
@@ -380,8 +395,19 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
         werft.fail('deploy', err);
     } finally {
         // produce the result independently of Helm succeding, so that in case Helm fails we still have the URL.
-        exec(`werft log result -d "dev installation" -c github url ${url}/workspaces/`);
+        exec(`werft log result -d "dev installation" -c github-check-preview-env url ${url}/workspaces/`);
     }
+
+    werft.log(`observability`, "Installing monitoring-satellite...")
+    if (deploymentConfig.withObservability) {
+        await installMonitoring();
+        exec(`werft log result -d "Monitoring Satellite - Grafana" -c github-check-Grafana url https://grafana-${monitoringDomain}/dashboards`);
+        exec(`werft log result -d "Monitoring Satellite - Prometheus" -c github-check-Prometheus url https://prometheus-${monitoringDomain}/graph`);
+    } else {
+        exec(`echo '"with-observability" annotation not set, skipping...'`, {slice: `observability`})
+        exec(`echo 'To deploy monitoring-satellite, please add "/werft with-observability" to your PR description.'`, {slice: `observability`})
+    }
+    werft.done('observability');
 
     if (k3sWsCluster) {
         try {
@@ -396,18 +422,31 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
         let flags = commonFlags
         flags += ` --set components.wsDaemon.servicePort=${wsdaemonPortMeta}`;
         flags += ` --set components.registryFacade.ports.registry.servicePort=${registryNodePortMeta}`;
+
+        const nodeAffinityValues = [
+            "values.nodeAffinities_0.yaml",
+            "values.nodeAffinities_1.yaml"
+        ]
+
         if (k3sWsCluster) {
             // we do not need meta cluster ws components when k3s ws is enabled
             // TODO: Add flags to disable ws component in the meta cluster
             flags += ` --set components.server.wsmanSkipSelf=true`
         }
         if (storage === "gcp") {
-            exec("kubectl get secret gcp-sa-cloud-storage-dev-sync-key -n werft -o yaml | yq d - metadata | yq w - metadata.name remote-storage-gcloud | kubectl apply -f -");
+            exec("kubectl get secret gcp-sa-gitpod-dev-deployer -n werft -o yaml | yq d - metadata | yq w - metadata.name remote-storage-gcloud | kubectl apply -f -");
             flags += ` -f ../.werft/values.dev.gcp-storage.yaml`;
         }
 
+        /*  A hash is caclulated from the branch name and a subset of that string is parsed to a number x,
+            x mod the number of different nodepool-sets defined in the files listed in nodeAffinityValues
+            is used to generate a pseudo-random number that consistent as long as the branchname persists.
+            We use it to reduce the number of preview-environments accumulating on a singe nodepool.
+         */
+        const nodepoolIndex = parseInt(createHash('sha256').update(namespace).digest('hex').substring(0,5),16) % nodeAffinityValues.length;
+
         exec(`helm dependencies up`);
-        exec(`/usr/local/bin/helm3 upgrade --install --timeout 10m -f ../.werft/values.dev.yaml ${flags} ${helmInstallName} .`);
+        exec(`/usr/local/bin/helm3 upgrade --install --timeout 10m -f ../.werft/${nodeAffinityValues[nodepoolIndex]} -f ../.werft/values.dev.yaml ${flags} ${helmInstallName} .`);
         exec(`kubectl apply -f ../.werft/jaeger.yaml`);
 
         werft.log('helm', 'installing Sweeper');
@@ -423,8 +462,8 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
         flags += ` --set components.registryFacade.ports.registry.servicePort=${registryNodePortK3sWs}`;
         flags += ` --set components.wsProxy.loadBalancerIP=${wsProxyIP}`;
         if (storage === "gcp") {
-            // notice below that we are not using the k3s cluster to get the gcp-sa-cloud-storage-dev-sync-key. As it is present in the dev cluster only
-            exec("kubectl get secret gcp-sa-cloud-storage-dev-sync-key -n werft -o yaml | yq d - metadata | yq w - metadata.name remote-storage-gcloud > remote-storage-gcloud.yaml");
+            // notice below that we are not using the k3s cluster to get the gcp-sa-gitpod-dev-deployer. As it is present in the dev cluster only
+            exec("kubectl get secret gcp-sa-gitpod-dev-deployer -n werft -o yaml | yq d - metadata | yq w - metadata.name remote-storage-gcloud > remote-storage-gcloud.yaml");
             // After storing the yaml we apply it to the k3s cluster
             exec(`export KUBECONFIG=${pathToKubeConfig} && kubectl apply -f remote-storage-gcloud.yaml`)
             flags += ` -f ../.werft/values.dev.gcp-storage.yaml`;
@@ -511,6 +550,17 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
         wsInstallCertParams.destinationNamespace = namespace
         wsInstallCertParams.pathToKubeConfig = getK3sWsKubeConfigPath()
         await installCertficate(werft, wsInstallCertParams);
+    }
+
+    async function installMonitoring() {
+        const installMonitoringSatelliteParams = new InstallMonitoringSatelliteParams();
+        installMonitoringSatelliteParams.branch = context.Annotations.withObservabilityBranch || "main";
+        installMonitoringSatelliteParams.pathToKubeConfig = ""
+        installMonitoringSatelliteParams.satelliteNamespace = namespace
+        installMonitoringSatelliteParams.clusterName = namespace
+        installMonitoringSatelliteParams.nodeExporterPort = nodeExporterPort
+        installMonitoringSatelliteParams.previewDomain = monitoringDomain
+        await installMonitoringSatellite(installMonitoringSatelliteParams);
     }
 
 
@@ -648,3 +698,4 @@ async function publishHelmChart(imageRepoBase, version) {
         exec(cmd, { slice: 'publish-charts' });
     });
 }
+

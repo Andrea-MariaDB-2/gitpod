@@ -6,23 +6,72 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
+	"time"
 
 	jwt "github.com/dgrijalva/jwt-go"
+	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
 	"github.com/sirupsen/logrus"
 	"github.com/skratchdot/open-golang/open"
 	keyring "github.com/zalando/go-keyring"
 	"golang.org/x/oauth2"
+	"golang.org/x/xerrors"
 )
 
 const (
 	keyringService = "gitpod-io"
 )
+
+var authScopes = []string{
+	"function:getGitpodTokenScopes",
+	"function:getWorkspace",
+	"function:getWorkspaces",
+	"function:listenForWorkspaceInstanceUpdates",
+	"resource:default",
+}
+
+type ErrInvalidGitpodToken struct {
+	cause error
+}
+
+func (e *ErrInvalidGitpodToken) Error() string {
+	return "invalid gitpod token: " + e.cause.Error()
+}
+
+// ValidateToken validates the given tkn against the given gitpod service
+func ValidateToken(client gitpod.APIInterface, tkn string) error {
+	hash := sha256.Sum256([]byte(tkn))
+	tokenHash := hex.EncodeToString(hash[:])
+	tknScopes, err := client.GetGitpodTokenScopes(context.Background(), tokenHash)
+	if e, ok := err.(*gitpod.ErrBadHandshake); ok && e.Resp.StatusCode == 401 {
+		return &ErrInvalidGitpodToken{err}
+	}
+	if err != nil && strings.Contains(err.Error(), "jsonrpc2: code 403") {
+		return &ErrInvalidGitpodToken{err}
+	}
+	if err != nil {
+		return err
+	}
+	tknScopesMap := make(map[string]struct{}, len(tknScopes))
+	for _, scope := range tknScopes {
+		tknScopesMap[scope] = struct{}{}
+	}
+	for _, scope := range authScopes {
+		_, ok := tknScopesMap[scope]
+		if !ok {
+			return &ErrInvalidGitpodToken{fmt.Errorf("%v scope is missing in %v", scope, tknScopes)}
+		}
+	}
+	return nil
+}
 
 // SetToken returns the persisted Gitpod token
 func SetToken(host, token string) error {
@@ -31,12 +80,23 @@ func SetToken(host, token string) error {
 
 // GetToken returns the persisted Gitpod token
 func GetToken(host string) (token string, err error) {
-	return keyring.Get(keyringService, host)
+	tkn, err := keyring.Get(keyringService, host)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return "", nil
+	}
+	return tkn, err
+}
+
+// DeleteToken deletes the persisted Gitpod token
+func DeleteToken(host string) error {
+	return keyring.Delete(keyringService, host)
 }
 
 // LoginOpts configure the login process
 type LoginOpts struct {
-	GitpodURL string
+	GitpodURL   string
+	RedirectURL string
+	AuthTimeout time.Duration
 }
 
 const html = `
@@ -77,7 +137,7 @@ func Login(ctx context.Context, opts LoginOpts) (token string, err error) {
 		defer rl.Close()
 	}
 	if rl == nil {
-		return "", fmt.Errorf("could not open any valid port in range %d - %d", STARTING_PORT_NUM, ENDING_PORT_NUM)
+		return "", xerrors.Errorf("could not open any valid port in range %d - %d", STARTING_PORT_NUM, ENDING_PORT_NUM)
 	}
 
 	var (
@@ -87,7 +147,11 @@ func Login(ctx context.Context, opts LoginOpts) (token string, err error) {
 
 	returnHandler := func(rw http.ResponseWriter, req *http.Request) {
 		queryChan <- req.URL.Query()
-		io.WriteString(rw, html)
+		if opts.RedirectURL != "" {
+			http.Redirect(rw, req, opts.RedirectURL, http.StatusSeeOther)
+		} else {
+			io.WriteString(rw, html)
+		}
 	}
 
 	returnServer := &http.Server{
@@ -117,12 +181,7 @@ func Login(ctx context.Context, opts LoginOpts) (token string, err error) {
 	conf := &oauth2.Config{
 		ClientID:     "gplctl-1.0",
 		ClientSecret: "gplctl-1.0-secret", // Required (even though it is marked as optional?!)
-		Scopes: []string{
-			"function:getWorkspaces",
-			"function:listenForWorkspaceInstanceUpdates",
-			"resource:workspace::*::get",
-			"resource:workspaceInstance::*::get",
-		},
+		Scopes:       authScopes,
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  authURL.String(),
 			TokenURL: tokenURL.String(),
@@ -141,9 +200,10 @@ func Login(ctx context.Context, opts LoginOpts) (token string, err error) {
 	// open a browser window to the authorizationURL
 	err = open.Start(authorizationURL)
 	if err != nil {
-		return "", fmt.Errorf("cannot open browser to URL %s: %s\n", authorizationURL, err)
+		return "", xerrors.Errorf("cannot open browser to URL %s: %s\n", authorizationURL, err)
 	}
 
+	authTimeout := time.NewTimer(opts.AuthTimeout * time.Second)
 	var query url.Values
 	var code, approved string
 	select {
@@ -154,6 +214,8 @@ func Login(ctx context.Context, opts LoginOpts) (token string, err error) {
 	case query = <-queryChan:
 		code = query.Get("code")
 		approved = query.Get("approved")
+	case <-authTimeout.C:
+		return "", xerrors.Errorf("auth timeout after %d seconds", uint32(opts.AuthTimeout))
 	}
 
 	if approved == "no" {

@@ -7,7 +7,7 @@
 import * as prometheusClient from 'prom-client';
 
 // Enable collection of default metrics.
-prometheusClient.collectDefaultMetrics({ timeout: 5000 });
+prometheusClient.collectDefaultMetrics();
 export const register = prometheusClient.register;
 
 const loginCounter = new prometheusClient.Counter({
@@ -100,4 +100,15 @@ export function increaseMessagebusTopicReads(topic: string) {
     messagebusTopicReads.inc({
         topic,
     })
+}
+
+const gitpodVersionInfo = new prometheusClient.Gauge({
+    name: 'gitpod_version_info',
+    help: "Gitpod's version",
+    labelNames: ["gitpod_version"],
+    registers: [prometheusClient.register]
+});
+
+export function setGitpodVersion(gitpod_version: string){
+    gitpodVersionInfo.set({gitpod_version}, 1)
 }

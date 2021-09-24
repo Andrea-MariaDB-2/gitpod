@@ -7,6 +7,7 @@ package seccomp
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
+	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/workspacekit/pkg/readarg"
@@ -49,15 +51,15 @@ func mapHandler(h SyscallHandler) map[string]syscallHandler {
 func LoadFilter() (libseccomp.ScmpFd, error) {
 	filter, err := libseccomp.NewFilter(libseccomp.ActAllow)
 	if err != nil {
-		return 0, fmt.Errorf("cannot create filter: %w", err)
+		return 0, xerrors.Errorf("cannot create filter: %w", err)
 	}
 	err = filter.SetTsync(false)
 	if err != nil {
-		return 0, fmt.Errorf("cannot set tsync: %w", err)
+		return 0, xerrors.Errorf("cannot set tsync: %w", err)
 	}
 	err = filter.SetNoNewPrivsBit(false)
 	if err != nil {
-		return 0, fmt.Errorf("cannot set no_new_privs: %w", err)
+		return 0, xerrors.Errorf("cannot set no_new_privs: %w", err)
 	}
 
 	// we explicitly prohibit open_tree/move_mount to prevent container workloads
@@ -69,11 +71,11 @@ func LoadFilter() (libseccomp.ScmpFd, error) {
 	for _, sc := range deniedSyscalls {
 		syscallID, err := libseccomp.GetSyscallFromName(sc)
 		if err != nil {
-			return 0, fmt.Errorf("unknown syscall %s: %w", sc, err)
+			return 0, xerrors.Errorf("unknown syscall %s: %w", sc, err)
 		}
 		err = filter.AddRule(syscallID, libseccomp.ActErrno.SetReturnCode(int16(unix.EPERM)))
 		if err != nil {
-			return 0, fmt.Errorf("cannot add rule for %s: %w", sc, err)
+			return 0, xerrors.Errorf("cannot add rule for %s: %w", sc, err)
 		}
 	}
 
@@ -81,22 +83,22 @@ func LoadFilter() (libseccomp.ScmpFd, error) {
 	for sc := range handledSyscalls {
 		syscallID, err := libseccomp.GetSyscallFromName(sc)
 		if err != nil {
-			return 0, fmt.Errorf("unknown syscall %s: %w", sc, err)
+			return 0, xerrors.Errorf("unknown syscall %s: %w", sc, err)
 		}
 		err = filter.AddRule(syscallID, libseccomp.ActNotify)
 		if err != nil {
-			return 0, fmt.Errorf("cannot add rule for %s: %w", sc, err)
+			return 0, xerrors.Errorf("cannot add rule for %s: %w", sc, err)
 		}
 	}
 
 	err = filter.Load()
 	if err != nil {
-		return 0, fmt.Errorf("cannot load filter: %w", err)
+		return 0, xerrors.Errorf("cannot load filter: %w", err)
 	}
 
 	fd, err := filter.GetNotifFd()
 	if err != nil {
-		return 0, fmt.Errorf("cannot get inotif fd: %w", err)
+		return 0, xerrors.Errorf("cannot get inotif fd: %w", err)
 	}
 
 	return fd, nil
@@ -168,10 +170,19 @@ func Errno(err unix.Errno) (val uint64, errno int32, flags uint32) {
 	return ^uint64(0), int32(errno), 0
 }
 
+// IWSClientProvider provides a client to the in-workspace-service.
+// Consumers of this provider will close the client after use.
+type IWSClientProvider func(ctx context.Context) (InWorkspaceServiceClient, error)
+
+type InWorkspaceServiceClient interface {
+	daemonapi.InWorkspaceServiceClient
+	io.Closer
+}
+
 // InWorkspaceHandler is the seccomp notification handler that serves a Gitpod workspace
 type InWorkspaceHandler struct {
 	FD          libseccomp.ScmpFd
-	Daemon      daemonapi.InWorkspaceServiceClient
+	Daemon      IWSClientProvider
 	Ring2PID    int
 	Ring2Rootfs string
 	BindEvents  chan<- BindEvent
@@ -224,7 +235,7 @@ func (h *InWorkspaceHandler) Mount(req *libseccomp.ScmpNotifReq) (val uint64, er
 		"source": source,
 		"dest":   dest,
 		"fstype": filesystem,
-	}).Info("handling mount syscall")
+	}).Debug("handling mount syscall")
 
 	if filesystem == "proc" || filesystem == "sysfs" {
 		// When a process wants to mount proc relative to `/proc/self` that path has no meaning outside of the processes' context.
@@ -260,9 +271,16 @@ func (h *InWorkspaceHandler) Mount(req *libseccomp.ScmpNotifReq) (val uint64, er
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		call := h.Daemon.MountProc
+		iws, err := h.Daemon(ctx)
+		if err != nil {
+			log.WithField("target", target).WithField("dest", dest).WithField("mode", stat.Mode()).WithError(err).Errorf("cannot get IWS client to mount %s", filesystem)
+			return Errno(unix.EFAULT)
+		}
+		defer iws.Close()
+
+		call := iws.MountProc
 		if filesystem == "sysfs" {
-			call = h.Daemon.MountSysfs
+			call = iws.MountSysfs
 		}
 		_, err = call(ctx, &daemonapi.MountProcRequest{
 			Target: dest,

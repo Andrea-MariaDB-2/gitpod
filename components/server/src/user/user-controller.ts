@@ -9,7 +9,7 @@ import { inject, injectable } from "inversify";
 import { UserDB, DBUser, WorkspaceDB } from '@gitpod/gitpod-db/lib';
 import * as express from 'express';
 import { Authenticator } from "../auth/authenticator";
-import { Env } from "../env";
+import { Config } from '../config';
 import { log, LogContext } from '@gitpod/gitpod-protocol/lib/util/logging';
 import { GitpodCookie } from "../auth/gitpod-cookie";
 import { AuthorizationService } from "./authorization-service";
@@ -36,7 +36,7 @@ export class UserController {
     @inject(WorkspaceDB) protected readonly workspaceDB: WorkspaceDB;
     @inject(UserDB) protected readonly userDb: UserDB;
     @inject(Authenticator) protected readonly authenticator: Authenticator;
-    @inject(Env) protected readonly env: Env;
+    @inject(Config) protected readonly config: Config;
     @inject(GitpodCookie) protected readonly gitpodCookie: GitpodCookie;
     @inject(TosCookie) protected readonly tosCookie: TosCookie;
     @inject(AuthorizationService) protected readonly authService: AuthorizationService;
@@ -57,7 +57,7 @@ export class UserController {
             if (req.isAuthenticated()) {
                 log.info({ sessionId: req.sessionID }, "(Auth) User is already authenticated.", { 'login-flow': true });
                 // redirect immediately
-                const redirectTo = this.getSafeReturnToParam(req) || this.env.hostUrl.asDashboard().toString();
+                const redirectTo = this.getSafeReturnToParam(req) || this.config.hostUrl.asDashboard().toString();
                 res.redirect(redirectTo);
                 return;
             }
@@ -72,7 +72,7 @@ export class UserController {
             if (redirectToLoginPage) {
                 const returnTo = this.getSafeReturnToParam(req);
                 const search = returnTo ? `returnTo=${returnTo}` : '';
-                const loginPageUrl = this.env.hostUrl.asLogin().with({ search }).toString();
+                const loginPageUrl = this.config.hostUrl.asLogin().with({ search }).toString();
                 log.info(`Redirecting to login ${loginPageUrl}`)
                 res.redirect(loginPageUrl);
                 return;
@@ -107,13 +107,13 @@ export class UserController {
             this.ensureSafeReturnToParam(req);
             this.authenticator.deauthorize(req, res, next);
         });
-        const branding = this.env.brandingConfig;
+        const branding = this.config.brandingConfig;
         router.get("/logout", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
             const logContext = LogContext.from({ user: req.user, request: req });
             const clientInfo = getRequestingClientInfo(req);
             const logPayload = { session: req.session, clientInfo };
 
-            let redirectToUrl = this.getSafeReturnToParam(req) || branding.redirectUrlAfterLogout || this.env.hostUrl.toString();
+            let redirectToUrl = this.getSafeReturnToParam(req) || branding.redirectUrlAfterLogout || this.config.hostUrl.toString();
 
             if (req.isAuthenticated()) {
                 req.logout();
@@ -128,7 +128,7 @@ export class UserController {
 
             // clear cookies
             this.gitpodCookie.unsetCookie(res);
-            this.sessionHandlerProvider.clearSessionCookie(res, this.env);
+            this.sessionHandlerProvider.clearSessionCookie(res, this.config);
 
             // then redirect
             log.info(logContext, "(Logout) Redirecting...", { redirectToUrl, ...logPayload });
@@ -170,6 +170,18 @@ export class UserController {
                 return;
             }
 
+            let cookiePrefix: string = this.config.hostUrl.url.host;
+            cookiePrefix = cookiePrefix.replace(/^https?/, '');
+            [" ", "-", "."].forEach(c => cookiePrefix = cookiePrefix.split(c).join("_"));
+            const name = `_${cookiePrefix}_ws_${instanceID}_owner_`;
+
+            if (!!req.cookies[name]) {
+                // cookie is already set - do nothing. This prevents server from drowning in load
+                // if the dashboard is ill-behaved.
+                res.sendStatus(200);
+                return;
+            }
+
             const [workspace, instance] = await Promise.all([
                 this.workspaceDB.findByInstanceId(instanceID),
                 this.workspaceDB.findInstanceById(instanceID)
@@ -207,22 +219,17 @@ export class UserController {
                 return;
             }
 
-            let cookiePrefix: string = this.env.hostUrl.url.host;
-            cookiePrefix = cookiePrefix.replace(/^https?/, '');
-            [" ", "-", "."].forEach(c => cookiePrefix = cookiePrefix.split(c).join("_"));
-
-            const name = `_${cookiePrefix}_ws_${instanceID}_owner_`;
             res.cookie(name, token, {
                 path: "/",
                 httpOnly: true,
                 secure: true,
                 maxAge: 1000 * 60 * 60 * 24 * 1,    // 1 day
                 sameSite: "lax",                    // default: true. "Lax" needed for cookie to work in the workspace domain.
-                domain: `.${this.env.hostUrl.url.host}`
+                domain: `.${this.config.hostUrl.url.host}`
             });
             res.sendStatus(200);
         });
-        if (this.env.enableLocalApp) {
+        if (this.config.enableLocalApp) {
             router.get("/auth/local-app", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
                 if (!req.isAuthenticated() || !User.is(req.user)) {
                     res.sendStatus(401);
@@ -371,7 +378,7 @@ export class UserController {
             this.tosCookie.set(res, tosHints);
 
             log.info(logContext, "(TOS) Redirecting to /tos.", { tosHints, ...logPayload });
-            res.redirect(this.env.hostUrl.with(() => ({ pathname: '/tos/' })).toString());
+            res.redirect(this.config.hostUrl.with(() => ({ pathname: '/tos/' })).toString());
         });
         const tosFlowUserInfo = (tosFlowInfo: TosFlow) => {
             if (TosFlow.WithIdentity.is(tosFlowInfo)) {
@@ -438,7 +445,7 @@ export class UserController {
                 // that no user data remains in the system.
                 log.info(logContext, '(TOS) User did NOT agree. Redirecting to /logout.', logPayload);
 
-                res.redirect(this.env.hostUrl.withApi({ pathname: "/logout" }).toString());
+                res.redirect(this.config.hostUrl.withApi({ pathname: "/logout" }).toString());
                 // todo@alex: consider redirecting to a info page (returnTo param)
 
                 return;
@@ -475,7 +482,7 @@ export class UserController {
                     await this.loginCompletionHandler.complete(req, res, { ...tosFlowInfo });
                 } else {
 
-                    let returnTo = returnToUrl || this.env.hostUrl.asDashboard().toString();
+                    let returnTo = returnToUrl || this.config.hostUrl.asDashboard().toString();
                     res.redirect(returnTo);
                 }
             }
@@ -512,7 +519,9 @@ export class UserController {
                 "name": user.identities[0].authName,
                 "full_name": user.fullName,
                 "created_at": user.creationDate,
-                "unsubscribed": !user.allowsMarketingCommunication,
+                "unsubscribed_onboarding": !user.additionalData?.emailNotificationSettings?.allowsOnboardingMail,
+                "unsubscribed_changelog": !user.additionalData?.emailNotificationSettings?.allowsChangelogMail,
+                "unsubscribed_devx": !user.additionalData?.emailNotificationSettings?.allowsDevXMail,
                 "blocked": user.blocked
             }
         });
@@ -527,7 +536,7 @@ export class UserController {
     }
 
     protected getSorryUrl(message: string) {
-        return this.env.hostUrl.asSorry(message).toString();
+        return this.config.hostUrl.asSorry(message).toString();
     }
 
     protected async augmentLoginRequest(req: express.Request) {
@@ -538,7 +547,7 @@ export class UserController {
         }
 
         // read current auth provider configs
-        const authProviderConfigs = this.hostContextProvider.getAll().map(hc => hc.authProvider.config);
+        const authProviderConfigs = this.hostContextProvider.getAll().map(hc => hc.authProvider.params);
 
         // Special Context exception
         if (returnToURL) {
@@ -604,7 +613,7 @@ export class UserController {
             return;
         }
 
-        if (this.urlStartsWith(returnToURL, this.env.hostUrl.toString()) || this.urlStartsWith(returnToURL, this.env.brandingConfig.homepage)) {
+        if (this.urlStartsWith(returnToURL, this.config.hostUrl.toString()) || this.urlStartsWith(returnToURL, this.config.brandingConfig.homepage)) {
             return returnToURL
         }
 

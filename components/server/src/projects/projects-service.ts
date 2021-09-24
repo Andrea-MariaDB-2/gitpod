@@ -5,19 +5,24 @@
  */
 
 import { inject, injectable } from "inversify";
-import { DBWithTracing, ProjectDB, TeamDB, TracedWorkspaceDB, WorkspaceDB } from "@gitpod/gitpod-db/lib";
-import { Branch, CommitInfo, CreateProjectParams, FindPrebuildsParams, PrebuildInfo, PrebuiltWorkspace, Project, ProjectConfig, User } from "@gitpod/gitpod-protocol";
+import { DBWithTracing, ProjectDB, TeamDB, TracedWorkspaceDB, UserDB, WorkspaceDB } from "@gitpod/gitpod-db/lib";
+import { Branch, CommitContext, PrebuildWithStatus, CreateProjectParams, FindPrebuildsParams, Project, ProjectConfig, User, WorkspaceConfig } from "@gitpod/gitpod-protocol";
+import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
 import { HostContextProvider } from "../auth/host-context-provider";
-import { parseRepoUrl } from "../repohost";
+import { FileProvider, parseRepoUrl } from "../repohost";
 import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
+import { ContextParser } from "../workspace/context-parser-service";
+import { ConfigInferrer } from "./config-inferrer";
 
 @injectable()
 export class ProjectsService {
 
     @inject(ProjectDB) protected readonly projectDB: ProjectDB;
     @inject(TeamDB) protected readonly teamDB: TeamDB;
+    @inject(UserDB) protected readonly userDB: UserDB;
     @inject(TracedWorkspaceDB) protected readonly workspaceDb: DBWithTracing<WorkspaceDB>;
     @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
+    @inject(ContextParser) protected contextParser: ContextParser;
 
     async getProject(projectId: string): Promise<Project | undefined> {
         return this.projectDB.findProjectById(projectId);
@@ -86,29 +91,49 @@ export class ProjectsService {
     }
 
     async createProject({ name, cloneUrl, teamId, userId, appInstallationId }: CreateProjectParams): Promise<Project> {
+        const projects = await this.getProjectsByCloneUrls([cloneUrl]);
+        if (projects.length > 0) {
+            throw new Error("Project for repository already exists.");
+        }
         const project = Project.create({
             name,
             cloneUrl,
             ...(!!userId ? { userId } : { teamId }),
             appInstallationId
         });
-        return this.projectDB.storeProject(project);
+        await this.projectDB.storeProject(project);
+        await this.onDidCreateProject(project);
+        return project;
+    }
+
+    protected async onDidCreateProject(project: Project) {
+        let { userId, teamId, cloneUrl } = project;
+        const parsedUrl = parseRepoUrl(project.cloneUrl);
+        if ("gitlab.com" === parsedUrl?.host) {
+            const repositoryService = this.hostContextProvider.get(parsedUrl?.host)?.services?.repositoryService;
+            if (repositoryService) {
+                if (teamId) {
+                    const owner = (await this.teamDB.findMembersByTeam(teamId)).find(m => m.role === "owner");
+                    userId = owner?.userId;
+                }
+                const user = userId && await this.userDB.findUserById(userId);
+                if (user) {
+                    if (await repositoryService.canInstallAutomatedPrebuilds(user, cloneUrl)) {
+                        log.info("Update prebuild installation for project.", { cloneUrl, teamId, userId });
+                        await repositoryService.installAutomatedPrebuilds(user, cloneUrl);
+                    }
+                } else {
+                    log.error("Cannot find user for project.", { cloneUrl })
+                }
+            }
+        }
     }
 
     async deleteProject(projectId: string): Promise<void> {
         return this.projectDB.markDeleted(projectId);
     }
 
-    protected async getLastPrebuild(project: Project, branch: Branch): Promise<PrebuildInfo | undefined> {
-        const prebuilds = await this.workspaceDb.trace({}).findPrebuiltWorkspacesByProject(project.id, branch?.name);
-        const prebuild = prebuilds[prebuilds.length - 1];
-        if (!prebuild) {
-            return undefined;
-        }
-        return await this.toPrebuildInfo(project, prebuild, branch.commit);
-    }
-
-    async findPrebuilds(user: User, params: FindPrebuildsParams): Promise<PrebuildInfo[]> {
+    async findPrebuilds(user: User, params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
         const { projectId, prebuildId } = params;
         const project = await this.projectDB.findProjectById(projectId);
         if (!project) {
@@ -118,66 +143,80 @@ export class ProjectsService {
         if (!parsedUrl) {
             return [];
         }
-        const { owner, repo, host } = parsedUrl;
-        const repositoryProvider = this.hostContextProvider.get(host)?.services?.repositoryProvider;
-        if (!repositoryProvider) {
-            return [];
-        }
-
-        let prebuilds: PrebuiltWorkspace[] = [];
-        const result: PrebuildInfo[] = [];
+        const result: PrebuildWithStatus[] = [];
 
         if (prebuildId) {
-            const pbws = await this.workspaceDb.trace({}).findPrebuiltWorkspacesById(prebuildId);
-            if (pbws) {
-                prebuilds.push(pbws);
+            const pbws = await this.workspaceDb.trace({}).findPrebuiltWorkspaceById(prebuildId);
+            const info = (await this.workspaceDb.trace({}).findPrebuildInfos([prebuildId]))[0];
+            if (info && pbws) {
+                result.push({ info, status: pbws.state });
             }
         } else {
-            const limit = params.latest ? 1 : undefined;
-            let branch = params.branch;
-            prebuilds = await this.workspaceDb.trace({}).findPrebuiltWorkspacesByProject(project.id, branch, limit);
-        }
-
-        for (const prebuild of prebuilds) {
-            try {
-                const commit = await repositoryProvider.getCommitInfo(user, owner, repo, prebuild.commit);
-                if (commit) {
-                    result.push(await this.toPrebuildInfo(project, prebuild, commit));
-                }
-            } catch (error) {
-                log.debug(`Could not fetch commit info.`, error, { owner, repo, prebuildCommit: prebuild.commit });
+            let limit = params.limit !== undefined ? params.limit : 30;
+            if (params.latest) {
+                limit = 1;
             }
+            let branch = params.branch;
+            const prebuilds = await this.workspaceDb.trace({}).findPrebuiltWorkspacesByProject(project.id, branch, limit);
+            const infos = await this.workspaceDb.trace({}).findPrebuildInfos([...prebuilds.map(p => p.id)]);
+            result.push(...infos.map(info => ({ info, status: prebuilds.find(p => p.id === info.id)?.state! })));
         }
         return result;
     }
 
-    protected async toPrebuildInfo(project: Project, prebuild: PrebuiltWorkspace, commit: CommitInfo): Promise<PrebuildInfo> {
-        const { teamId, name: projectName } = project;
-
-        return {
-            id: prebuild.id,
-            buildWorkspaceId: prebuild.buildWorkspaceId,
-            startedAt: prebuild.creationTime,
-            startedBy: "", // TODO
-            startedByAvatar: "", // TODO
-            teamId: teamId || "", // TODO
-            projectName,
-            branch: prebuild.branch || "unknown",
-            cloneUrl: prebuild.cloneURL,
-            status: prebuild.state,
-            changeAuthor: commit.author,
-            changeAuthorAvatar: commit.authorAvatarUrl,
-            changeDate: commit.authorDate || "",
-            changeHash: commit.sha,
-            changeTitle: commit.commitMessage,
-            // changePR
-            // changeUrl
-            branchPrebuildNumber: "42"
-        };
+    async setProjectConfiguration(projectId: string, config: ProjectConfig): Promise<void> {
+        return this.projectDB.setProjectConfiguration(projectId, config);
     }
 
-    async setProjectConfiguration(projectId: string, config: ProjectConfig) {
-        return this.projectDB.setProjectConfiguration(projectId, config);
+    protected async getRepositoryFileProviderAndCommitContext(ctx: TraceContext, user: User, projectId: string): Promise<{fileProvider: FileProvider, commitContext: CommitContext}> {
+        const project = await this.getProject(projectId);
+        if (!project) {
+            throw new Error("Project not found");
+        }
+        const normalizedContextUrl = this.contextParser.normalizeContextURL(project.cloneUrl);
+        const commitContext = (await this.contextParser.handle(ctx, user, normalizedContextUrl)) as CommitContext;
+        const { host } = commitContext.repository;
+        const hostContext = this.hostContextProvider.get(host);
+        if (!hostContext || !hostContext.services) {
+            throw new Error(`Cannot fetch repository configuration for host: ${host}`);
+        }
+        const fileProvider = hostContext.services.fileProvider;
+        return { fileProvider, commitContext };
+    }
+
+    async fetchProjectRepositoryConfiguration(ctx: TraceContext, user: User, projectId: string): Promise<string | undefined> {
+        const { fileProvider, commitContext } = await this.getRepositoryFileProviderAndCommitContext(ctx, user, projectId);
+        const configString = await fileProvider.getGitpodFileContent(commitContext, user);
+        return configString;
+    }
+
+    // a static cache used to prefetch inferrer related files in parallel in advance
+    private requestedPaths = new Set<string>();
+
+    async guessProjectConfiguration(ctx: TraceContext, user: User, projectId: string): Promise<string | undefined> {
+        const { fileProvider, commitContext } = await this.getRepositoryFileProviderAndCommitContext(ctx, user, projectId);
+        const cache: { [path: string]: Promise<string | undefined> } = {};
+        const readFile = async (path: string) => {
+            if (path in cache) {
+                return await cache[path];
+            }
+            this.requestedPaths.add(path);
+            const content = fileProvider.getFileContent(commitContext, user, path);
+            cache[path] = content;
+            return await content;
+        }
+        // eagerly fetch for all files that the inferrer usually asks for.
+        this.requestedPaths.forEach(path => !(path in cache) && readFile(path));
+        const config: WorkspaceConfig = await new ConfigInferrer().getConfig({
+            config: {},
+            read: readFile,
+            exists: async (path: string) => !!(await readFile(path)),
+        });
+        if (!config.tasks) {
+            return;
+        }
+        const configString = `tasks:\n  - ${config.tasks.map(task => Object.entries(task).map(([phase, command]) => `${phase}: ${command}`).join('\n    ')).join('\n  - ')}`;
+        return configString;
     }
 
 }

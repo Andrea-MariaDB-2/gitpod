@@ -5,12 +5,17 @@
  */
 
 import moment from "moment";
-import { PrebuildInfo, PrebuiltWorkspaceState, Project } from "@gitpod/gitpod-protocol";
+import { PrebuildInfo, PrebuildWithStatus, PrebuiltWorkspaceState, Project, WorkspaceInstance } from "@gitpod/gitpod-protocol";
 import { useContext, useEffect, useState } from "react";
 import { useHistory, useLocation, useRouteMatch } from "react-router";
 import Header from "../components/Header";
 import DropDown, { DropDownEntry } from "../components/DropDown";
 import { ItemsList, Item, ItemField, ItemFieldContextMenu } from "../components/ItemsList";
+import Spinner from "../icons/Spinner.svg";
+import StatusDone from "../icons/StatusDone.svg";
+import StatusFailed from "../icons/StatusFailed.svg";
+import StatusPaused from "../icons/StatusPaused.svg";
+import StatusRunning from "../icons/StatusRunning.svg";
 import { getGitpodService } from "../service/service";
 import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
 import { ContextMenuEntry } from "../components/ContextMenu";
@@ -18,20 +23,42 @@ import { shortCommitMessage } from "./render-utils";
 
 export default function () {
     const history = useHistory();
-    const { teams } = useContext(TeamsContext);
     const location = useLocation();
-    const match = useRouteMatch<{ team: string, resource: string }>("/:team/:resource");
-    const projectName = match?.params?.resource;
+
+    const { teams } = useContext(TeamsContext);
     const team = getCurrentTeam(location, teams);
 
-    // @ts-ignore
+    const match = useRouteMatch<{ team: string, resource: string }>("/(t/)?:team/:resource");
+    const projectName = match?.params?.resource;
+
     const [project, setProject] = useState<Project | undefined>();
-    const [defaultBranch, setDefaultBranch] = useState<string | undefined>();
 
     const [searchFilter, setSearchFilter] = useState<string | undefined>();
     const [statusFilter, setStatusFilter] = useState<PrebuiltWorkspaceState | undefined>();
 
-    const [prebuilds, setPrebuilds] = useState<PrebuildInfo[]>([]);
+    const [prebuilds, setPrebuilds] = useState<PrebuildWithStatus[]>([]);
+
+    useEffect(() => {
+        if (!project) {
+            return;
+        }
+        const registration = getGitpodService().registerClient({
+            onPrebuildUpdate: (update: PrebuildWithStatus) => {
+                if (update.info.projectId === project.id) {
+                    setPrebuilds(prev => [update, ...prev.filter(p => p.info.id !== update.info.id)])
+                }
+            }
+        });
+
+        (async () => {
+            const prebuilds = await getGitpodService().server.findPrebuilds({ projectId: project.id });
+            setPrebuilds(prebuilds);
+        })();
+
+        return () => {
+            registration.dispose();
+        }
+    }, [project]);
 
     useEffect(() => {
         if (!teams) {
@@ -42,31 +69,23 @@ export default function () {
                 ? await getGitpodService().server.getTeamProjects(team.id)
                 : await getGitpodService().server.getUserProjects());
 
-            const project = projectName && projects.find(p => p.name === projectName);
-            if (project) {
-                setProject(project);
-
-                const prebuilds = await getGitpodService().server.findPrebuilds({ projectId: project.id });
-                setPrebuilds(prebuilds);
-
-                const details = await getGitpodService().server.getProjectOverview(project.id);
-                if (details?.branches) {
-                    setDefaultBranch(details.branches.find(b => b.isDefault)?.name);
-                }
+            const newProject = projectName && projects.find(p => p.name === projectName);
+            if (newProject) {
+                setProject(newProject);
             }
         })();
-    }, [ teams, team ]);
+    }, [teams]);
 
-    const prebuildContextMenu = (p: PrebuildInfo) => {
+    const prebuildContextMenu = (p: PrebuildWithStatus) => {
         const running = p.status === "building";
         const entries: ContextMenuEntry[] = [];
         entries.push({
             title: "View Prebuild",
-            onClick: () => openPrebuild(p)
+            onClick: () => openPrebuild(p.info)
         });
         entries.push({
             title: "Trigger Prebuild",
-            onClick: () => triggerPrebuild(p.branch),
+            onClick: () => triggerPrebuild(p.info.branch),
             separator: running
         });
         if (running) {
@@ -92,23 +111,31 @@ export default function () {
         return entries;
     }
 
-    const filter = (p: PrebuildInfo) => {
+    const filter = (p: PrebuildWithStatus) => {
         if (statusFilter && statusFilter !== p.status) {
             return false;
         }
-        if (searchFilter && `${p.changeTitle} ${p.branch}`.toLowerCase().includes(searchFilter.toLowerCase()) === false) {
+        if (searchFilter && `${p.info.changeTitle} ${p.info.branch}`.toLowerCase().includes(searchFilter.toLowerCase()) === false) {
             return false;
         }
         return true;
     }
 
-    const filteredPrebuilds = prebuilds.filter(filter);
-
-    const openPrebuild = (pb: PrebuildInfo) => {
-        history.push(`/${!!team ? team.slug : 'projects'}/${projectName}/${pb.id}`);
+    const prebuildSorter = (a: PrebuildWithStatus, b: PrebuildWithStatus) => {
+        if (a.info.startedAt < b.info.startedAt) {
+            return 1;
+        }
+        if (a.info.startedAt === b.info.startedAt) {
+            return 0;
+        }
+        return -1;
     }
 
-    const triggerPrebuild = (branchName: string) => {
+    const openPrebuild = (pb: PrebuildInfo) => {
+        history.push(`/${!!team ? 't/'+team.slug : 'projects'}/${projectName}/${pb.id}`);
+    }
+
+    const triggerPrebuild = (branchName: string | null) => {
         if (project) {
             getGitpodService().server.triggerPrebuild(project.id, branchName);
         }
@@ -132,7 +159,7 @@ export default function () {
                 <div className="py-3 pl-3">
                     <DropDown prefix="Prebuild Status: " contextMenuWidth="w-32" entries={statusFilterEntries()} />
                 </div>
-                <button disabled={!defaultBranch} onClick={() => { defaultBranch && triggerPrebuild(defaultBranch) }} className="ml-2">Trigger Prebuild</button>
+                <button disabled={!project} onClick={() => triggerPrebuild(null)} className="ml-2">Trigger Prebuild</button>
             </div>
             <ItemsList className="mt-2">
                 <Item header={true} className="grid grid-cols-3">
@@ -147,26 +174,25 @@ export default function () {
                         <ItemFieldContextMenu />
                     </ItemField>
                 </Item>
-                {filteredPrebuilds.map((p: PrebuildInfo) => <Item className="grid grid-cols-3">
+                {prebuilds.filter(filter).sort(prebuildSorter).map((p, index) => <Item key={`prebuild-${p.info.id}`} className="grid grid-cols-3">
                     <ItemField className="flex items-center">
-                        <div className="cursor-pointer" onClick={() => openPrebuild(p)}>
+                        <div className="cursor-pointer" onClick={() => openPrebuild(p.info)}>
                             <div className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1">
                                 <div className="inline-block align-text-bottom mr-2 w-4 h-4">{prebuildStatusIcon(p.status)}</div>
                                 {prebuildStatusLabel(p.status)}
                             </div>
-                            <p>{p.startedByAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.startedByAvatar || ''} alt={p.startedBy} />}Triggered {formatDate(p.startedAt)}</p>
+                            <p>{p.info.startedByAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.info.startedByAvatar || ''} alt={p.info.startedBy} />}Triggered {formatDate(p.info.startedAt)}</p>
                         </div>
                     </ItemField>
                     <ItemField className="flex items-center">
                         <div>
-                            <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1">{shortCommitMessage(p.changeTitle)}</div>
-                            <p>{p.changeAuthorAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.changeAuthorAvatar || ''} alt={p.changeAuthor} />}Authored {formatDate(p.changeDate)} · {p.changeHash?.substring(0, 8)}</p>
+                            <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1">{shortCommitMessage(p.info.changeTitle)}</div>
+                            <p>{p.info.changeAuthorAvatar && <img className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2" src={p.info.changeAuthorAvatar || ''} alt={p.info.changeAuthor} />}Authored {formatDate(p.info.changeDate)} · {p.info.changeHash?.substring(0, 8)}</p>
                         </div>
                     </ItemField>
                     <ItemField className="flex items-center">
                         <div className="flex space-x-2">
-                            <span className="font-medium text-gray-500 dark:text-gray-50">{p.branch}</span>
-                            <span className="text-gray-400">#{p.branchPrebuildNumber}</span>
+                            <span className="font-medium text-gray-500 dark:text-gray-50">{p.info.branch}</span>
                         </div>
                         <span className="flex-grow" />
                         <ItemFieldContextMenu menuEntries={prebuildContextMenu(p)} />
@@ -178,7 +204,7 @@ export default function () {
     </>;
 }
 
-export function prebuildStatusLabel(status: PrebuiltWorkspaceState) {
+export function prebuildStatusLabel(status: PrebuiltWorkspaceState | undefined) {
     switch (status) {
         case "aborted":
             return (<span className="font-medium text-red-500 uppercase">failed</span>);
@@ -192,7 +218,8 @@ export function prebuildStatusLabel(status: PrebuiltWorkspaceState) {
             break;
     }
 }
-export function prebuildStatusIcon(status: PrebuiltWorkspaceState) {
+
+export function prebuildStatusIcon(status: PrebuiltWorkspaceState | undefined) {
     switch (status) {
         case "aborted":
             return (<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -213,4 +240,63 @@ export function prebuildStatusIcon(status: PrebuiltWorkspaceState) {
         default:
             break;
     }
+}
+
+export function PrebuildInstanceStatus(props: { prebuildInstance?: WorkspaceInstance }) {
+    let status = <></>;
+    let details = <></>;
+    switch (props.prebuildInstance?.status.phase) {
+        case undefined: // Fall through
+        case 'unknown':
+            status = <div className="flex space-x-1 items-center text-yellow-600">
+                <img className="h-4 w-4" src={StatusPaused} />
+                <span>PENDING</span>
+                </div>;
+            details = <div className="flex space-x-1 items-center text-gray-400">
+                <img className="h-4 w-4 animate-spin" src={Spinner} />
+                <span>Prebuild in progress ...</span>
+                </div>;
+            break;
+        case 'preparing': // Fall through
+        case 'pending': // Fall through
+        case 'creating': // Fall through
+        case 'initializing': // Fall  through
+        case 'running': // Fall through
+        case 'interrupted':
+            status = <div className="flex space-x-1 items-center text-blue-600">
+                <img className="h-4 w-4" src={StatusRunning} />
+                <span>RUNNING</span>
+                </div>;
+            details = <div className="flex space-x-1 items-center text-gray-400">
+                <img className="h-4 w-4 animate-spin" src={Spinner} />
+                <span>Prebuild in progress ...</span>
+                </div>;
+            break;
+        case 'stopping': // Fall through
+        case 'stopped':
+            status = <div className="flex space-x-1 items-center text-green-600">
+                <img className="h-4 w-4" src={StatusDone} />
+                <span>READY</span>
+                </div>;
+            details = <div className="flex space-x-1 items-center text-gray-400">
+                <img className="h-4 w-4 filter-grayscale" src={StatusRunning} />
+                <span>{!!props.prebuildInstance?.stoppedTime
+                    ? `${Math.round(((new Date(props.prebuildInstance.stoppedTime).getTime()) - (new Date(props.prebuildInstance.creationTime).getTime())) / 1000)}s`
+                    : '...'}</span>
+                </div>;
+            break;
+    }
+    if (props.prebuildInstance?.status.conditions.failed) {
+        status = <div className="flex space-x-1 items-center text-gitpod-red">
+            <img className="h-4 w-4" src={StatusFailed} />
+            <span>FAILED</span>
+            </div>;
+        details = <div className="flex space-x-1 items-center text-gray-400">
+            <span>Prebuild failed</span>
+            </div>;
+    }
+    return <div className="flex flex-col space-y-1 justify-center text-sm font-semibold">
+        <div>{status}</div>
+        <div>{details}</div>
+    </div>;
 }

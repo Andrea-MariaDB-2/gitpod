@@ -10,6 +10,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -26,7 +27,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/websocket"
 	grpcruntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
@@ -35,6 +35,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/gitpod-io/gitpod/common-go/analytics"
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -111,7 +112,8 @@ const (
 
 // Run serves as main entrypoint to the supervisor
 func Run(options ...RunOption) {
-	defer log.Info("supervisor shut down")
+	exitCode := 0
+	defer handleExit(&exitCode)
 
 	opts := runOptions{
 		Args: os.Args,
@@ -184,7 +186,7 @@ func Run(options ...RunOption) {
 		)
 		termMux             = terminal.NewMux()
 		termMuxSrv          = terminal.NewMuxTerminalService(termMux)
-		taskManager         = newTasksManager(cfg, termMuxSrv, cstate, &loggingHeadlessTaskProgressReporter{})
+		taskManager         = newTasksManager(cfg, termMuxSrv, cstate, nil)
 		analytics           = analytics.NewFromEnvironment()
 		notificationService = NewNotificationService()
 	)
@@ -194,6 +196,18 @@ func Run(options ...RunOption) {
 	go analyseConfigChanges(ctx, cfg, analytics, gitpodConfigService)
 
 	termMuxSrv.DefaultWorkdir = cfg.RepoRoot
+	if cfg.WorkspaceRoot != "" {
+		termMuxSrv.DefaultWorkdirProvider = func() string {
+			<-cstate.ContentReady()
+			stat, err := os.Stat(cfg.WorkspaceRoot)
+			if err != nil {
+				log.WithError(err).Error("default workdir provider: cannot resolve the workspace root")
+			} else if stat.IsDir() {
+				return cfg.WorkspaceRoot
+			}
+			return ""
+		}
+	}
 	termMuxSrv.Env = buildChildProcEnv(cfg, nil)
 	termMuxSrv.DefaultCreds = &syscall.Credential{
 		Uid: gitpodUID,
@@ -238,7 +252,7 @@ func Run(options ...RunOption) {
 	wg.Add(1)
 	go startSSHServer(ctx, cfg, &wg)
 	wg.Add(1)
-	tasksSuccessChan := make(chan bool, 1)
+	tasksSuccessChan := make(chan taskSuccess, 1)
 	go taskManager.Run(ctx, &wg, tasksSuccessChan)
 	wg.Add(1)
 	go socketActivationForDocker(ctx, &wg, termMux)
@@ -264,7 +278,6 @@ func Run(options ...RunOption) {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	var exitCode int
 	select {
 	case <-sigChan:
 	case shutdownReason := <-shutdown:
@@ -284,9 +297,6 @@ func Run(options ...RunOption) {
 	terminateChildProcesses()
 
 	wg.Wait()
-
-	log.WithField("exitCode", exitCode).Debug("supervisor exit")
-	os.Exit(exitCode)
 }
 
 func createGitpodService(cfg *Config, tknsrv api.TokenServiceServer) *gitpod.APIoverJSONRPC {
@@ -348,7 +358,7 @@ func symlinkBinaries(cfg *Config) {
 			to   = filepath.Join("/usr/bin", v)
 		)
 		err = os.Symlink(from, to)
-		if err != nil {
+		if err != nil && !os.IsExist(err) {
 			log.WithError(err).WithField("from", from).WithField("to", to).Warn("cannot create symlink")
 		}
 	}
@@ -544,7 +554,9 @@ supervisorLoop:
 		case <-ctx.Done():
 			// we've been asked to shut down
 			s = statusShouldShutdown
-			cmd.Process.Signal(os.Interrupt)
+			if cmd != nil && cmd.Process != nil {
+				cmd.Process.Signal(os.Interrupt)
+			}
 			break supervisorLoop
 		}
 	}
@@ -870,14 +882,14 @@ func tunnelOverSSH(ctx context.Context, tunneled *ports.TunneledPortsService, ne
 	<-ctx.Done()
 }
 
-func stopWhenTasksAreDone(ctx context.Context, wg *sync.WaitGroup, shutdown chan ShutdownReason, successChan <-chan bool) {
+func stopWhenTasksAreDone(ctx context.Context, wg *sync.WaitGroup, shutdown chan ShutdownReason, successChan <-chan taskSuccess) {
 	defer wg.Done()
 	defer close(shutdown)
 
 	success := <-successChan
-	if !success {
+	if success.Failed() {
 		// we signal task failure via kubernetes termination log
-		msg := []byte("headless task failed")
+		msg := []byte("headless task failed: " + string(success))
 		err := ioutil.WriteFile("/dev/termination-log", msg, 0644)
 		if err != nil {
 			log.WithError(err).Error("err while writing termination log")
@@ -932,8 +944,10 @@ func startSSHServer(ctx context.Context, cfg *Config, wg *sync.WaitGroup) {
 		log.WithError(err).WithField("out", string(out)).Error("cannot create hostkey file")
 		return
 	}
+	_ = os.Chown(hostkeyFN.Name(), gitpodUID, gitpodGID)
 
 	cmd := exec.Command(dropbear, "-F", "-E", "-w", "-s", "-p", fmt.Sprintf(":%d", cfg.SSHPort), "-r", hostkeyFN.Name())
+	cmd = runAsGitpodUser(cmd)
 	cmd.Env = buildChildProcEnv(cfg, nil)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1066,7 +1080,7 @@ func terminateProcess(pid int, privileged bool) {
 	}
 
 	if err != nil {
-		log.WithError(err).WithField("pid", pid).Warn("cannot terminate child process")
+		log.WithError(err).WithField("pid", pid).Debug("child process is already terminated")
 		return
 	}
 
@@ -1114,7 +1128,14 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 	l, err := net.Listen("unix", fn)
 	if err != nil {
 		log.WithError(err).Error("cannot provide Docker activation socket")
+		return
 	}
+
+	go func() {
+		<-ctx.Done()
+		l.Close()
+	}()
+
 	_ = os.Chown(fn, gitpodUID, gitpodGID)
 	err = activation.Listen(ctx, l, func(socketFD *os.File) error {
 		cmd := exec.Command("docker-up")
@@ -1128,7 +1149,7 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 		})
 		return err
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.WithError(err).Error("cannot provide Docker activation socket")
 	}
 }
@@ -1216,4 +1237,10 @@ func runAsGitpodUser(cmd *exec.Cmd) *exec.Cmd {
 	cmd.SysProcAttr.Credential.Uid = gitpodUID
 	cmd.SysProcAttr.Credential.Gid = gitpodGID
 	return cmd
+}
+
+func handleExit(ec *int) {
+	exitCode := *ec
+	log.WithField("exitCode", exitCode).Debug("supervisor exit")
+	os.Exit(exitCode)
 }

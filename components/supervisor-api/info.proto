@@ -68,4 +68,13 @@ message WorkspaceInfoResponse {
 
     // workspace_cluster_host provides the cluster host under which this workspace is served, e.g. ws-eu11.gitpod.io
     string workspace_cluster_host = 11;
+
+    // workspace_url is an URL for which the workspace is accessed.
+    string workspace_url = 12;
+
+    // ide_alias is an alias of IDE to be run. Possible values: "code", "code-latest", "theia"
+    string ide_alias = 13;
+
+    // ide_port is the port on which the IDE is to be run
+    uint32 ide_port = 14;
 }

@@ -10,6 +10,7 @@ package lift
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"golang.org/x/sys/unix"
+	"golang.org/x/xerrors"
 )
 
 const (
@@ -29,7 +31,7 @@ type LiftRequest struct {
 	Command []string `json:"command"`
 }
 
-func ServeLift(socket string) error {
+func ServeLift(ctx context.Context, socket string) error {
 	skt, err := net.Listen("unix", socket)
 	if err != nil {
 		return err
@@ -43,6 +45,13 @@ func ServeLift(socket string) error {
 	}()
 
 	for {
+		select {
+		case <-ctx.Done():
+			break
+		default:
+			// pass through
+		}
+
 		conn, err := skt.Accept()
 		if err != nil {
 			log.WithError(err).Error("cannot accept lift connection")
@@ -90,7 +99,7 @@ func serveLiftClient(conn net.Conn) error {
 	}
 
 	if len(msgs) != 1 {
-		return fmt.Errorf("expected a single socket control message")
+		return xerrors.Errorf("expected a single socket control message")
 	}
 
 	fds, err := unix.ParseUnixRights(&msgs[0])
@@ -99,7 +108,7 @@ func serveLiftClient(conn net.Conn) error {
 	}
 
 	if len(fds) != 3 {
-		return fmt.Errorf("expected three file descriptors")
+		return xerrors.Errorf("expected three file descriptors")
 	}
 
 	rd := bufio.NewReader(f)
@@ -115,7 +124,7 @@ func serveLiftClient(conn net.Conn) error {
 	}
 
 	if len(msg.Command) == 0 {
-		return fmt.Errorf("expected non-empty command")
+		return xerrors.Errorf("expected non-empty command")
 	}
 
 	log.WithField("command", msg.Command).Info("running lifted command")

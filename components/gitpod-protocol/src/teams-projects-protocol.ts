@@ -54,19 +54,28 @@ export namespace Project {
     }
 }
 
+export interface PrebuildWithStatus {
+    info: PrebuildInfo;
+    status: PrebuiltWorkspaceState;
+}
+
 export interface PrebuildInfo {
     id: string;
-    teamId: string;
+    buildWorkspaceId: string;
+
+    teamId?: string;
+    userId?: string;
+
+    projectId: string;
     projectName: string;
+
     cloneUrl: string;
     branch: string;
-    branchPrebuildNumber: string;
-    buildWorkspaceId: string;
 
     startedAt: string;
     startedBy: string;
     startedByAvatar?: string;
-    status: PrebuiltWorkspaceState;
+
     changeTitle: string;
     changeDate: string;
     changeAuthor: string;
@@ -74,6 +83,17 @@ export interface PrebuildInfo {
     changePR?: string;
     changeUrl?: string;
     changeHash: string;
+}
+export namespace PrebuildInfo {
+    export function is(data?: any): data is PrebuildInfo {
+        return typeof data === "object" && ["id", "buildWorkspaceId", "projectId", "branch"].every(p => p in data);
+    }
+}
+
+export interface StartPrebuildResult {
+    wsid: string;
+    done: boolean;
+    didFinish?: boolean;
 }
 
 export interface Team {

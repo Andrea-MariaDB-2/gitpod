@@ -34,7 +34,7 @@ export default function Menu() {
     const { teams } = useContext(TeamsContext);
     const location = useLocation();
 
-    const match = useRouteMatch<{ segment1?: string, segment2?: string, segment3?: string }>("/:segment1/:segment2?/:segment3?");
+    const match = useRouteMatch<{ segment1?: string, segment2?: string, segment3?: string }>("/(t/)?:segment1/:segment2?/:segment3?");
     const projectName = (() => {
         const resource = match?.params?.segment2;
         if (resource && !["projects", "members", "users", "workspaces"].includes(resource)) {
@@ -76,22 +76,22 @@ export default function Menu() {
         })();
     }, [ teams ]);
 
-    const teamOrUserSlug = !!team ? team.slug : 'projects';
+    const teamOrUserSlug = !!team ? '/t/' + team.slug : '/projects';
     const leftMenu: Entry[] = (() => {
         // Project menu
         if (projectName) {
             return [
                 {
                     title: 'Branches',
-                    link: `/${teamOrUserSlug}/${projectName}`
+                    link: `${teamOrUserSlug}/${projectName}`
                 },
                 {
                     title: 'Prebuilds',
-                    link: `/${teamOrUserSlug}/${projectName}/prebuilds`
+                    link: `${teamOrUserSlug}/${projectName}/prebuilds`
                 },
                 {
                     title: 'Configuration',
-                    link: `/${teamOrUserSlug}/${projectName}/configure`
+                    link: `${teamOrUserSlug}/${projectName}/configure`
                 }
             ];
         }
@@ -100,12 +100,12 @@ export default function Menu() {
             return [
                 {
                     title: 'Projects',
-                    link: `/${team.slug}/projects`,
+                    link: `/t/${team.slug}/projects`,
                     alternatives: [`/${team.slug}`]
                 },
                 {
                     title: 'Members',
-                    link: `/${team.slug}/members`
+                    link: `/t/${team.slug}/members`
                 }
             ];
         }
@@ -147,7 +147,7 @@ export default function Menu() {
         return (
             <div className="flex p-1 pl-3 ">
                 { projectName && <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 px-2 py-1">
-                    <Link to={team ? `/${team.slug}/projects` : "/workspaces"}>
+                    <Link to={team ? `/t/${team.slug}/projects` : "/workspaces"}>
                         <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{team?.name || userFullName}</span>
                     </Link>
                 </div> }
@@ -174,7 +174,7 @@ export default function Menu() {
                             </div>,
                             active: team && team.id === t.id,
                             separator: true,
-                            link: `/${t.slug}`,
+                            link: `/t/${t.slug}`,
                         })).sort((a, b) => a.title.toLowerCase() > b.title.toLowerCase() ? 1 : -1),
                         {
                             title: 'Create a new team',
@@ -193,7 +193,7 @@ export default function Menu() {
                 </div>
                 { projectName && (
                     <div className="flex h-full rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 px-2 py-1">
-                        <Link to={`/${teamOrUserSlug}/${projectName}${prebuildId ? "/prebuilds" : ""}`}>
+                        <Link to={`${teamOrUserSlug}/${projectName}${prebuildId ? "/prebuilds" : ""}`}>
                             <span className="text-base text-gray-600 dark:text-gray-400 font-semibold">{projectName}</span>
                         </Link>
                     </div>
@@ -209,7 +209,7 @@ export default function Menu() {
     }
 
     return <>
-        <header className={`lg:px-28 px-10 flex flex-col pt-4 space-y-4 ${isMinimalUI || !!prebuildId ? 'pb-4' : ''}`}>
+        <header className={`lg:px-28 px-10 flex flex-col pt-4 space-y-4 ${isMinimalUI || !!prebuildId ? 'pb-4' : ''}`} data-analytics='{"button_type":"menu"}'>
             <div className="flex h-10">
                 <div className="flex justify-between items-center pr-3">
                     <Link to="/">
@@ -238,7 +238,7 @@ export default function Menu() {
                             </li>)}
                         </ul>
                     </nav>
-                    <div className="ml-3 flex items-center justify-start mb-0 pointer-cursor m-l-auto rounded-full border-2 border-transparent hover:border-gray-200 dark:hover:border-gray-700 p-0.5 font-medium">
+                    <div className="ml-3 flex items-center justify-start mb-0 pointer-cursor m-l-auto rounded-full border-2 border-transparent hover:border-gray-200 dark:hover:border-gray-700 p-0.5 font-medium" data-analytics='{"label":"Account"}'>
                         <ContextMenu menuEntries={[
                             {
                                 title: (user && User.getPrimaryEmail(user)) || '',

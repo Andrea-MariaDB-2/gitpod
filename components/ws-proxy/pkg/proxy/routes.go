@@ -462,7 +462,7 @@ func logHandler(h http.Handler) http.Handler {
 func logRouteHandlerHandler(routeHandlerName string) mux.MiddlewareFunc {
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-			getLog(req.Context()).WithField("routeHandler", routeHandlerName).Info("hit route handler")
+			getLog(req.Context()).WithField("routeHandler", routeHandlerName).Debug("hit route handler")
 			h.ServeHTTP(resp, req)
 		})
 	}
@@ -607,7 +607,7 @@ func (t *blobserveTransport) DoRoundTrip(req *http.Request) (resp *http.Response
 			}
 
 			// treat any client or server error code as a http error
-			return nil, fmt.Errorf("blobserver error: (%d) %s", resp.StatusCode, string(respBody))
+			return nil, xerrors.Errorf("blobserver error: (%d) %s", resp.StatusCode, string(respBody))
 		}
 		break
 	}

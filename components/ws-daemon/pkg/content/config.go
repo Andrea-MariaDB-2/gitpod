@@ -5,13 +5,13 @@
 package content
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/gitpod-io/gitpod/common-go/util"
-	"github.com/gitpod-io/gitpod/content-service/pkg/storage"
+	cntntcfg "github.com/gitpod-io/gitpod/content-service/api/config"
 	"github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/quota"
+	"golang.org/x/xerrors"
 )
 
 // Config configures the workspace content service
@@ -32,7 +32,7 @@ type Config struct {
 	WorkspaceSizeLimit quota.Size `json:"workspaceSizeLimit"`
 
 	// Storage is some form of permanent file store to which we back up workspaces
-	Storage storage.Config `json:"storage"`
+	Storage cntntcfg.StorageConfig `json:"storage"`
 
 	// Backup configures the behaviour of ws-daemon during backup
 	Backup struct {
@@ -71,7 +71,7 @@ func (m *FSShiftMethod) UnmarshalJSON(data []byte) error {
 	input := strings.ToUpper(strings.Trim(string(data), "\""))
 	v, ok := api.FSShiftMethod_value[input]
 	if !ok {
-		return fmt.Errorf("invalid shift method: %v", input)
+		return xerrors.Errorf("invalid shift method: %v", input)
 	}
 	*m = FSShiftMethod(v)
 	return nil

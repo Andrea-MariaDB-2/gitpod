@@ -183,7 +183,13 @@ env:
 - name: GITPOD_INSTALLATION_SHORTNAME
   value: {{ template "gitpod.installation.shortname" . }}
 - name: LOG_LEVEL
-  value: {{ $gp.log.level | default "debug" | lower | quote }}
+  value: {{ template "gitpod.loglevel" . }}
+{{- end -}}
+
+{{- define "gitpod.loglevel" -}}
+{{- $ := .root -}}
+{{- $gp := .gp -}}
+{{ $gp.log.level | default "info" | lower | quote }}
 {{- end -}}
 
 {{- define "gitpod.container.analyticsEnv" -}}
@@ -351,7 +357,7 @@ storage:
 
 {{- define "gitpod.kube-rbac-proxy" -}}
 - name: kube-rbac-proxy
-  image: quay.io/brancz/kube-rbac-proxy:v0.9.0
+  image: quay.io/brancz/kube-rbac-proxy:v0.11.0
   args:
   - --v=10
   - --logtostderr

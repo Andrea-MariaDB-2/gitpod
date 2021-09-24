@@ -28,8 +28,6 @@ export interface User {
 
     identities: Identity[]
 
-    allowsMarketingCommunication: boolean;
-
     /**
      * Whether the user has been blocked to use our service, because of TOS violation for example.
      * Optional for backwards compatibility.
@@ -109,7 +107,9 @@ export interface AdditionalUserData {
 }
 
 export interface EmailNotificationSettings {
-    disallowTransactionalEmails?: boolean;
+    allowsChangelogMail?: boolean;
+    allowsDevXMail?: boolean;
+    allowsOnboardingMail?: boolean;
 }
 
 export type IDESettings = {
@@ -705,7 +705,7 @@ export interface TaskConfig {
     init?: string;
     prebuild?: string;
     command?: string;
-    env?: { [env: string]: string };
+    env?: { [env: string]: any };
     openIn?: 'bottom' | 'main' | 'left' | 'right';
     openMode?: 'split-top' | 'split-left' | 'split-right' | 'split-bottom' | 'tab-before' | 'tab-after';
 }

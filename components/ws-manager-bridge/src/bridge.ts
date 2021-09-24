@@ -55,9 +55,12 @@ export class WorkspaceManagerBridge implements Disposable {
     protected readonly disposables: Disposable[] = [];
     protected readonly queues = new Map<string, Queue>();
 
+    protected cluster: WorkspaceClusterInfo;
+
     public start(cluster: WorkspaceClusterInfo, clientProvider: ClientProvider) {
         const logPayload = { name: cluster.name, url: cluster.url };
         log.info(`starting bridge to cluster...`, logPayload);
+        this.cluster = cluster;
 
         if (cluster.govern) {
             log.debug(`starting DB updater: ${cluster.name}`, logPayload);
@@ -70,7 +73,7 @@ export class WorkspaceManagerBridge implements Disposable {
                 throw new Error("controllerInterval <= 0!");
             }
             log.debug(`starting controller: ${cluster.name}`, logPayload);
-            this.startController(clientProvider, cluster.name, controllerInterval, this.config.controllerMaxDisconnectSeconds);
+            this.startController(clientProvider, controllerInterval, this.config.controllerMaxDisconnectSeconds);
         }
         log.info(`started bridge to cluster.`, logPayload);
     }
@@ -118,7 +121,7 @@ export class WorkspaceManagerBridge implements Disposable {
         log.debug("Received status update", status);
 
         const span = TraceContext.startSpan("handleStatusUpdate", ctx);
-        span.setTag("status", JSON.stringify(status))
+        span.setTag("status", JSON.stringify(filterStatus(status)));
         try {
             // Beware of the ID mapping here: What's a workspace to the ws-manager is a workspace instance to the rest of the system.
             //                                The workspace ID of ws-manager is the workspace instance ID in the database.
@@ -129,7 +132,10 @@ export class WorkspaceManagerBridge implements Disposable {
             const logCtx = { instanceId, workspaceId, userId };
 
             const instance = await this.workspaceDB.trace({span}).findInstanceById(instanceId);
-            if (!instance) {
+            if (instance) {
+                this.prometheusExporter.statusUpdateReceived(this.cluster.name, true);
+            } else {
+                this.prometheusExporter.statusUpdateReceived(this.cluster.name, false);
                 log.warn(logCtx, "Received a status update for an unknown instance", { status });
                 return;
             }
@@ -214,12 +220,16 @@ export class WorkspaceManagerBridge implements Disposable {
                     instance.status.phase = "interrupted";
                     break;
                 case WorkspacePhase.STOPPING:
-                    instance.status.phase = "stopping";
-                    if (!instance.stoppingTime) {
-                        // The first time a workspace enters stopping we record that as it's stoppingTime time.
-                        // This way we don't take the time a workspace requires to stop into account when
-                        // computing the time a workspace instance was running.
-                        instance.stoppingTime = new Date().toISOString();
+                    if (instance.status.phase != 'stopped') {
+                        instance.status.phase = "stopping";
+                        if (!instance.stoppingTime) {
+                            // The first time a workspace enters stopping we record that as it's stoppingTime time.
+                            // This way we don't take the time a workspace requires to stop into account when
+                            // computing the time a workspace instance was running.
+                            instance.stoppingTime = new Date().toISOString();
+                        }
+                    } else {
+                        log.warn("Got a stopping event for an already stopped workspace.", instance);
                     }
                     break;
                 case WorkspacePhase.STOPPED:
@@ -255,17 +265,17 @@ export class WorkspaceManagerBridge implements Disposable {
         }
     }
 
-    protected startController(clientProvider: ClientProvider, installation: string, controllerIntervalSeconds: number, controllerMaxDisconnectSeconds: number, maxTimeToRunningPhaseSeconds = 60 * 60) {
+    protected startController(clientProvider: ClientProvider, controllerIntervalSeconds: number, controllerMaxDisconnectSeconds: number, maxTimeToRunningPhaseSeconds = 60 * 60) {
         let disconnectStarted = Number.MAX_SAFE_INTEGER;
         const timer = setInterval(async () => {
             try {
                 const client = await clientProvider();
-                await this.controlInstallationInstances(client, installation, maxTimeToRunningPhaseSeconds);
+                await this.controlInstallationInstances(client, maxTimeToRunningPhaseSeconds);
 
                 disconnectStarted = Number.MAX_SAFE_INTEGER;    // Reset disconnect period
             } catch (e) {
                 if (durationLongerThanSeconds(disconnectStarted, controllerMaxDisconnectSeconds)) {
-                    log.warn("error while controlling installation's workspaces", e, { installation });
+                    log.warn("error while controlling installation's workspaces", e, { installation: this.cluster.name });
                 } else if (disconnectStarted > Date.now()) {
                     disconnectStarted = Date.now();
                 }
@@ -274,7 +284,8 @@ export class WorkspaceManagerBridge implements Disposable {
         this.disposables.push({ dispose: () => clearTimeout(timer) });
     }
 
-    protected async controlInstallationInstances(client: PromisifiedWorkspaceManagerClient, installation: string, maxTimeToRunningPhaseSeconds: number) {
+    protected async controlInstallationInstances(client: PromisifiedWorkspaceManagerClient, maxTimeToRunningPhaseSeconds: number) {
+        const installation = this.cluster.name;
         log.debug("controlling instances", { installation });
         let ctx: TraceContext = {};
 
@@ -363,3 +374,18 @@ const mapPortVisibility = (visibility: WsManPortVisibility | undefined): PortVis
 const durationLongerThanSeconds = (time: number, durationSeconds: number, now: number = Date.now()) => {
     return (now - time) / 1000 > durationSeconds;
 };
+
+/**
+ * Filter here to avoid overloading spans
+ * @param status
+ */
+const filterStatus = (status: WorkspaceStatus.AsObject): Partial<WorkspaceStatus.AsObject> => {
+    return {
+        id: status.id,
+        metadata: status.metadata,
+        phase: status.phase,
+        message: status.message,
+        conditions: status.conditions,
+        runtime: status.runtime,
+    };
+}

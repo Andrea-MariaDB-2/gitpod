@@ -46,6 +46,7 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "deleteOwnAuthProvider": { group: "default", points: 1 },
         "getBranding": { group: "default", points: 1 },
         "getConfiguration": { group: "default", points: 1 },
+        "getGitpodTokenScopes": { group: "default", points: 1 },
         "getToken": { group: "default", points: 1 },
         "getPortAuthenticationToken": { group: "default", points: 1 },
         "deleteAccount": { group: "default", points: 1 },
@@ -97,6 +98,7 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "triggerPrebuild":  { group: "default", points: 1 },
         "setProjectConfiguration":  { group: "default", points: 1 },
         "fetchProjectRepositoryConfiguration":  { group: "default", points: 1 },
+        "guessProjectConfiguration":  { group: "default", points: 1 },
         "getContentBlobUploadUrl": { group: "default", points: 1 },
         "getContentBlobDownloadUrl": { group: "default", points: 1 },
         "getGitpodTokens": { group: "default", points: 1 },
@@ -165,6 +167,7 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         "tsReactivateSlot":  { group: "default", points: 1 },
         "tsReassignSlot":  { group: "default", points: 1 },
         "trackEvent":  { group: "default", points: 1 },
+        "trackLocation": { group: "default", points: 1}
     };
 
     return {

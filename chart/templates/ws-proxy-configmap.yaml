@@ -63,17 +63,8 @@ data:
                 "location": "/app/public"
             }
         },
-        {{ if (and $comp.wsManagerProxy $comp.wsManagerProxy.enabled) }}
-        "wsManagerProxy": {
-            "listenAddress": "{{ $comp.wsManagerProxy.listenAddress }}",
-            "rateLimiter": {
-                "refillInterval": "1s",
-                "bucketSize": {{ $comp.wsManagerProxy.ratelimit.maxRPS }}
-            }
-        },
-        {{ end }}
-        "pprofAddr": ":60060",
+        "pprofAddr": ":6060",
         "readinessProbeAddr": ":60088",
-        "prometheusAddr": ":60095"
+        "prometheusAddr": "localhost:9500"
     }
 {{- end -}}

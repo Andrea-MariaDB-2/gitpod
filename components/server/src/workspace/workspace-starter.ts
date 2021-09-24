@@ -20,7 +20,7 @@ import { inject, injectable } from "inversify";
 import * as uuidv4 from 'uuid/v4';
 import { HostContextProvider } from "../auth/host-context-provider";
 import { ScopedResourceGuard } from '../auth/resource-access';
-import { Env } from "../env";
+import { Config } from "../config";
 import { OneTimeSecretServer } from "../one-time-secret-server";
 import { TheiaPluginService } from "../theia-plugin/theia-plugin-service";
 import { AuthorizationService } from "../user/authorization-service";
@@ -29,6 +29,7 @@ import { UserService } from "../user/user-service";
 import { ImageSourceProvider } from "./image-source-provider";
 import { MessageBusIntegration } from "./messagebus-integration";
 import * as path from 'path';
+import { IDEConfig, IDEConfigService } from "../ide-config";
 
 export interface StartWorkspaceOptions {
     rethrow?: boolean;
@@ -39,7 +40,8 @@ export interface StartWorkspaceOptions {
 @injectable()
 export class WorkspaceStarter {
     @inject(WorkspaceManagerClientProvider) protected readonly clientProvider: WorkspaceManagerClientProvider;
-    @inject(Env) protected readonly env: Env;
+    @inject(Config) protected readonly config: Config;
+    @inject(IDEConfigService) private readonly ideConfigService: IDEConfigService;
     @inject(TracedWorkspaceDB) protected readonly workspaceDb: DBWithTracing<WorkspaceDB>;
     @inject(TracedUserDB) protected readonly userDB: DBWithTracing<UserDB>;
     @inject(TokenProvider) protected readonly tokenProvider: TokenProvider;
@@ -55,6 +57,7 @@ export class WorkspaceStarter {
 
     public async startWorkspace(ctx: TraceContext, workspace: Workspace, user: User, userEnvVars?: UserEnvVar[], options?: StartWorkspaceOptions): Promise<StartWorkspaceResult> {
         const span = TraceContext.startSpan("WorkspaceStarter.startWorkspace", ctx);
+        span.setTag("workspaceId", workspace.id);
 
         options = options || {};
         try {
@@ -74,7 +77,7 @@ export class WorkspaceStarter {
 
             if (options.forceDefaultImage) {
                 const req = new ResolveBaseImageRequest();
-                req.setRef(this.env.workspaceDefaultImage);
+                req.setRef(this.config.workspaceDefaults.workspaceImage);
                 const allowAll = new BuildRegistryAuthTotal();
                 allowAll.setAllowAll(true);
                 const auth = new BuildRegistryAuth();
@@ -92,8 +95,10 @@ export class WorkspaceStarter {
             const pastInstances = await this.workspaceDb.trace({ span }).findInstances(workspace.id);
             const mustHaveBackup = pastInstances.some(i => !!i.status && !!i.status.conditions && !i.status.conditions.failed);
 
+            const ideConfig = await this.ideConfigService.config;
+
             // create and store instance
-            let instance = await this.workspaceDb.trace({ span }).storeInstance(await this.newInstance(workspace, user, options.excludeFeatureFlags || []));
+            let instance = await this.workspaceDb.trace({ span }).storeInstance(await this.newInstance(workspace, user, options.excludeFeatureFlags || [], ideConfig));
             span.log({ "newInstance": instance.id });
 
             const forceRebuild = !!workspace.context.forceImageBuild;
@@ -121,11 +126,11 @@ export class WorkspaceStarter {
             // If the caller requested that errors be rethrown we must await the actual workspace start to be in the exception path.
             // To this end we disable the needsImageBuild behaviour if rethrow is true.
             if (needsImageBuild && !options.rethrow) {
-                this.actuallyStartWorkspace({ span }, instance, workspace, user, mustHaveBackup, userEnvVars, options.rethrow, forceRebuild);
+                this.actuallyStartWorkspace({ span }, instance, workspace, user, mustHaveBackup, ideConfig, userEnvVars, options.rethrow, forceRebuild);
                 return { instanceID: instance.id };
             }
 
-            return await this.actuallyStartWorkspace({ span }, instance, workspace, user, mustHaveBackup, userEnvVars, options.rethrow, forceRebuild);
+            return await this.actuallyStartWorkspace({ span }, instance, workspace, user, mustHaveBackup, ideConfig, userEnvVars, options.rethrow, forceRebuild);
         } catch (e) {
             TraceContext.logError({ span }, e);
             throw e;
@@ -136,7 +141,7 @@ export class WorkspaceStarter {
 
     // Note: this function does not expect to be awaited for by its caller. This means that it takes care of error handling itself
     //       and creates its tracing span as followFrom rather than the usual childOf reference.
-    protected async actuallyStartWorkspace(ctx: TraceContext, instance: WorkspaceInstance, workspace: Workspace, user: User, mustHaveBackup: boolean, userEnvVars?: UserEnvVar[], rethrow?: boolean, forceRebuild?: boolean): Promise<StartWorkspaceResult> {
+    protected async actuallyStartWorkspace(ctx: TraceContext, instance: WorkspaceInstance, workspace: Workspace, user: User, mustHaveBackup: boolean, ideConfig: IDEConfig, userEnvVars?: UserEnvVar[], rethrow?: boolean, forceRebuild?: boolean): Promise<StartWorkspaceResult> {
         const span = TraceContext.startAsyncSpan("actuallyStartWorkspace", ctx);
 
         try {
@@ -151,7 +156,7 @@ export class WorkspaceStarter {
             }
 
             // create spec
-            const spec = await this.createSpec({span}, user, workspace, instance, mustHaveBackup, userEnvVars);
+            const spec = await this.createSpec({span}, user, workspace, instance, mustHaveBackup, ideConfig, userEnvVars);
 
             // create start workspace request
             const metadata = new WorkspaceMetadata();
@@ -179,6 +184,7 @@ export class WorkspaceStarter {
             }
 
             // start that thing
+            log.info('starting instance', {instanceId: instance.id});
             const resp = (await manager.startWorkspace({ span }, startRequest)).toObject();
             span.log({ "resp": resp });
 
@@ -193,6 +199,15 @@ export class WorkspaceStarter {
                 }
             });
 
+            {
+                if (type === WorkspaceType.PREBUILD) {
+                    // do not await
+                    this.notifyOnPrebuildQueued(ctx, workspace.id).catch(err => {
+                        log.error("failed to notify on prebuild queued", err);
+                    });
+                }
+            }
+
             return { instanceID: instance.id, workspaceURL: resp.url };
         } catch (err) {
             TraceContext.logError({ span }, err);
@@ -201,13 +216,23 @@ export class WorkspaceStarter {
             if (rethrow) {
                 throw err;
             } else {
-                // we "swallow" this error as the promise of this function might not be awaited to - and even so,
-                // we've already handled the error properly.
+                log.error("error starting instance", err, { instanceId: instance.id});
             }
 
             return { instanceID: instance.id };
         } finally {
             span.finish();
+        }
+    }
+
+    protected async notifyOnPrebuildQueued(ctx: TraceContext, workspaceId: string) {
+        const span = TraceContext.startAsyncSpan("notifyOnPrebuildQueued", ctx);
+        const prebuild = await this.workspaceDb.trace({span}).findPrebuildByWorkspaceID(workspaceId);
+        if (prebuild) {
+            const info = (await this.workspaceDb.trace({span}).findPrebuildInfos([prebuild.id]))[0];
+            if (info) {
+                this.messageBus.notifyOnPrebuildUpdate({ info, status: "queued" });
+            }
         }
     }
 
@@ -254,20 +279,17 @@ export class WorkspaceStarter {
      *
      * @param workspace the workspace to create an instance for
      */
-    protected async newInstance(workspace: Workspace, user: User, excludeFeatureFlags: NamedWorkspaceFeatureFlag[]): Promise<WorkspaceInstance> {
-        const theiaVersion = this.env.theiaVersion;
-        const ideImage = this.env.ideDefaultImage;
-
+    protected async newInstance(workspace: Workspace, user: User, excludeFeatureFlags: NamedWorkspaceFeatureFlag[], ideConfig: IDEConfig): Promise<WorkspaceInstance> {
         // TODO(cw): once we allow changing the IDE in the workspace config (i.e. .gitpod.yml), we must
         //           give that value precedence over the default choice.
         const configuration: WorkspaceInstanceConfiguration = {
-            theiaVersion,
-            ideImage,
+            theiaVersion: ideConfig.ideVersion,
+            ideImage: ideConfig.ideImage,
         };
 
         const ideChoice = user.additionalData?.ideSettings?.defaultIde;
         if (!!ideChoice) {
-            const mappedImage = this.env.ideImageAliases[ideChoice];
+            const mappedImage = ideConfig.ideImageAliases[ideChoice];
             if (!!mappedImage) {
                 configuration.ideImage = mappedImage;
             } else if (this.authService.hasPermission(user, "ide-settings")) {
@@ -278,7 +300,7 @@ export class WorkspaceStarter {
         }
 
         let featureFlags: NamedWorkspaceFeatureFlag[] = workspace.config._featureFlags || [];
-        featureFlags = featureFlags.concat(this.env.defaultFeatureFlags);
+        featureFlags = featureFlags.concat(this.config.workspaceDefaults.defaultFeatureFlags);
         if (user.featureFlags && user.featureFlags.permanentWSFeatureFlags) {
             featureFlags = featureFlags.concat(featureFlags, user.featureFlags.permanentWSFeatureFlags);
         }
@@ -286,7 +308,7 @@ export class WorkspaceStarter {
         // if the user has feature preview enabled, we need to add the respective feature flags.
         // Beware: all feature flags we add here are not workspace-persistent feature flags, e.g. no full-workspace backup.
         if (!!user.additionalData?.featurePreview) {
-            featureFlags = featureFlags.concat(this.env.previewFeatureFlags.filter(f => !featureFlags.includes(f)));
+            featureFlags = featureFlags.concat(this.config.workspaceDefaults.previewFeatureFlags.filter(f => !featureFlags.includes(f)));
         }
 
         featureFlags = featureFlags.filter(f => !excludeFeatureFlags.includes(f));
@@ -303,7 +325,7 @@ export class WorkspaceStarter {
             workspaceId: workspace.id,
             creationTime: now,
             ideUrl: '', // Initially empty, filled during starting process
-            region: this.env.installationShortname, // Shortname set to bridge can cleanup workspaces stuck preparing
+            region: this.config.installationShortname, // Shortname set to bridge can cleanup workspaces stuck preparing
             workspaceImage: '', // Initially empty, filled during starting process
             status: {
                 conditions: {},
@@ -337,7 +359,7 @@ export class WorkspaceStarter {
                 // The base image is not neccesarily stored on the Gitpod registry, but might also come
                 // from a private whitelisted registry also. Hence allowBaserep is not enough, and we also
                 // need to explicitly allow all whitelisted registry when resolving the base image.
-                nauth.setAnyOfList(this.env.defaultBaseImageRegistryWhitelist);
+                nauth.setAnyOfList(this.config.defaultBaseImageRegistryWhitelist);
                 const auth = new BuildRegistryAuth();
                 auth.setSelective(nauth);
 
@@ -352,7 +374,7 @@ export class WorkspaceStarter {
                 auth.setTotal(totalAuth);
             } else {
                 const selectiveAuth = new BuildRegistryAuthSelective();
-                selectiveAuth.setAnyOfList(this.env.defaultBaseImageRegistryWhitelist);
+                selectiveAuth.setAnyOfList(this.config.defaultBaseImageRegistryWhitelist);
                 auth.setSelective(selectiveAuth);
             }
             if (WorkspaceImageSourceDocker.is(imgsrc)) {
@@ -506,7 +528,14 @@ export class WorkspaceStarter {
             await this.messageBus.notifyOnInstanceUpdate(workspace.ownerId, instance);
 
             TraceContext.logError({ span }, err);
-            log.error({instanceId: instance.id, userId: user.id, workspaceId: workspace.id}, `workspace image build failed: ${message}`);
+            const looksLikeUserError = (msg: string): boolean => {
+                return msg.startsWith("build failed:");
+            };
+            if (looksLikeUserError(message)) {
+                log.debug({instanceId: instance.id, userId: user.id, workspaceId: workspace.id}, `workspace image build failed: ${message}`);
+            } else {
+                log.warn({instanceId: instance.id, userId: user.id, workspaceId: workspace.id}, `workspace image build failed: ${message}`);
+            }
             this.analytics.track({ userId: user.id, event: "imagebuild-failed", properties: { workspaceId: workspace.id, instanceId: instance.id, contextURL: workspace.contextURL, }});
 
             throw err;
@@ -515,7 +544,7 @@ export class WorkspaceStarter {
         }
     }
 
-    protected async createSpec(traceCtx: TraceContext, user: User, workspace: Workspace, instance: WorkspaceInstance, mustHaveBackup: boolean, userEnvVars?: UserEnvVarValue[]): Promise<StartWorkspaceSpec> {
+    protected async createSpec(traceCtx: TraceContext, user: User, workspace: Workspace, instance: WorkspaceInstance, mustHaveBackup: boolean, ideConfig: IDEConfig, userEnvVars?: UserEnvVarValue[]): Promise<StartWorkspaceSpec> {
         const context = workspace.context;
 
         let allEnvVars: UserEnvVarValue[] = [];
@@ -535,6 +564,14 @@ export class WorkspaceStarter {
             ev.setValue(uv.value);
             return ev;
         });
+
+        const ideAlias = user.additionalData?.ideSettings?.defaultIde;
+        if (ideAlias && ideConfig.ideImageAliases[ideAlias]) {
+            const ideAliasEnv = new EnvironmentVariable();
+            ideAliasEnv.setName('GITPOD_IDE_ALIAS');
+            ideAliasEnv.setValue(ideAlias);
+            envvars.push(ideAliasEnv);
+        }
 
         const contextUrlEnv = new EnvironmentVariable();
         contextUrlEnv.setName('GITPOD_WORKSPACE_CONTEXT_URL');
@@ -570,6 +607,12 @@ export class WorkspaceStarter {
                 }
             }
         )
+
+        const vsxRegistryUrl = new EnvironmentVariable();
+        vsxRegistryUrl.setName("VSX_REGISTRY_URL");
+        vsxRegistryUrl.setValue(this.config.vsxRegistryUrl);
+        envvars.push(vsxRegistryUrl);
+
         const createGitpodTokenPromise = (async () => {
             const scopes = this.createDefaultGitpodAPITokenScopes(workspace, instance);
             const token = crypto.randomBytes(30).toString('hex');
@@ -596,7 +639,7 @@ export class WorkspaceStarter {
                 tokenOTS: ots.token,
                 token: "ots",
                 kind: "gitpod",
-                host: this.env.hostUrl.url.host,
+                host: this.config.hostUrl.url.host,
                 scope: scopes,
                 expiryDate: tokenExpirationTime.toISOString(),
                 reuse: 2
@@ -645,7 +688,7 @@ export class WorkspaceStarter {
         if (!!instance.configuration?.ideImage) {
             ideImage = instance.configuration?.ideImage;
         } else {
-            ideImage = this.env.ideDefaultImage;
+            ideImage = ideConfig.ideImage;
         }
 
         const spec = new StartWorkspaceSpec();
@@ -688,6 +731,7 @@ export class WorkspaceStarter {
             "function:storeLayout",
             "function:stopWorkspace",
             "function:getToken",
+            "function:getGitpodTokenScopes",
             "function:getContentBlobUploadUrl",
             "function:getContentBlobDownloadUrl",
             "function:accessCodeSyncStorage",
@@ -859,7 +903,7 @@ export class WorkspaceStarter {
         gitConfig.setAuthentication(GitAuthMethod.BASIC_AUTH_OTS);
         gitConfig.setAuthOts(tokenOTS);
 
-        if (this.env.insecureNoDomain) {
+        if (this.config.insecureNoDomain) {
             const token = await this.tokenProvider.getTokenForHost(user, host);
             gitConfig.setAuthentication(GitAuthMethod.BASIC_AUTH);
             gitConfig.setAuthUser(token.username || "oauth2");
@@ -916,7 +960,7 @@ export class WorkspaceStarter {
                     return (WorkspaceFeatureFlag[key] as any) as WorkspaceFeatureFlag;
                 }
             }
-            log.warn(`not a valid workspace feature flag: ${name}`);
+            log.debug(`not a valid workspace feature flag: ${name}`);
             return undefined;
         }).filter(f => !!f) as WorkspaceFeatureFlag[];
 

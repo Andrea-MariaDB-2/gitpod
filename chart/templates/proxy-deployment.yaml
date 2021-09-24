@@ -51,6 +51,33 @@ spec:
             - -c
             - "sysctl -w net.core.somaxconn=32768; sysctl -w net.ipv4.ip_local_port_range='1024 65000'"
       containers:
+      # TODO: remove once Caddy can listen only in localhost
+      - name: kube-rbac-proxy
+        args:
+        - --v=10
+        - --logtostderr
+        - --insecure-listen-address=[$(IP)]:9500
+        - --upstream=http://127.0.0.1:9545/
+        env:
+        - name: IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        image: quay.io/brancz/kube-rbac-proxy:v0.11.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 9500
+          name: metrics
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 1m
+            memory: 30Mi
+        securityContext:
+          runAsGroup: 65532
+          runAsNonRoot: true
+          runAsUser: 65532
       - name: proxy
         image: {{ template "gitpod.comp.imageFull" $this }}
 {{ include "gitpod.container.imagePullPolicy" $this | indent 8 }}
@@ -81,11 +108,6 @@ spec:
 {{ include "gitpod.container.defaultEnv" (dict "root" . "gp" $.Values "comp" $comp) | indent 8 }}
         - name: PROXY_DOMAIN
           value: "{{ $.Values.hostname }}"
-        - name: SERVER_PROXY_APIKEY
-          valueFrom:
-            secretKeyRef:
-              name: server-proxy-apikey
-              key: apikey
       volumes:
       - name: vhosts
         configMap:

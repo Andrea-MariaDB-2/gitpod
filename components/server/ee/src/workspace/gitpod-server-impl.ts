@@ -7,7 +7,7 @@
 import { injectable, inject } from "inversify";
 import { GitpodServerImpl } from "../../../src/workspace/gitpod-server-impl";
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
-import { GitpodServer, GitpodClient, AdminGetListRequest, User, AdminGetListResult, Permission, AdminBlockUserRequest, AdminModifyRoleOrPermissionRequest, RoleOrPermission, AdminModifyPermanentWorkspaceFeatureFlagRequest, UserFeatureSettings, AdminGetWorkspacesRequest, WorkspaceAndInstance, GetWorkspaceTimeoutResult, WorkspaceTimeoutDuration, WorkspaceTimeoutValues, SetWorkspaceTimeoutResult, WorkspaceContext, CreateWorkspaceMode, WorkspaceCreationResult, PrebuiltWorkspaceContext, CommitContext, PrebuiltWorkspace, PermissionName, WorkspaceInstance, EduEmailDomain, ProviderRepository, Queue } from "@gitpod/gitpod-protocol";
+import { GitpodServer, GitpodClient, AdminGetListRequest, User, AdminGetListResult, Permission, AdminBlockUserRequest, AdminModifyRoleOrPermissionRequest, RoleOrPermission, AdminModifyPermanentWorkspaceFeatureFlagRequest, UserFeatureSettings, AdminGetWorkspacesRequest, WorkspaceAndInstance, GetWorkspaceTimeoutResult, WorkspaceTimeoutDuration, WorkspaceTimeoutValues, SetWorkspaceTimeoutResult, WorkspaceContext, CreateWorkspaceMode, WorkspaceCreationResult, PrebuiltWorkspaceContext, CommitContext, PrebuiltWorkspace, PermissionName, WorkspaceInstance, EduEmailDomain, ProviderRepository, Queue, PrebuildWithStatus, CreateProjectParams, Project, StartPrebuildResult, ClientHeaderFields } from "@gitpod/gitpod-protocol";
 import { ResponseError } from "vscode-jsonrpc";
 import { TakeSnapshotRequest, AdmissionLevel, ControlAdmissionRequest, StopWorkspacePolicy, DescribeWorkspaceRequest, SetTimeoutRequest } from "@gitpod/ws-manager/lib";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
@@ -37,9 +37,10 @@ import { ChargebeeProvider, UpgradeHelper } from "@gitpod/gitpod-payment-endpoin
 import { ChargebeeCouponComputer } from "../user/coupon-computer";
 import { ChargebeeService } from "../user/chargebee-service";
 import { Chargebee as chargebee } from '@gitpod/gitpod-payment-endpoint/lib/chargebee';
-import { EnvEE } from "../env";
 
 import { GitHubAppSupport } from "../github/github-app-support";
+import { GitLabAppSupport } from "../gitlab/gitlab-app-support";
+import { Config } from "../../../src/config";
 
 @injectable()
 export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodServer> {
@@ -68,12 +69,44 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     @inject(ChargebeeService) protected readonly chargebeeService: ChargebeeService;
 
     @inject(GitHubAppSupport) protected readonly githubAppSupport: GitHubAppSupport;
+    @inject(GitLabAppSupport) protected readonly gitLabAppSupport: GitLabAppSupport;
 
-    @inject(EnvEE) protected readonly env: EnvEE;
+    @inject(Config) protected readonly config: Config;
 
-    initialize(client: GitpodClient | undefined, clientRegion: string | undefined, user: User, accessGuard: ResourceAccessGuard): void {
-        super.initialize(client, clientRegion, user, accessGuard);
+    initialize(client: GitpodClient | undefined, user: User, accessGuard: ResourceAccessGuard, clientHeaderFields: ClientHeaderFields): void {
+        super.initialize(client, user, accessGuard, clientHeaderFields);
         this.listenToCreditAlerts();
+        this.listenForPrebuildUpdates();
+    }
+
+    protected async listenForPrebuildUpdates() {
+        // 'registering for prebuild updates for all projects this user has access to
+        const projects = await this.getAccessibleProjects();
+        for (const projectId of projects) {
+            this.disposables.push(this.messageBusIntegration.listenForPrebuildUpdates(
+                (ctx: TraceContext, update: PrebuildWithStatus) => {
+                    this.client?.onPrebuildUpdate(update);
+                },
+                projectId
+            ));
+        }
+
+        // TODO(at) we need to keep the list of accessible project up to date
+    }
+
+    protected async getAccessibleProjects() {
+        if (!this.user) {
+            return [];
+        }
+
+        // update all project this user has access to
+        const allProjects: string[] = [];
+        const teams = await this.teamDB.findTeamsByUser(this.user.id);
+        for (const team of teams) {
+            allProjects.push(...(await this.projectsService.getTeamProjects(team.id)).map(p => p.id));
+        }
+        allProjects.push(...(await this.projectsService.getUserProjects(this.user.id)).map(p => p.id));
+        return allProjects;
     }
 
     /**
@@ -182,7 +215,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
             if (!runningInstance) {
                 throw new ResponseError(ErrorCodes.NOT_FOUND, "Can only set keep-alive for running workspaces");
             }
-            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "update");
+            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace: workspace }, "update");
 
             // if any other running instance has a custom timeout other than the user's default, we'll reset that timeout
             const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
@@ -234,7 +267,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
                 log.warn({ userId: user.id, workspaceId }, 'Can only get keep-alive for running workspaces');
                 return { duration: "30m", canChange };
             }
-            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "get");
+            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace: workspace }, "get");
 
             const req = new DescribeWorkspaceRequest();
             req.setId(runningInstance.id);
@@ -304,7 +337,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
 
             const instance = await this.workspaceDb.trace({ span }).findRunningInstance(id);
             if (instance) {
-                await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "update");
+                await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace: workspace }, "update");
 
                 const req = new ControlAdmissionRequest();
                 req.setId(instance.id);
@@ -347,7 +380,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
                 throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} has no running instance`);
             }
 
-            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspaceOwnerID: workspace.ownerId, workspaceIsShared: workspace.shareable || false }, "get");
+            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace}, "get");
             await this.guardAccess({ kind: "snapshot", subject: undefined, workspaceOwnerID: workspace.ownerId, workspaceID: workspace.id }, "create");
 
             const client = await this.workspaceManagerClientProvider.get(instance.region);
@@ -609,7 +642,10 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
         await this.guardAdminAccess("adminForceStopWorkspace", { id }, Permission.ADMIN_WORKSPACES);
 
         const span = opentracing.globalTracer().startSpan("adminForceStopWorkspace");
-        await this.internalStopWorkspace({ span }, id, undefined, StopWorkspacePolicy.IMMEDIATELY);
+        const workspace = await this.workspaceDb.trace({ span }).findById(id);
+        if (workspace) {
+            await this.internalStopWorkspace({ span }, workspace, StopWorkspacePolicy.IMMEDIATELY, true);
+        }
     }
 
     async adminRestoreSoftDeletedWorkspace(id: string): Promise<void> {
@@ -715,7 +751,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
                 }
                 const result = makeResult(wsi.id);
 
-                const inSameCluster = wsi.region === this.env.installationShortname;
+                const inSameCluster = wsi.region === this.config.installationShortname;
                 if (!inSameCluster) {
                     if (mode === CreateWorkspaceMode.UsePrebuild) {
                         /* We need to wait for this prebuild to finish before we return from here.
@@ -849,7 +885,11 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     // chargebee
     async getChargebeeSiteId(): Promise<string> {
         this.checkUser('getChargebeeSiteId');
-        return this.env.chargebeeProviderOptions.site;
+        if (!this.config.chargebeeProviderOptions) {
+            log.error("config error: expected chargebeeProviderOptions but found none!");
+            return "none";
+        }
+        return this.config.chargebeeProviderOptions.site;
     }
 
     public async isStudent(): Promise<boolean> {
@@ -859,7 +899,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
 
     async getShowPaymentUI(): Promise<boolean> {
         this.checkUser('getShowPaymentUI');
-        return this.env.enablePayment;
+        return !!this.config.enablePayment;
     }
 
     async isChargebeeCustomer(): Promise<boolean> {
@@ -1284,7 +1324,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
             log.debug({ userId: user.id }, "user has no GitHub identity - cannot provide plan upgrade URLs");
             return [];
         }
-        const produceUpgradeURL = (planID: number) => `https://www.github.com/marketplace/${this.env.githubAppMarketplaceName}/upgrade/${planID}/${ghidentity.authId}`;
+        const produceUpgradeURL = (planID: number) => `https://www.github.com/marketplace/${this.config.githubApp?.marketplaceName}/upgrade/${planID}/${ghidentity.authId}`;
 
         // GitHub plans are USD
         return Plans.getAvailablePlans('USD')
@@ -1450,42 +1490,82 @@ export class GitpodServerEEImpl extends GitpodServerImpl<GitpodClient, GitpodSer
     async getProviderRepositoriesForUser(params: { provider: string, hints?: object }): Promise<ProviderRepository[]> {
         const user = this.checkAndBlockUser("getProviderRepositoriesForUser");
 
-        const repositories = await this.githubAppSupport.getProviderRepositoriesForUser({ user, ...params });
+        const repositories: ProviderRepository[] = [];
+        if (params.provider === "github.com") {
+            repositories.push(...(await this.githubAppSupport.getProviderRepositoriesForUser({ user, ...params })));
+        } else if (params.provider === "gitlab.com") {
+            repositories.push(...(await this.gitLabAppSupport.getProviderRepositoriesForUser({ user, ...params })));
+        } else {
+            log.info({ userId: user.id }, `Unsupported provider: "${params.provider}"`, { params });
+        }
         const projects = await this.projectsService.getProjectsByCloneUrls(repositories.map(r => r.cloneUrl));
 
         const cloneUrlsInUse = new Set(projects.map(p => p.cloneUrl));
         repositories.forEach(r => { r.inUse = cloneUrlsInUse.has(r.cloneUrl) });
 
+        await this.ensureTeamsEnabled();
+
         return repositories;
     }
 
-    async triggerPrebuild(projectId: string, branchName: string): Promise<void> {
+    async triggerPrebuild(projectId: string, branchName: string | null): Promise<StartPrebuildResult> {
         const user = this.checkAndBlockUser("triggerPrebuild");
 
         const project = await this.projectsService.getProject(projectId);
         if (!project) {
-            return;
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Project not found");
         }
         await this.guardProjectOperation(user, projectId, "update");
 
         const span = opentracing.globalTracer().startSpan("triggerPrebuild");
         span.setTag("userId", user.id);
 
-        const branchDetails = await this.projectsService.getBranchDetails(user, project, branchName);
+        const branchDetails = (!!branchName
+            ? await this.projectsService.getBranchDetails(user, project, branchName)
+            : (await this.projectsService.getBranchDetails(user, project)).filter(b => b.isDefault));
         if (branchDetails.length !== 1) {
             log.debug({ userId: user.id }, 'Cannot find branch details.', { project, branchName });
+            throw new ResponseError(ErrorCodes.NOT_FOUND, `Could not find ${!branchName ? 'a default branch' : `branch '${branchName}'`} in repository ${project.cloneUrl}`);
         }
         const contextURL = branchDetails[0].url;
 
         const context = await this.contextParser.handle({ span }, user, contextURL) as CommitContext;
 
-        await this.prebuildManager.startPrebuild({ span }, {
+        const prebuild = await this.prebuildManager.startPrebuild({ span }, {
             contextURL,
             cloneURL: project.cloneUrl,
             commit: context.revision,
             user,
-            branch: branchName,
+            branch: branchDetails[0].name,
             project
         });
+
+        this.analytics.track({
+            userId: user.id,
+            event: "prebuild_triggered",
+            properties: {
+                context_url: contextURL,
+                clone_url: project.cloneUrl,
+                commit: context.revision,
+                branch: branchDetails[0].name,
+                project_id: project.id
+            }
+        });
+
+        return prebuild;
     }
+
+    public async createProject(params: CreateProjectParams): Promise<Project> {
+        const project = await super.createProject(params);
+
+        // update client registration for the logged in user
+        this.disposables.push(this.messageBusIntegration.listenForPrebuildUpdates(
+            (ctx: TraceContext, update: PrebuildWithStatus) => {
+                this.client?.onPrebuildUpdate(update);
+            },
+            project.id
+        ));
+        return project;
+    }
+
 }

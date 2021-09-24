@@ -8,6 +8,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -266,7 +267,7 @@ func (it *Test) Instrument(component ComponentType, agentName string, opts ...In
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("agent stopped unexepectedly")
+		return nil, xerrors.Errorf("agent stopped unexepectedly")
 	case <-time.After(1 * time.Second):
 	}
 
@@ -314,7 +315,7 @@ func (it *Test) Instrument(component ComponentType, agentName string, opts ...In
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("cannot shutdown agent: %w", err)
+			return xerrors.Errorf("cannot shutdown agent: %w", err)
 		}
 		return nil
 	})
@@ -399,7 +400,7 @@ func forwardPort(ctx context.Context, config *rest.Config, namespace, pod, port 
 		}
 
 		if errOut.Len() != 0 {
-			errchan <- fmt.Errorf(errOut.String())
+			errchan <- xerrors.Errorf(errOut.String())
 			return
 		}
 
@@ -533,7 +534,7 @@ func (t *Test) buildAgent(name string) (loc string, err error) {
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, string(out))
+		return "", xerrors.Errorf("%w: %s", err, string(out))
 	}
 
 	return f.Name(), nil
@@ -597,28 +598,65 @@ func (t *Test) selectPod(component ComponentType, options selectPodOptions) (pod
 	return
 }
 
-func envvarFromPod(pods *corev1.PodList, name, containerName string) (value string, err error) {
-	if len(pods.Items) == 0 {
-		return "", xerrors.Errorf("envvarFromPod: no pods found for %s", name)
+// ServerConfigPartial is the subset of server config we're using for integration tests.
+// Ideally we're using a definition derived from the config interface, someday...
+// NOTE: keep in sync with chart/templates/server-configmap.yaml
+type ServerConfigPartial struct {
+	HostURL           string `json:"hostUrl"`
+	WorkspaceDefaults struct {
+		WorkspaceImage string `json:"workspaceImage"`
+	} `json:"workspaceDefaults"`
+}
+
+func (t *Test) GetServerConfig() (*ServerConfigPartial, error) {
+	cm, err := t.clientset.CoreV1().ConfigMaps(t.namespace).Get(context.Background(), "server-config", metav1.GetOptions{})
+	if err != nil {
+		return nil, err
 	}
-	var container *corev1.Container
-	for _, c := range pods.Items[0].Spec.Containers {
-		if c.Name == containerName {
-			cc := c
-			container = &cc
-			break
-		}
+
+	key := "config.json"
+	configJson, ok := cm.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("key %s not found", key)
 	}
-	if container == nil {
-		return "", fmt.Errorf("envvarFromPod: cannot find container %s", containerName)
+
+	var config ServerConfigPartial
+	err = json.Unmarshal([]byte(configJson), &config)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling server config: %v", err)
 	}
-	for _, e := range container.Env {
-		if e.Name == name {
-			value = e.Value
-			break
-		}
+	return &config, nil
+}
+
+// ServerIDEConfigPartial is the subset of server IDE config we're using for integration tests.
+// NOTE: keep in sync with chart/templates/server-ide-configmap.yaml
+type ServerIDEConfigPartial struct {
+	IDEVersion      string `json:"ideVersion"`
+	IDEImageRepo    string `json:"ideImageRepo"`
+	IDEImageAliases struct {
+		Code       string `json:"code"`
+		CodeLatest string `json:"code-latest"`
+	} `json:"ideImageAliases"`
+}
+
+func (t *Test) GetServerIDEConfig() (*ServerIDEConfigPartial, error) {
+	cm, err := t.clientset.CoreV1().ConfigMaps(t.namespace).Get(context.Background(), "server-ide-config", metav1.GetOptions{})
+	if err != nil {
+		return nil, err
 	}
-	return
+
+	key := "config.json"
+	configJson, ok := cm.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("key %s not found", key)
+	}
+
+	var config ServerIDEConfigPartial
+	err = json.Unmarshal([]byte(configJson), &config)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling server IDE config: %v", err)
+	}
+	return &config, nil
 }
 
 // ComponentType denotes a Gitpod component

@@ -6,12 +6,17 @@
 
 import React, { Suspense, useContext, useEffect, useState } from "react";
 import { useLocation, useRouteMatch } from "react-router";
-import { CreateWorkspaceMode, Project, WorkspaceCreationResult } from "@gitpod/gitpod-protocol";
+import { Project, StartPrebuildResult, WorkspaceInstance } from "@gitpod/gitpod-protocol";
 import PrebuildLogs from "../components/PrebuildLogs";
 import TabMenuItem from "../components/TabMenuItem";
 import { getGitpodService } from "../service/service";
 import { getCurrentTeam, TeamsContext } from "../teams/teams-context";
-import AlertBox from "../components/AlertBox";
+import Header from "../components/Header";
+import Spinner from "../icons/Spinner.svg";
+import PrebuildLogsEmpty from "../images/prebuild-logs-empty.svg";
+import PrebuildLogsEmptyDark from "../images/prebuild-logs-empty-dark.svg";
+import { ThemeContext } from "../theme-context";
+import { PrebuildInstanceStatus } from "./Prebuilds";
 
 const MonacoEditor = React.lazy(() => import('../components/MonacoEditor'));
 
@@ -52,20 +57,27 @@ export default function () {
   const { teams } = useContext(TeamsContext);
   const location = useLocation();
   const team = getCurrentTeam(location, teams);
-  const routeMatch = useRouteMatch<{ teamSlug: string, projectSlug: string }>("/:teamSlug/:projectSlug/configure");
+  const routeMatch = useRouteMatch<{ teamSlug: string, projectSlug: string }>("/(t/)?:teamSlug/:projectSlug/configure");
   const [ project, setProject ] = useState<Project | undefined>();
   const [ gitpodYml, setGitpodYml ] = useState<string>('');
   const [ dockerfile, setDockerfile ] = useState<string>('');
-  const [ editorError, setEditorError ] = useState<React.ReactNode | null>(null);
+  const [ editorMessage, setEditorMessage ] = useState<React.ReactNode | null>(null);
   const [ selectedEditor, setSelectedEditor ] = useState<'.gitpod.yml'|'.gitpod.Dockerfile'>('.gitpod.yml');
   const [ isEditorDisabled, setIsEditorDisabled ] = useState<boolean>(true);
-  const [ workspaceCreationResult, setWorkspaceCreationResult ] = useState<WorkspaceCreationResult | undefined>();
+  const [ isDetecting, setIsDetecting ] = useState<boolean>(true);
+  const [ prebuildWasTriggered, setPrebuildWasTriggered ] = useState<boolean>(false);
+  const [ startPrebuildResult, setStartPrebuildResult ] = useState<StartPrebuildResult | undefined>();
+  const [ prebuildInstance, setPrebuildInstance ] = useState<WorkspaceInstance | undefined>();
+  const { isDark } = useContext(ThemeContext);
 
   useEffect(() => {
     // Disable editing while loading, or when the config comes from Git.
+    setIsDetecting(true);
     setIsEditorDisabled(true);
-    setEditorError(null);
+    setEditorMessage(null);
     if (!teams) {
+      setIsDetecting(false);
+      setEditorMessage(<EditorMessage type="warning" heading="Couldn't load teams information." message="Please try to reload this page." />);
       return;
     }
     (async () => {
@@ -73,18 +85,36 @@ export default function () {
         ? await getGitpodService().server.getTeamProjects(team.id)
         : await getGitpodService().server.getUserProjects());
       const project = projects.find(p => p.name === routeMatch?.params.projectSlug);
-      if (project) {
-        setProject(project);
-        const configString = await getGitpodService().server.fetchProjectRepositoryConfiguration(project.id);
-        if (configString) {
-          // TODO(janx): Link to .gitpod.yml directly instead of just the cloneUrl.
-          setEditorError(<span>A Gitpod configuration already exists in the project's <a className="gp-link" href={project.cloneUrl}>repository</a>.<br/>Please <a className="gp-link" href={`/#${project.cloneUrl}`}>edit it in Gitpod</a> instead.</span>);
-          setGitpodYml(configString);
-        } else {
-          setIsEditorDisabled(false);
-          setGitpodYml(project.config && project.config['.gitpod.yml'] || '');
-        }
+      if (!project) {
+        setIsDetecting(false);
+        setEditorMessage(<EditorMessage type="warning" heading="Couldn't load project information." message="Please try to reload this page." />);
+        return;
       }
+      setProject(project);
+      const guessedConfigStringPromise = getGitpodService().server.guessProjectConfiguration(project.id);
+      const repoConfigString = await getGitpodService().server.fetchProjectRepositoryConfiguration(project.id);
+      if (repoConfigString) {
+        setIsDetecting(false);
+        setEditorMessage(<EditorMessage type="warning" heading="Configuration already exists in git." message="Run a prebuild or open a new workspace to edit project configuration."/>);
+        setGitpodYml(repoConfigString);
+        return;
+      }
+      if (project.config && project.config['.gitpod.yml']) {
+        setIsDetecting(false);
+        setIsEditorDisabled(false);
+        setGitpodYml(project.config['.gitpod.yml']);
+        return;
+      }
+      const guessedConfigString = await guessedConfigStringPromise;
+      setIsDetecting(false);
+      setIsEditorDisabled(false);
+      if (guessedConfigString) {
+        setEditorMessage(<EditorMessage type="success" heading="Project type detected." message="You can edit project configuration below before running a prebuild"/>);
+        setGitpodYml(guessedConfigString);
+        return;
+      }
+      setEditorMessage(<EditorMessage type="warning" heading="Project type could not be detected." message="You can edit project configuration below before running a prebuild."/>);
+      setGitpodYml(TASKS.Other);
     })();
   }, [ teams, team ]);
 
@@ -93,52 +123,76 @@ export default function () {
       return;
     }
     // (event.target as HTMLButtonElement).disabled = true;
-    setEditorError(null);
-    if (!!workspaceCreationResult) {
-      setWorkspaceCreationResult(undefined);
+    setEditorMessage(null);
+    if (!!startPrebuildResult) {
+      setStartPrebuildResult(undefined);
     }
     try {
-      await getGitpodService().server.setProjectConfiguration(project.id, gitpodYml);
-      const result = await getGitpodService().server.createWorkspace({
-        contextUrl: `prebuild/${project.cloneUrl}`,
-        mode: CreateWorkspaceMode.ForceNew,
-      });
-      setWorkspaceCreationResult(result);
+      setPrebuildWasTriggered(true);
+      if (!isEditorDisabled) {
+        await getGitpodService().server.setProjectConfiguration(project.id, gitpodYml);
+      }
+      const result = await getGitpodService().server.triggerPrebuild(project.id, null);
+      setStartPrebuildResult(result);
     } catch (error) {
-      setEditorError(<span>{String(error)}</span>);
+      setPrebuildWasTriggered(false);
+      setEditorMessage(<EditorMessage type="warning" heading="Could not run prebuild." message={String(error).replace(/Error: Request \w+ failed with message: /, '')}/>);
     }
+  }
+
+  const onInstanceUpdate = (instance: WorkspaceInstance) => {
+    setPrebuildInstance(instance);
   }
 
   useEffect(() => { document.title = 'Configure Project — Gitpod' }, []);
 
-  return <div className="flex flex-col mt-24 mx-auto items-center">
-    <h1>Configure Project</h1>
-    <p className="text-gray-500 text-center text-base">Fully-automate your project's dev setup. <a className="gp-link" href="https://www.gitpod.io/docs/references/gitpod-yml">Learn more</a></p>
-    <div className="mt-4 w-full flex">
-      <div className="flex-1 m-8">
-        {editorError && <AlertBox className="mb-2">{editorError}</AlertBox>}
-        {!isEditorDisabled && <select className="w-full" defaultValue="" onChange={e => setGitpodYml(e.target.value)}>
-          <option value="" disabled={true}>…</option>
-          {Object.entries(TASKS).map(([ name, value ]) => <option value={value}>{name}</option>)}
-        </select>}
-        {!!dockerfile && <div className="flex justify-center border-b border-gray-200 dark:border-gray-800">
+  return <>
+    <Header title="Configuration" subtitle="View and edit project configuration." />
+    <div className="lg:px-28 px-10 mt-8 flex space-x-4">
+      <div className="flex-1 h-96 rounded-xl overflow-hidden relative flex flex-col">
+        <div className="flex bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-600 px-6 pt-3">
           <TabMenuItem name=".gitpod.yml" selected={selectedEditor === '.gitpod.yml'} onClick={() => setSelectedEditor('.gitpod.yml')} />
-          <TabMenuItem name=".gitpod.Dockerfile" selected={selectedEditor === '.gitpod.Dockerfile'} onClick={() => setSelectedEditor('.gitpod.Dockerfile')} />
-        </div>}
+          {!!dockerfile && <TabMenuItem name=".gitpod.Dockerfile" selected={selectedEditor === '.gitpod.Dockerfile'} onClick={() => setSelectedEditor('.gitpod.Dockerfile')} />}
+        </div>
+        {editorMessage}
         <Suspense fallback={<div />}>
           {selectedEditor === '.gitpod.yml' &&
-            <MonacoEditor classes="mt-4 w-full h-64" disabled={isEditorDisabled} language="yaml" value={gitpodYml} onChange={setGitpodYml} />}
+            <MonacoEditor classes="w-full flex-grow" disabled={isEditorDisabled} language="yaml" value={gitpodYml} onChange={setGitpodYml} />}
           {selectedEditor === '.gitpod.Dockerfile' &&
-            <MonacoEditor classes="mt-4 w-full h-64" disabled={isEditorDisabled} language="dockerfile" value={dockerfile} onChange={setDockerfile} />}
+            <MonacoEditor classes="w-full flex-grow" disabled={isEditorDisabled} language="dockerfile" value={dockerfile} onChange={setDockerfile} />}
         </Suspense>
-        <div className="mt-2 flex justify-center space-x-2">
-          <button disabled={isEditorDisabled} onClick={buildProject}>Save &amp; Test Configuration</button>
+        {isDetecting && <div className="absolute h-full w-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center space-x-2">
+          <img className="h-5 w-5 animate-spin" src={Spinner} />
+          <span className="font-semibold text-gray-400">Detecting project configuration ...</span>
+        </div>}
+      </div>
+      <div className="flex-1 h-96 rounded-xl overflow-hidden bg-gray-100 dark:bg-gray-700 flex flex-col">
+        <div className="flex-grow flex">{startPrebuildResult
+          ? <PrebuildLogs workspaceId={startPrebuildResult.wsid} onInstanceUpdate={onInstanceUpdate} />
+          : (!prebuildWasTriggered && <div className="flex-grow flex flex-col items-center justify-center">
+              <img className="w-14" role="presentation" src={isDark ? PrebuildLogsEmptyDark : PrebuildLogsEmpty} />
+              <h3 className="text-center text-lg text-gray-500 dark:text-gray-50 mt-4">No Recent Prebuild</h3>
+              <p className="text-center text-base text-gray-500 dark:text-gray-400 mt-2 w-64">Edit the project configuration on the left to get started. <a className="gp-link" href="https://www.gitpod.io/docs/config-gitpod-file/">Learn more</a></p>
+            </div>)
+        }</div>
+        <div className="h-20 px-6 bg-gray-50 dark:bg-gray-800 border-t border-gray-200 dark:border-gray-600 flex space-x-2">
+          {prebuildWasTriggered && <PrebuildInstanceStatus prebuildInstance={prebuildInstance} />}
+          <div className="flex-grow" />
+          {(prebuildInstance?.status.phase === "stopped" && !prebuildInstance?.status.conditions.failed)
+              ? <a className="my-auto" href={`/#${project?.cloneUrl}`}><button className="secondary">New Workspace</button></a>
+              : <button disabled={true} className="secondary">New Workspace</button>}
+          <button disabled={isDetecting || (prebuildWasTriggered && prebuildInstance?.status.phase !== "stopped")} onClick={buildProject}>Run Prebuild</button>
         </div>
       </div>
-      <div className="flex-1 m-8">
-        <h3 className="text-center">Output</h3>
-        {!!workspaceCreationResult && <PrebuildLogs workspaceId={workspaceCreationResult.createdWorkspaceId} />}
-      </div>
     </div>
+  </>;
+}
+
+function EditorMessage(props: { heading: string, message: string, type: 'success' | 'warning' }) {
+  return <div className={`p-4 flex flex-col ${props.type === 'success' ? 'bg-green-50 text-green-700' : 'bg-yellow-50 text-yellow-700'}`}>
+    <strong className={`font-semibold ${props.type === 'success' ? 'text-green-800' : 'text-yellow-800'}`}>{props.heading}</strong>
+    <span>{props.message}</span>
   </div>;
 }
+
+
