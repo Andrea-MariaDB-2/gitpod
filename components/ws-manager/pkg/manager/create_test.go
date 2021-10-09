@@ -21,14 +21,16 @@ import (
 
 func TestCreateDefiniteWorkspacePod(t *testing.T) {
 	type fixture struct {
-		Spec             *json.RawMessage              `json:"spec,omitempty"`    // *api.StartWorkspaceSpec
-		Request          *json.RawMessage              `json:"request,omitempty"` // *api.StartWorkspaceRequest
-		Context          *startWorkspaceContext        `json:"context,omitempty"`
-		DefaultTemplate  *corev1.Pod                   `json:"defaultTemplate,omitempty"`
-		PrebuildTemplate *corev1.Pod                   `json:"prebuildTemplate,omitempty"`
-		ProbeTemplate    *corev1.Pod                   `json:"probeTemplate,omitempty"`
-		RegularTemplate  *corev1.Pod                   `json:"regularTemplate,omitempty"`
-		ResourceRequests *config.ResourceConfiguration `json:"resourceRequests,omitempty"`
+		Spec               *json.RawMessage              `json:"spec,omitempty"`    // *api.StartWorkspaceSpec
+		Request            *json.RawMessage              `json:"request,omitempty"` // *api.StartWorkspaceRequest
+		Context            *startWorkspaceContext        `json:"context,omitempty"`
+		DefaultTemplate    *corev1.Pod                   `json:"defaultTemplate,omitempty"`
+		PrebuildTemplate   *corev1.Pod                   `json:"prebuildTemplate,omitempty"`
+		ProbeTemplate      *corev1.Pod                   `json:"probeTemplate,omitempty"`
+		ImagebuildTemplate *corev1.Pod                   `json:"imagebuildTemplate,omitempty"`
+		RegularTemplate    *corev1.Pod                   `json:"regularTemplate,omitempty"`
+		ResourceRequests   *config.ResourceConfiguration `json:"resourceRequests,omitempty"`
+		EnforceAffinity    bool                          `json:"enforceAffinity,omitempty"`
 	}
 	type gold struct {
 		Pod   corev1.Pod `json:"reason,omitempty"`
@@ -39,19 +41,23 @@ func TestCreateDefiniteWorkspacePod(t *testing.T) {
 		T:    t,
 		Path: "testdata/cdwp_*.json",
 		Test: func(t *testing.T, input interface{}) interface{} {
-			manager := forTestingOnlyGetManager(t)
 			fixture := input.(*fixture)
+
+			mgmtCfg := forTestingOnlyManagerConfig()
+			if fixture.EnforceAffinity {
+				mgmtCfg.EnforceWorkspaceNodeAffinity = true
+			}
 			if fixture.ResourceRequests != nil {
 				var (
-					cfg  = manager.Config
-					cont = cfg.Container
+					cont = mgmtCfg.Container
 					ws   = cont.Workspace
 				)
 				ws.Requests = *fixture.ResourceRequests
 				cont.Workspace = ws
-				cfg.Container = cont
-				manager.Config = cfg
+				mgmtCfg.Container = cont
 			}
+
+			manager := &Manager{Config: mgmtCfg}
 
 			// create in-memory file system
 			mapFS := fstest.MapFS{}
@@ -66,6 +72,7 @@ func TestCreateDefiniteWorkspacePod(t *testing.T) {
 				{"default-template.yaml", fixture.DefaultTemplate, func(fn string) { manager.Config.WorkspacePodTemplate.DefaultPath = fn }},
 				{"prebuild-template.yaml", fixture.PrebuildTemplate, func(fn string) { manager.Config.WorkspacePodTemplate.PrebuildPath = fn }},
 				{"probe-template.yaml", fixture.ProbeTemplate, func(fn string) { manager.Config.WorkspacePodTemplate.ProbePath = fn }},
+				{"imagebuild-template.yaml", fixture.ImagebuildTemplate, func(fn string) { manager.Config.WorkspacePodTemplate.ImagebuildPath = fn }},
 				{"regular-template.yaml", fixture.RegularTemplate, func(fn string) { manager.Config.WorkspacePodTemplate.RegularPath = fn }},
 			}
 			for _, f := range files {

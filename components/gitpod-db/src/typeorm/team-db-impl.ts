@@ -145,6 +145,15 @@ export class TeamDBImpl implements TeamDB {
         return team;
     }
 
+    public async deleteTeam(teamId: string): Promise<void> {
+        const teamRepo = await this.getTeamRepo();
+        const team = await this.findTeamById(teamId);
+        if (team) {
+            team.markedDeleted = true;
+            await teamRepo.save(team);
+        }
+    }
+
     public async addMemberToTeam(userId: string, teamId: string): Promise<void> {
         const teamRepo = await this.getTeamRepo();
         const team = await teamRepo.findOneById(teamId);
@@ -154,7 +163,7 @@ export class TeamDBImpl implements TeamDB {
         const membershipRepo = await this.getMembershipRepo();
         const membership = await membershipRepo.findOne({ teamId, userId, deleted: false });
         if (!!membership) {
-            throw new Error('You are already a member of this team');
+            throw new Error(`You are already a member of this team. (${team.slug})`);
         }
         await membershipRepo.save({
             id: uuidv4(),

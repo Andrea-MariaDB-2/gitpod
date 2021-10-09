@@ -35,7 +35,11 @@ export default function PrebuildLogs(props: PrebuildLogsProps) {
           setWorkspaceInstance(info.latestInstance);
         }
         disposables.push(getGitpodService().registerClient({
-          onInstanceUpdate: setWorkspaceInstance,
+          onInstanceUpdate: (instance) => {
+            if (props.workspaceId === instance.workspaceId) {
+              setWorkspaceInstance(instance);
+            }
+          },
           onWorkspaceImageBuildLogs: (info: WorkspaceImageBuild.StateInfo, content?: WorkspaceImageBuild.LogContent) => {
             if (!content) {
               return;
@@ -109,6 +113,9 @@ export default function PrebuildLogs(props: PrebuildLogsProps) {
       case "stopped":
         getGitpodService().server.watchWorkspaceImageBuildLogs(workspace!.id);
         break;
+    }
+    if (workspaceInstance?.status.conditions.headlessTaskFailed) {
+      setError(new Error(workspaceInstance.status.conditions.headlessTaskFailed));
     }
     if (workspaceInstance?.status.conditions.failed) {
       setError(new Error(workspaceInstance.status.conditions.failed));

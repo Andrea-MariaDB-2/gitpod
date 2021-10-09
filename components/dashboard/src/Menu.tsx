@@ -33,17 +33,18 @@ export default function Menu() {
     const { user } = useContext(UserContext);
     const { teams } = useContext(TeamsContext);
     const location = useLocation();
+    const visibleTeams = teams?.filter(team => { return Boolean(!team.markedDeleted) });
 
     const match = useRouteMatch<{ segment1?: string, segment2?: string, segment3?: string }>("/(t/)?:segment1/:segment2?/:segment3?");
     const projectName = (() => {
         const resource = match?.params?.segment2;
-        if (resource && !["projects", "members", "users", "workspaces"].includes(resource)) {
+        if (resource && !["projects", "members", "users", "workspaces", "settings"].includes(resource)) {
             return resource;
         }
     })();
     const prebuildId = (() => {
         const resource = projectName && match?.params?.segment3;
-        if (resource !== "prebuilds" && resource !== "settings" && resource !== "configure") {
+        if (resource !== "workspaces" && resource !== "prebuilds" && resource !== "settings" && resource !== "configure") {
             return resource;
         }
     })();
@@ -55,22 +56,32 @@ export default function Menu() {
     }
 
     const userFullName = user?.fullName || user?.name || '...';
-    const showTeamsUI = user?.rolesOrPermissions?.includes('teams-and-projects');
     const team = getCurrentTeam(location, teams);
+
+    {
+        // updating last team selection
+        try {
+            localStorage.setItem('team-selection', team ? team.slug : "");
+        } catch {
+        }
+    }
 
     // Hide most of the top menu when in a full-page form.
     const isMinimalUI = ['/new', '/teams/new'].includes(location.pathname);
 
     const [ teamMembers, setTeamMembers ] = useState<Record<string, TeamMemberInfo[]>>({});
     useEffect(() => {
-        if (!showTeamsUI || !teams) {
+        if (!teams) {
             return;
         }
         (async () => {
             const members: Record<string, TeamMemberInfo[]> = {};
             await Promise.all(teams.map(async (team) => {
-                const infos = await getGitpodService().server.getTeamMembers(team.id);
-                members[team.id] = infos;
+                try {
+                    members[team.id] = await getGitpodService().server.getTeamMembers(team.id);
+                } catch (error) {
+                    console.error('Could not get members of team', team, error);
+                }
             }));
             setTeamMembers(members);
         })();
@@ -86,6 +97,10 @@ export default function Menu() {
                     link: `${teamOrUserSlug}/${projectName}`
                 },
                 {
+                    title: 'Workspaces',
+                    link: `${teamOrUserSlug}/${projectName}/workspaces`
+                },
+                {
                     title: 'Prebuilds',
                     link: `${teamOrUserSlug}/${projectName}/prebuilds`
                 },
@@ -97,24 +112,38 @@ export default function Menu() {
         }
         // Team menu
         if (team) {
-            return [
+            const currentUserInTeam = (teamMembers[team.id] || []).find(m => m.userId === user?.id);
+
+            const teamSettingsList = [
                 {
                     title: 'Projects',
                     link: `/t/${team.slug}/projects`,
-                    alternatives: [`/${team.slug}`]
+                },
+                {
+                    title: 'Workspaces',
+                    link: `/t/${team.slug}/workspaces`,
+                    alternatives: [`/t/${team.slug}`]
                 },
                 {
                     title: 'Members',
                     link: `/t/${team.slug}/members`
                 }
             ];
+            if (currentUserInTeam?.role === "owner") {
+                teamSettingsList.push({
+                    title: 'Settings',
+                    link: `/t/${team.slug}/settings`,
+                })
+            }
+
+            return teamSettingsList;
         }
         // User menu
         return [
-            ...(showTeamsUI ? [{
+            {
                 title: 'Projects',
                 link: '/projects'
-            }] : []),
+            },
             {
                 title: 'Workspaces',
                 link: '/workspaces',
@@ -163,7 +192,7 @@ export default function Menu() {
                             separator: true,
                             link: '/',
                         },
-                        ...(teams || []).map(t => ({
+                        ...(visibleTeams || []).map(t => ({
                             title: t.name,
                             customContent: <div className="w-full text-gray-400 flex flex-col">
                                 <span className="text-gray-800 dark:text-gray-300 text-base font-semibold">{t.name}</span>
@@ -208,25 +237,22 @@ export default function Menu() {
         )
     }
 
+    const gitpodIconUrl = () => {
+        if (team) {
+            return `/t/${team.slug}`;
+        }
+        return "/"
+    }
+
     return <>
         <header className={`lg:px-28 px-10 flex flex-col pt-4 space-y-4 ${isMinimalUI || !!prebuildId ? 'pb-4' : ''}`} data-analytics='{"button_type":"menu"}'>
             <div className="flex h-10">
                 <div className="flex justify-between items-center pr-3">
-                    <Link to="/">
+                    <Link to={gitpodIconUrl()}>
                         <img src={gitpodIcon} className="h-6" />
                     </Link>
                     {!isMinimalUI && <div className="ml-2 text-base">
-                        {showTeamsUI
-                            ? renderTeamMenu()
-                            : <nav className="flex-1">
-                                <ul className="flex flex-1 items-center justify-between text-base text-gray-700 space-x-2">
-                                    <li className="flex-1"></li>
-                                    {leftMenu.map(entry => <li key={entry.title}>
-                                        <PillMenuItem name={entry.title} selected={isSelected(entry, location)} link={entry.link}/>
-                                    </li>)}
-                                </ul>
-                            </nav>
-                        }
+                        {renderTeamMenu()}
                     </div>}
                 </div>
                 <div className="flex flex-1 items-center w-auto" id="menu">
@@ -260,10 +286,10 @@ export default function Menu() {
                     </div>
                 </div>
             </div>
-            {!isMinimalUI && showTeamsUI && !prebuildId && <div className="flex">
-                {leftMenu.map((entry: Entry) => <TabMenuItem name={entry.title} selected={isSelected(entry, location)} link={entry.link}/>)}
+            {!isMinimalUI && !prebuildId && <div className="flex">
+                {leftMenu.map((entry: Entry) => <TabMenuItem key={entry.title} name={entry.title} selected={isSelected(entry, location)} link={entry.link}/>)}
             </div>}
         </header>
-        {showTeamsUI && <Separator />}
+        <Separator />
     </>;
 }

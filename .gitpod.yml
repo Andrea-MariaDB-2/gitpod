@@ -1,4 +1,4 @@
-image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:aledbf-libsecov.2
+image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:as-migrate-mixins.73
 workspaceLocation: gitpod/gitpod-ws.code-workspace
 checkoutLocation: gitpod
 ports:
@@ -55,3 +55,4 @@ vscode:
     - stkb.rewrap
     - zxh404.vscode-proto3
     - matthewpi.caddyfile-support
+    - heptio.jsonnet

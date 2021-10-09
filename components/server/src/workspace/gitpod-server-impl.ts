@@ -1442,8 +1442,6 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
         await this.teamDB.addMemberToTeam(user.id, invite.teamId);
         const team = await this.teamDB.findTeamById(invite.teamId);
 
-        await this.ensureTeamsEnabled();
-
         this.analytics.track({
             userId: user.id,
             event: "team_joined",
@@ -1453,16 +1451,6 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
             }
         })
         return team!;
-    }
-
-    protected async ensureTeamsEnabled() {
-        if (this.user && !this.user?.rolesOrPermissions?.includes('teams-and-projects')) {
-            this.user.rolesOrPermissions = [...(this.user.rolesOrPermissions || []), 'teams-and-projects'];
-            await this.userDB.updateUserPartial({
-                id: this.user.id,
-                rolesOrPermissions: this.user.rolesOrPermissions
-            })
-        }
     }
 
     public async setTeamMemberRole(teamId: string, userId: string, role: TeamMemberRole): Promise<void> {
@@ -1567,6 +1555,31 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
         return this.projectsService.deleteProject(projectId);
     }
 
+    public async deleteTeam(teamId: string, userId: string): Promise<void> {
+        const user = this.checkAndBlockUser("deleteTeam");
+        await this.guardTeamOperation(teamId, "delete");
+
+        const teamProjects = await this.projectsService.getTeamProjects(teamId);
+        teamProjects.forEach(project => {
+            this.deleteProject(project.id);
+        })
+
+        const teamMembers = await this.teamDB.findMembersByTeam(teamId);
+        teamMembers.forEach(member => {
+            this.removeTeamMember(teamId, member.userId);
+        })
+
+        await this.teamDB.deleteTeam(teamId);
+
+        return this.analytics.track({
+            userId: user.id,
+            event: "team_deleted",
+            properties: {
+                team_id: teamId
+            }
+        })
+    }
+
     public async getTeamProjects(teamId: string): Promise<Project[]> {
         this.checkUser("getTeamProjects");
         await this.guardTeamOperation(teamId, "get");
@@ -1592,7 +1605,14 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
             throw new ResponseError(ErrorCodes.NOT_FOUND, "Project not found");
         }
         await this.guardProjectOperation(user, projectId, "get");
-        return this.projectsService.getProjectOverview(user, project);
+        try {
+            return await this.projectsService.getProjectOverview(user, project);
+        } catch (error) {
+            if (UnauthorizedError.is(error)) {
+                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
+            }
+            throw error;
+        }
     }
 
     public async triggerPrebuild(projectId: string, branchName: string | null): Promise<StartPrebuildResult> {
@@ -1616,7 +1636,14 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
         span.setTag("projectId", projectId);
 
         await this.guardProjectOperation(user, projectId, "get");
-        return this.projectsService.fetchProjectRepositoryConfiguration({ span }, user, projectId);
+        try {
+            return await this.projectsService.fetchProjectRepositoryConfiguration({ span }, user, projectId);
+        } catch (error) {
+            if (UnauthorizedError.is(error)) {
+                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
+            }
+            throw error;
+        }
     }
 
     public async guessProjectConfiguration(projectId: string): Promise<string | undefined> {
@@ -1625,7 +1652,14 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
         span.setTag("projectId", projectId);
 
         await this.guardProjectOperation(user, projectId, "get");
-        return this.projectsService.guessProjectConfiguration({ span }, user, projectId);
+        try {
+            return await this.projectsService.guessProjectConfiguration({ span }, user, projectId);
+        } catch (error) {
+            if (UnauthorizedError.is(error)) {
+                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
+            }
+            throw error;
+        }
     }
 
     public async getContentBlobUploadUrl(name: string): Promise<string> {

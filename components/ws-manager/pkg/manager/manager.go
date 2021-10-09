@@ -32,7 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
@@ -44,6 +46,7 @@ import (
 	wsdaemon "github.com/gitpod-io/gitpod/ws-daemon/api"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
 	config "github.com/gitpod-io/gitpod/ws-manager/api/config"
+	"github.com/gitpod-io/gitpod/ws-manager/pkg/clock"
 	"github.com/gitpod-io/gitpod/ws-manager/pkg/manager/internal/grpcpool"
 )
 
@@ -56,6 +59,7 @@ type Manager struct {
 	OnChange  func(context.Context, *api.WorkspaceStatus)
 
 	activity sync.Map
+	clock    *clock.HLC
 
 	wsdaemonPool *grpcpool.Pool
 
@@ -118,6 +122,7 @@ func New(config config.Configuration, client client.Client, rawClient kubernetes
 		Clientset:    client,
 		RawClient:    rawClient,
 		Content:      cp,
+		clock:        clock.System(),
 		subscribers:  make(map[string]chan *api.SubscribeResponse),
 		wsdaemonPool: grpcpool.New(wsdaemonConnfactory, checkWSDaemonEndpoint(config.Namespace, client)),
 	}
@@ -226,12 +231,24 @@ func (m *Manager) StartWorkspace(ctx context.Context, req *api.StartWorkspaceReq
 		},
 	}
 
-	err = m.Clientset.Create(ctx, &theiaService)
+	var errorFn = func(err error) bool {
+		return strings.Contains(err.Error(), "object is being deleted")
+	}
+	// in some scenarios we could be recreating a service being deleted
+	err = retry.OnError(wait.Backoff{
+		Steps:    4,
+		Duration: 1 * time.Second,
+		Factor:   5.0,
+		Jitter:   0.1,
+	}, errorFn, func() error {
+		return m.Clientset.Create(ctx, &theiaService)
+	})
 	if err != nil {
 		clog.WithError(err).WithField("req", req).Error("was unable to start workspace")
 		// could not create Theia service
 		return nil, xerrors.Errorf("cannot create workspace's Theia service: %w", err)
 	}
+
 	span.LogKV("event", "theia service created")
 
 	// if we have ports configured already, create the ports service

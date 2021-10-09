@@ -491,9 +491,51 @@ export namespace ControlAdmissionResponse {
     }
 }
 
+export class BackupWorkspaceRequest extends jspb.Message {
+    getId(): string;
+    setId(value: string): BackupWorkspaceRequest;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): BackupWorkspaceRequest.AsObject;
+    static toObject(includeInstance: boolean, msg: BackupWorkspaceRequest): BackupWorkspaceRequest.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: BackupWorkspaceRequest, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): BackupWorkspaceRequest;
+    static deserializeBinaryFromReader(message: BackupWorkspaceRequest, reader: jspb.BinaryReader): BackupWorkspaceRequest;
+}
+
+export namespace BackupWorkspaceRequest {
+    export type AsObject = {
+        id: string,
+    }
+}
+
+export class BackupWorkspaceResponse extends jspb.Message {
+    getUrl(): string;
+    setUrl(value: string): BackupWorkspaceResponse;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): BackupWorkspaceResponse.AsObject;
+    static toObject(includeInstance: boolean, msg: BackupWorkspaceResponse): BackupWorkspaceResponse.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: BackupWorkspaceResponse, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): BackupWorkspaceResponse;
+    static deserializeBinaryFromReader(message: BackupWorkspaceResponse, reader: jspb.BinaryReader): BackupWorkspaceResponse;
+}
+
+export namespace BackupWorkspaceResponse {
+    export type AsObject = {
+        url: string,
+    }
+}
+
 export class WorkspaceStatus extends jspb.Message {
     getId(): string;
     setId(value: string): WorkspaceStatus;
+    getStatusVersion(): number;
+    setStatusVersion(value: number): WorkspaceStatus;
 
     hasMetadata(): boolean;
     clearMetadata(): void;
@@ -542,6 +584,7 @@ export class WorkspaceStatus extends jspb.Message {
 export namespace WorkspaceStatus {
     export type AsObject = {
         id: string,
+        statusVersion: number,
         metadata?: WorkspaceMetadata.AsObject,
         spec?: WorkspaceSpec.AsObject,
         phase: WorkspacePhase,

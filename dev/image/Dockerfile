@@ -5,7 +5,7 @@
 FROM gitpod/workspace-full-vnc:latest
 
 ENV TRIGGER_REBUILD 14
-ENV WORKSPACE_KERNEL 5.4.0-1046-gke
+ENV WORKSPACE_KERNEL 5.4.0-1051-gke
 
 USER root
 
@@ -63,9 +63,12 @@ RUN install-packages mysql-client
 # golangci-lint
 RUN cd /usr/local && curl -fsSL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s v1.42.0
 
+# gokart
+RUN cd /usr/bin && curl -L https://github.com/praetorian-inc/gokart/releases/download/v0.3.0/gokart_0.3.0_linux_x86_64.tar.gz | tar xzv gokart
+
 # leeway
 ENV LEEWAY_NESTED_WORKSPACE=true
-RUN cd /usr/bin && curl -fsSL https://github.com/TypeFox/leeway/releases/download/v0.2.5/leeway_0.2.5_Linux_x86_64.tar.gz | tar xz
+RUN cd /usr/bin && curl -fsSL https://github.com/gitpod-io/leeway/releases/download/v0.2.7/leeway_0.2.7_Linux_x86_64.tar.gz | tar xz
 
 # dazzle
 RUN cd /usr/bin && curl -fsSL https://github.com/32leaves/dazzle/releases/download/v0.0.3/dazzle_0.0.3_Linux_x86_64.tar.gz | tar xz
@@ -199,3 +202,25 @@ RUN sudo curl -fsSL https://uploader.codecov.io/latest/codecov-linux -o /usr/loc
 # Install pre-commit https://pre-commit.com/#install
 RUN sudo install-packages shellcheck \
     && sudo pip3 install pre-commit
+
+# Install observability-related binaries
+ARG PROM_VERSION="2.30.0"
+RUN curl -LO https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz && \
+    tar -xzvf prometheus-${PROM_VERSION}.linux-amd64.tar.gz && \
+    sudo mv prometheus-${PROM_VERSION}.linux-amd64/promtool /usr/local/bin/promtool && \
+    rm -rf prometheus-${PROM_VERSION}.linux-amd64/
+
+ARG JSONNET_BUNDLER_VERSION="0.4.0"
+RUN curl -L -o jb https://github.com/jsonnet-bundler/jsonnet-bundler/releases/download/v${JSONNET_BUNDLER_VERSION}/jb-linux-amd64 && \
+    chmod +x jb && sudo mv jb /usr/local/bin
+
+ARG JSONNET_VERSION="0.17.0"
+RUN curl -LO https://github.com/google/go-jsonnet/releases/download/v${JSONNET_VERSION}/go-jsonnet_${JSONNET_VERSION}_Linux_x86_64.tar.gz && \
+    tar -xzvf go-jsonnet_${JSONNET_VERSION}_Linux_x86_64.tar.gz && \
+    sudo mv jsonnet /usr/local/bin/jsonnet && \
+    sudo mv jsonnetfmt /usr/local/bin/jsonnetfmt
+
+ARG GOJSONTOYAML_VERSION="0.1.0"
+RUN curl -LO https://github.com/brancz/gojsontoyaml/releases/download/v${GOJSONTOYAML_VERSION}/gojsontoyaml_${GOJSONTOYAML_VERSION}_linux_amd64.tar.gz && \
+    tar -xzvf gojsontoyaml_${GOJSONTOYAML_VERSION}_linux_amd64.tar.gz && \
+    sudo mv gojsontoyaml /usr/local/bin/gojsontoyaml

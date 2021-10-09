@@ -14,13 +14,10 @@ import { useContext, useEffect, useState } from "react";
 import { getGitpodService } from "../service/service";
 import { getCurrentTeam, TeamsContext } from "../teams/teams-context";
 import { ThemeContext } from "../theme-context";
-import { PrebuildWithStatus, PrebuiltWorkspaceState, Project } from "@gitpod/gitpod-protocol";
+import { PrebuildWithStatus, Project } from "@gitpod/gitpod-protocol";
 import { toRemoteURL } from "./render-utils";
 import ContextMenu from "../components/ContextMenu";
-import StatusDone from "../icons/StatusDone.svg";
-import StatusPaused from "../icons/StatusPaused.svg";
-import StatusRunning from "../icons/StatusRunning.svg";
-import StatusFailed from "../icons/StatusFailed.svg";
+import { prebuildStatusIcon } from "./Prebuilds";
 
 export default function () {
     const location = useLocation();
@@ -48,15 +45,21 @@ export default function () {
             : await getGitpodService().server.getUserProjects());
         setProjects(infos);
 
-        for (const p of infos) {
-            const lastPrebuild = await getGitpodService().server.findPrebuilds({
-                projectId: p.id,
-                latest: true,
-            });
-            if (lastPrebuild[0]) {
-                setLastPrebuilds(prev => new Map(prev).set(p.id, lastPrebuild[0]));
+        const map = new Map();
+        await Promise.all(infos.map(async (p) => {
+            try {
+                const lastPrebuild = await getGitpodService().server.findPrebuilds({
+                    projectId: p.id,
+                    latest: true,
+                });
+                if (lastPrebuild[0]) {
+                    map.set(p.id, lastPrebuild[0]);
+                }
+            } catch (error) {
+                console.error('Failed to load prebuilds for project', p, error);
             }
-        }
+        }));
+        setLastPrebuilds(map);
     }
 
     const newProjectUrl = !!team ? `/new?team=${team.slug}` : '/new';
@@ -76,22 +79,11 @@ export default function () {
         return true;
     }
 
-    const teamOrUserSlug = !!team ? 't/'+team.slug : 'projects';
-
-    const getPrebuildStatusIcon = (status: PrebuiltWorkspaceState) => {
-        switch (status) {
-            case undefined: // Fall through
-            case "queued":
-                return StatusPaused;
-            case "building":
-                return StatusRunning;
-            case "aborted": // Fall through
-            case "timeout":
-                return StatusFailed;
-            case "available":
-                return StatusDone;
-        }
+    function hasNewerPrebuild(p0: Project, p1: Project): number {
+        return moment(lastPrebuilds.get(p1.id)?.info?.startedAt || '1970-01-01').diff(moment(lastPrebuilds.get(p0.id)?.info?.startedAt || '1970-01-01'));
     }
+
+    const teamOrUserSlug = !!team ? 't/'+team.slug : 'projects';
 
     return <>
         <Header title="Projects" subtitle="Manage recently added projects." />
@@ -123,7 +115,7 @@ export default function () {
                     <button className="ml-2" onClick={() => onNewProject()}>New Project</button>
                 </div>
                 <div className="mt-4 grid grid-cols-3 gap-4">
-                    {projects.filter(filter).map(p => (<div key={`project-${p.id}`} className="h-52">
+                    {projects.filter(filter).sort(hasNewerPrebuild).map(p => (<div key={`project-${p.id}`} className="h-52">
                         <div className="h-42 border border-gray-100 dark:border-gray-800 rounded-t-xl">
                             <div className="h-32 p-6">
                                 <div className="flex text-xl font-semibold text-gray-700 dark:text-gray-200 font-medium">
@@ -160,11 +152,11 @@ export default function () {
                         <div className="h-10 px-4 border rounded-b-xl dark:border-gray-800 bg-gray-100 border-gray-100 dark:bg-gray-800">
                             {lastPrebuilds.get(p.id)
                                 ? (<div className="flex flex-row h-full text-sm justify-between">
-                                    <Link to={`/${teamOrUserSlug}/${p.name}/${lastPrebuilds.get(p.id)?.info?.id}`} className="flex my-auto group space-x-2">
-                                        <img className="h-4 w-4 my-auto" src={getPrebuildStatusIcon(lastPrebuilds.get(p.id)!.status)} />
-                                        <div className="my-auto font-semibold text-gray-500 dark:text-gray-400 truncate w-24" title={lastPrebuilds.get(p.id)?.info?.branch}>{lastPrebuilds.get(p.id)?.info?.branch}</div>
-                                        <span className="mx-1 my-auto text-gray-400 dark:text-gray-600">·</span>
-                                        <div className="my-auto text-gray-400 dark:text-gray-500 flex-grow hover:text-gray-800 dark:hover:text-gray-300">{moment(lastPrebuilds.get(p.id)?.info?.startedAt, "YYYYMMDD").fromNow()}</div>
+                                    <Link to={`/${teamOrUserSlug}/${p.name}/${lastPrebuilds.get(p.id)?.info?.id}`} className="flex my-auto items-center group space-x-2">
+                                        {prebuildStatusIcon(lastPrebuilds.get(p.id))}
+                                        <div className="font-semibold text-gray-500 dark:text-gray-400 truncate w-24" title={lastPrebuilds.get(p.id)?.info?.branch}>{lastPrebuilds.get(p.id)?.info?.branch}</div>
+                                        <span className="mx-1 text-gray-400 dark:text-gray-600">·</span>
+                                        <div className="text-gray-400 dark:text-gray-500 flex-grow hover:text-gray-800 dark:hover:text-gray-300">{moment(lastPrebuilds.get(p.id)?.info?.startedAt).fromNow()}</div>
                                     </Link>
                                     <Link to={`/${teamOrUserSlug}/${p.name}/prebuilds`} className="my-auto group">
                                         <div className="flex my-auto text-gray-400 flex-grow text-right group-hover:text-gray-600 dark:hover:text-gray-300">View All &rarr;</div>

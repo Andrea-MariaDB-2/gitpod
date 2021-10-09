@@ -10,7 +10,7 @@ import * as util from 'util';
 import { sleep } from './util/util';
 import * as gpctl from './util/gpctl';
 import { createHash } from "crypto";
-import { InstallMonitoringSatelliteParams, installMonitoringSatellite } from './util/observability';
+import { InstallMonitoringSatelliteParams, installMonitoringSatellite, observabilityStaticChecks } from './util/observability';
 
 const readDir = util.promisify(fs.readdir)
 
@@ -144,15 +144,15 @@ export async function build(context, version) {
 
     exec(`LICENCE_HEADER_CHECK_ONLY=true leeway run components:update-license-header || { echo "[build|FAIL] There are some license headers missing. Please run 'leeway run components:update-license-header'."; exit 1; }`)
     exec(`leeway vet --ignore-warnings`);
-    exec(`leeway build --werft=true -c ${cacheLevel} ${dontTest ? '--dont-test' : ''} --dont-retag --coverage-output-path=${coverageOutput} --save /tmp/dev.tar.gz -Dversion=${version} -DimageRepoBase=eu.gcr.io/gitpod-core-dev/dev dev:all`);
+    exec(`leeway build --docker-build-options network=host --werft=true -c ${cacheLevel} ${dontTest ? '--dont-test' : ''} --dont-retag --coverage-output-path=${coverageOutput} --save /tmp/dev.tar.gz -Dversion=${version} -DimageRepoBase=eu.gcr.io/gitpod-core-dev/dev dev:all`);
     const sweeperImage = exec(`tar xfO /tmp/dev.tar.gz ./sweeper.txt`).stdout.trim();
     if (publishRelease) {
         exec(`gcloud auth activate-service-account --key-file "/mnt/secrets/gcp-sa-release/service-account.json"`);
     }
     if (withContrib || publishRelease) {
-        exec(`leeway build --werft=true -c ${cacheLevel} ${dontTest ? '--dont-test' : ''} -Dversion=${version} -DimageRepoBase=${imageRepo} contrib:all`);
+        exec(`leeway build --docker-build-options network=host --werft=true -c ${cacheLevel} ${dontTest ? '--dont-test' : ''} -Dversion=${version} -DimageRepoBase=${imageRepo} contrib:all`);
     }
-    exec(`leeway build --werft=true -c ${cacheLevel} ${retag} --coverage-output-path=${coverageOutput} -Dversion=${version} -DremoveSources=false -DimageRepoBase=${imageRepo} -DlocalAppVersion=${localAppVersion} -DnpmPublishTrigger=${publishToNpm ? Date.now() : 'false'}`);
+    exec(`leeway build --docker-build-options network=host --werft=true -c ${cacheLevel} ${retag} --coverage-output-path=${coverageOutput} -Dversion=${version} -DremoveSources=false -DimageRepoBase=${imageRepo} -DlocalAppVersion=${localAppVersion} -DnpmPublishTrigger=${publishToNpm ? Date.now() : 'false'}`);
     if (publishRelease) {
         try {
             werft.phase("publish", "checking version semver compliance...");
@@ -167,7 +167,7 @@ export async function build(context, version) {
             werft.phase("publish", `preparing GitHub release files...`);
             const releaseFilesTmpDir = exec("mktemp -d", { silent: true }).stdout.trim();
             const releaseTarName = "release.tar.gz";
-            exec(`leeway build --werft=true chart:release-tars -Dversion=${version} -DimageRepoBase=${imageRepo} --save ${releaseFilesTmpDir}/${releaseTarName}`);
+            exec(`leeway build --docker-build-options network=host --werft=true chart:release-tars -Dversion=${version} -DimageRepoBase=${imageRepo} --save ${releaseFilesTmpDir}/${releaseTarName}`);
             exec(`cd ${releaseFilesTmpDir} && tar xzf ${releaseTarName} && rm -f ${releaseTarName}`);
 
             werft.phase("publish", `publishing GitHub release ${version}...`);
@@ -398,6 +398,8 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
         exec(`werft log result -d "dev installation" -c github-check-preview-env url ${url}/workspaces/`);
     }
 
+    werft.log(`observability`, "Running observability static checks.")
+    observabilityStaticChecks()
     werft.log(`observability`, "Installing monitoring-satellite...")
     if (deploymentConfig.withObservability) {
         await installMonitoring();
@@ -424,8 +426,8 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
         flags += ` --set components.registryFacade.ports.registry.servicePort=${registryNodePortMeta}`;
 
         const nodeAffinityValues = [
-            "values.nodeAffinities_0.yaml",
-            "values.nodeAffinities_1.yaml"
+            "values.nodeAffinities_2.yaml",
+            "values.nodeAffinities_3.yaml",
         ]
 
         if (k3sWsCluster) {
@@ -477,8 +479,8 @@ export async function deployToDev(deploymentConfig: DeploymentConfig, workspaceF
     function addDeploymentFlags() {
         let flags = ""
         flags += ` --namespace ${namespace}`;
-        flags += ` --set components.imageBuilder.hostDindData=/mnt/disks/ssd0/docker-${namespace}`;
-        flags += ` --set components.wsDaemon.hostWorkspaceArea=/mnt/disks/ssd0/workspaces-${namespace}`;
+        flags += ` --set components.imageBuilder.hostDindData=/mnt/disks/raid0/docker-${namespace}`;
+        flags += ` --set components.wsDaemon.hostWorkspaceArea=/mnt/disks/raid0/workspaces-${namespace}`;
         flags += ` --set version=${version}`;
         flags += ` --set hostname=${domain}`;
         flags += ` --set devBranch=${destname}`;
@@ -686,7 +688,7 @@ async function publishHelmChart(imageRepoBase, version) {
     werft.phase("publish-charts", "Publish charts");
     [
         "gcloud config set project gitpod-io",
-        `leeway build -Dversion=${version} -DimageRepoBase=${imageRepoBase} --save helm-repo.tar.gz chart:helm`,
+        `leeway build --docker-build-options network=host -Dversion=${version} -DimageRepoBase=${imageRepoBase} --save helm-repo.tar.gz chart:helm`,
         "tar xzfv helm-repo.tar.gz",
         "mkdir helm-repo",
         "cp gitpod*tgz helm-repo/",

@@ -57,6 +57,7 @@ export namespace Project {
 export interface PrebuildWithStatus {
     info: PrebuildInfo;
     status: PrebuiltWorkspaceState;
+    error?: string;
 }
 
 export interface PrebuildInfo {
@@ -93,7 +94,6 @@ export namespace PrebuildInfo {
 export interface StartPrebuildResult {
     wsid: string;
     done: boolean;
-    didFinish?: boolean;
 }
 
 export interface Team {
@@ -101,6 +101,7 @@ export interface Team {
     name: string;
     slug: string;
     creationTime: string;
+    markedDeleted?: boolean;
     /** This is a flag that triggers the HARD DELETION of this entity */
     deleted?: boolean;
 }

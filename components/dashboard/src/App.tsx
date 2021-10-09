@@ -34,6 +34,7 @@ const CreateWorkspace = React.lazy(() => import(/* webpackPrefetch: true */ './s
 const NewTeam = React.lazy(() => import(/* webpackPrefetch: true */ './teams/NewTeam'));
 const JoinTeam = React.lazy(() => import(/* webpackPrefetch: true */ './teams/JoinTeam'));
 const Members = React.lazy(() => import(/* webpackPrefetch: true */ './teams/Members'));
+const TeamSettings = React.lazy(() => import(/* webpackPrefetch: true */ './teams/TeamSettings'));
 const NewProject = React.lazy(() => import(/* webpackPrefetch: true */ './projects/NewProject'));
 const ConfigureProject = React.lazy(() => import(/* webpackPrefetch: true */ './projects/ConfigureProject'));
 const Projects = React.lazy(() => import(/* webpackPrefetch: true */ './projects/Projects'));
@@ -84,6 +85,22 @@ function App() {
                 setUser(user);
 
                 const teams = await teamsPromise;
+
+                {
+                    // if a team was selected previously and we call the root URL (e.g. "gitpod.io"),
+                    // let's continue with the team page
+                    const hash = getURLHash();
+                    const isRoot = window.location.pathname === '/' && hash === '';
+                    if (isRoot) {
+                        try {
+                            const teamSlug = localStorage.getItem('team-selection');
+                            if (teams.some(t => t.slug === teamSlug)) {
+                                history.push(`/t/${teamSlug}`);
+                            }
+                        } catch {
+                        }
+                    }
+                }
                 setTeams(teams);
             } catch (error) {
                 console.error(error);
@@ -249,6 +266,9 @@ function App() {
                         if (resourceOrPrebuild === "configure") {
                             return <ConfigureProject />;
                         }
+                        if (resourceOrPrebuild === "workspaces") {
+                            return <Workspaces />;
+                        }
                         if (resourceOrPrebuild === "prebuilds") {
                             return <Prebuilds />;
                         }
@@ -260,27 +280,37 @@ function App() {
                     <Route exact path="/teams/new" component={NewTeam} />
                     <Route exact path="/teams/join" component={JoinTeam} />
                 </Route>
-                {(teams || []).map(team => <Route path={`/t/${team.slug}`}>
-                    <Route exact path={`/t/${team.slug}`}>
-                        <Redirect to={`/t/${team.slug}/projects`} />
-                    </Route>
-                    <Route exact path={`/t/${team.slug}/:maybeProject/:resourceOrPrebuild?`} render={(props) => {
-                        const { maybeProject, resourceOrPrebuild } = props.match.params;
-                        if (maybeProject === "projects") {
-                            return <Projects />;
-                        }
-                        if (maybeProject === "members") {
-                            return <Members />;
-                        }
-                        if (resourceOrPrebuild === "configure") {
-                            return <ConfigureProject />;
-                        }
-                        if (resourceOrPrebuild === "prebuilds") {
-                            return <Prebuilds />;
-                        }
-                        return resourceOrPrebuild ? <Prebuild /> : <Project />;
-                    }} />
-                </Route>)}
+                {(teams || []).map(team =>
+                    <Route path={`/t/${team.slug}`} key={team.slug}>
+                        <Route exact path={`/t/${team.slug}`}>
+                            <Redirect to={`/t/${team.slug}/workspaces`} />
+                        </Route>
+                        <Route exact path={`/t/${team.slug}/:maybeProject/:resourceOrPrebuild?`} render={(props) => {
+                            const { maybeProject, resourceOrPrebuild } = props.match.params;
+                            if (maybeProject === "projects") {
+                                return <Projects />;
+                            }
+                            if (maybeProject === "workspaces") {
+                                return <Workspaces />;
+                            }
+                            if (maybeProject === "members") {
+                                return <Members />;
+                            }
+                            if (maybeProject === "settings") {
+                                return <TeamSettings />;
+                            }
+                            if (resourceOrPrebuild === "configure") {
+                                return <ConfigureProject />;
+                            }
+                            if (resourceOrPrebuild === "workspaces") {
+                                return <Workspaces />;
+                            }
+                            if (resourceOrPrebuild === "prebuilds") {
+                                return <Prebuilds />;
+                            }
+                            return resourceOrPrebuild ? <Prebuild /> : <Project />;
+                        }} />
+                    </Route>)}
                 <Route path="*" render={
                     (_match) => {
 

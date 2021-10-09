@@ -20,6 +20,9 @@ service WorkspaceManager {
     // describeWorkspace investigates a workspace and returns its status, and configuration
     rpc DescribeWorkspace(DescribeWorkspaceRequest) returns (DescribeWorkspaceResponse) {}
 
+    // backupWorkspace backs up a running workspace
+    rpc BackupWorkspace(BackupWorkspaceRequest) returns (BackupWorkspaceResponse) {}
+
     // subscribe streams all status updates to a client
     rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse) {}
 
@@ -214,10 +217,29 @@ enum AdmissionLevel {
     ADMIT_EVERYONE = 1;
 }
 
+// BackupWorkspaceRequest backs up a running workspace
+message BackupWorkspaceRequest {
+    // ID is the unique identifier of the workspace of which to take a backup
+    string id = 1;
+}
+
+// BackupWorkspaceResponse is the answer to a backup workspace request
+message BackupWorkspaceResponse {
+    // URL is the location of the backup
+    string url = 1;
+}
+
 // WorkspaceStatus describes a workspace status
 message WorkspaceStatus {
     // ID is the unique identifier of the workspace
     string id = 1;
+
+    // version of the status update. Workspace instances themselves are unversioned,
+    // but their statuus has different versions.
+    // The value of this field has no semantic meaning (e.g. don't interpret it as
+    // as a timestemp), but it can be used to impose a partial order.
+    // If a.status_version < b.status_version then a was the status before b.
+    uint64 status_version = 10;
 
     // Metadata is data associated with this workspace that's required for other parts of Gitpod to function
     WorkspaceMetadata metadata = 2;

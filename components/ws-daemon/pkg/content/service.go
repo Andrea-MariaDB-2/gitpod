@@ -5,17 +5,13 @@
 package content
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -24,12 +20,9 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
@@ -42,6 +35,7 @@ import (
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/container"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/internal/session"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/iws"
+	"github.com/gitpod-io/gitpod/ws-daemon/pkg/quota"
 )
 
 // WorkspaceService implements the InitService and WorkspaceService
@@ -72,8 +66,13 @@ func NewWorkspaceService(ctx context.Context, cfg Config, kubernetesNamespace st
 		return nil, xerrors.Errorf("cannot create working area: %w", err)
 	}
 
+	xfs, err := quota.NewXFS(cfg.WorkingArea)
+	if err != nil {
+		return nil, err
+	}
+
 	// read all session json files
-	store, err := session.NewStore(ctx, cfg.WorkingArea, workspaceLifecycleHooks(cfg, kubernetesNamespace, wec, uidmapper))
+	store, err := session.NewStore(ctx, cfg.WorkingArea, workspaceLifecycleHooks(cfg, kubernetesNamespace, wec, uidmapper, xfs))
 	if err != nil {
 		return nil, xerrors.Errorf("cannot create session store: %w", err)
 	}
@@ -263,10 +262,15 @@ func (s *WorkspaceService) creator(req *api.InitWorkspaceRequest) session.Worksp
 			ContentManifest:       req.ContentManifest,
 			RemoteStorageDisabled: req.RemoteStorageDisabled,
 
-			ServiceLocDaemon: filepath.Join(s.config.WorkingArea, req.Id+"-daemon"),
-			ServiceLocNode:   filepath.Join(s.config.WorkingAreaNode, req.Id+"-daemon"),
+			ServiceLocDaemon: filepath.Join(s.config.WorkingArea, ServiceDirName(req.Id)),
+			ServiceLocNode:   filepath.Join(s.config.WorkingAreaNode, ServiceDirName(req.Id)),
 		}, nil
 	}
+}
+
+// ServiceDirName produces the directory name for a workspace
+func ServiceDirName(instanceID string) string {
+	return instanceID + "-daemon"
 }
 
 // getCheckoutLocation returns the first checkout location found of any Git initializer configured by this request
@@ -324,6 +328,10 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 	}
 
 	if req.BackupLogs {
+		if sess.RemoteStorageDisabled {
+			return nil, status.Errorf(codes.FailedPrecondition, "workspace has no remote storage")
+		}
+
 		// Ok, we have to do all the work
 		err = s.uploadWorkspaceLogs(ctx, sess)
 		if err != nil {
@@ -370,16 +378,6 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 		return nil, status.Error(codes.Internal, "cannot delete workspace from store")
 	}
 
-	// Important:
-	// If ws-daemon is killed or restarts, the new ws-daemon pod mount table contains the
-	// node's current state, i.e., it has all the running workspaces running in the node.
-	// Unmounting the mark in Teardown (nsenter) works from inside the workspace,
-	// but the mount is still present in ws-daemon mount table. Unmounting the mark from
-	// ws-daemon is required to ensure the proper termination of the workspace pod.
-	if err := unmountMark(sess.ServiceLocDaemon); err != nil {
-		log.WithError(err).WithField("workspaceId", req.Id).Error("cannot unmount mark mount")
-	}
-
 	// remove workspace daemon directory in the node
 	if err := os.RemoveAll(sess.ServiceLocDaemon); err != nil {
 		log.WithError(err).WithField("workspaceId", req.Id).Error("cannot delete workspace daemon directory")
@@ -391,6 +389,11 @@ func (s *WorkspaceService) DisposeWorkspace(ctx context.Context, req *api.Dispos
 func (s *WorkspaceService) uploadWorkspaceContent(ctx context.Context, sess *session.Workspace, backupName, mfName string) (err error) {
 	//nolint:ineffassign
 	span, ctx := opentracing.StartSpanFromContext(ctx, "uploadWorkspaceContent")
+	span.SetTag("workspace", sess.WorkspaceID)
+	span.SetTag("instance", sess.InstanceID)
+	span.SetTag("backup", backupName)
+	span.SetTag("manifest", mfName)
+	span.SetTag("full", sess.FullWorkspaceBackup)
 	defer tracing.FinishSpan(span, &err)
 
 	var (
@@ -714,6 +717,56 @@ func (s *WorkspaceService) TakeSnapshot(ctx context.Context, req *api.TakeSnapsh
 	}, nil
 }
 
+// BackupWorkspace creates a backup of a workspace, if possible
+func (s *WorkspaceService) BackupWorkspace(ctx context.Context, req *api.BackupWorkspaceRequest) (res *api.BackupWorkspaceResponse, err error) {
+	//nolint:ineffassign
+	span, ctx := opentracing.StartSpanFromContext(ctx, "BackupWorkspace")
+	span.SetTag("workspace", req.Id)
+	defer tracing.FinishSpan(span, &err)
+
+	sess := s.store.Get(req.Id)
+	if sess == nil {
+		// TODO(rl): do we want to fake a session just to see if we can access the location
+		// Potentiall fragile but we are probably using the backup in dire straits :shrug:
+		// i.e. location = /mnt/disks/ssd0/workspaces- + req.Id
+		// It would also need to setup the remote storagej
+		// ... but in the worse case we *could* backup locally and then upload manually
+		return nil, status.Error(codes.NotFound, "workspace does not exist")
+	}
+	if sess.RemoteStorageDisabled {
+		return nil, status.Errorf(codes.FailedPrecondition, "workspace has no remote storage")
+	}
+	rs, ok := sess.NonPersistentAttrs[session.AttrRemoteStorage].(storage.DirectAccess)
+	if rs == nil || !ok {
+		log.WithFields(sess.OWI()).WithError(err).Error("cannot take backup: no remote storage configured")
+		return nil, status.Error(codes.Internal, "workspace has no remote storage")
+	}
+
+	backupName := storage.DefaultBackup
+	var mfName = storage.DefaultBackupManifest
+	// TODO: do we want this always in the worse case?
+	if sess.FullWorkspaceBackup {
+		backupName = fmt.Sprintf(storage.FmtFullWorkspaceBackup, time.Now().UnixNano())
+	}
+	log.WithField("workspaceId", sess.WorkspaceID).WithField("instanceID", sess.InstanceID).WithField("backupName", backupName).Info("backing up")
+
+	err = s.uploadWorkspaceContent(ctx, sess, backupName, mfName)
+	if err != nil {
+		log.WithError(err).WithFields(sess.OWI()).Error("final backup failed")
+		return nil, status.Error(codes.DataLoss, "final backup failed")
+	}
+
+	var qualifiedName string
+	if sess.FullWorkspaceBackup {
+		qualifiedName = rs.Qualify(mfName)
+	} else {
+		qualifiedName = rs.Qualify(backupName)
+	}
+	return &api.BackupWorkspaceResponse{
+		Url: qualifiedName,
+	}, nil
+}
+
 // Close ends this service and its housekeeping
 func (s *WorkspaceService) Close() error {
 	s.stopService()
@@ -751,84 +804,4 @@ func (c *cannotCancelContext) Err() error {
 
 func (c *cannotCancelContext) Value(key interface{}) interface{} {
 	return c.Delegate.Value(key)
-}
-
-func workspaceLifecycleHooks(cfg Config, kubernetesNamespace string, workspaceExistenceCheck WorkspaceExistenceCheck, uidmapper *iws.Uidmapper) map[session.WorkspaceState][]session.WorkspaceLivecycleHook {
-	var setupWorkspace session.WorkspaceLivecycleHook = func(ctx context.Context, ws *session.Workspace) error {
-		if _, ok := ws.NonPersistentAttrs[session.AttrRemoteStorage]; !ws.RemoteStorageDisabled && !ok {
-			remoteStorage, err := storage.NewDirectAccess(&cfg.Storage)
-			if err != nil {
-				return xerrors.Errorf("cannot use configured storage: %w", err)
-			}
-
-			err = remoteStorage.Init(ctx, ws.Owner, ws.WorkspaceID, ws.InstanceID)
-			if err != nil {
-				return xerrors.Errorf("cannot use configured storage: %w", err)
-			}
-
-			err = remoteStorage.EnsureExists(ctx)
-			if err != nil {
-				return xerrors.Errorf("cannot use configured storage: %w", err)
-			}
-
-			ws.NonPersistentAttrs[session.AttrRemoteStorage] = remoteStorage
-		}
-
-		return nil
-	}
-
-	// startIWS starts the in-workspace service for a workspace. This lifecycle hook is idempotent, hence can - and must -
-	// be called on initialization and ready. The on-ready hook exists only to support ws-daemon restarts.
-	startIWS := iws.ServeWorkspace(uidmapper, api.FSShiftMethod(cfg.UserNamespaces.FSShift))
-
-	return map[session.WorkspaceState][]session.WorkspaceLivecycleHook{
-		session.WorkspaceInitializing: {setupWorkspace, startIWS},
-		session.WorkspaceReady:        {setupWorkspace, startIWS},
-		session.WorkspaceDisposed:     {iws.StopServingWorkspace},
-	}
-}
-
-// if the mark mount still exists in /proc/mounts it means we failed to unmount it and
-// we cannot remove the content. As a side effect the pod will stay in Terminating state
-func unmountMark(dir string) error {
-	mounts, err := ioutil.ReadFile("/proc/mounts")
-	if err != nil {
-		return xerrors.Errorf("cannot read /proc/mounts: %w", err)
-	}
-
-	path := fromPartialMount(filepath.Join(dir, "mark"), mounts)
-	// empty path means no mount found
-	if path == "" {
-		return nil
-	}
-
-	// in some scenarios we need to wait for the unmount
-	var errorFn = func(err error) bool {
-		return strings.Contains(err.Error(), "device or resource busy")
-	}
-
-	return retry.OnError(wait.Backoff{
-		Steps:    5,
-		Duration: 1 * time.Second,
-		Factor:   5.0,
-		Jitter:   0.1,
-	}, errorFn, func() error {
-		return unix.Unmount(path, 0)
-	})
-}
-
-func fromPartialMount(path string, info []byte) string {
-	scanner := bufio.NewScanner(bytes.NewReader(info))
-	for scanner.Scan() {
-		mount := strings.Split(scanner.Text(), " ")
-		if len(mount) < 2 {
-			continue
-		}
-
-		if strings.Contains(mount[1], path) {
-			return mount[1]
-		}
-	}
-
-	return ""
 }
