@@ -2,7 +2,7 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License-AGPL.txt in the project root for license information.
 
-FROM moby/buildkit:v0.9.0
+FROM moby/buildkit:v0.9.3
 
 USER root
 RUN apk --no-cache add sudo bash \
@@ -11,6 +11,11 @@ RUN apk --no-cache add sudo bash \
     && echo "gitpod ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gitpod \
     && chmod 0440 /etc/sudoers.d/gitpod
 
+COPY components-image-builder-bob--runc-facade/bob /app/runc-facade
+RUN chmod 4755 /app/runc-facade \
+    && mv /usr/bin/buildkit-runc /usr/bin/bob-runc \
+    && mv /app/runc-facade /usr/bin/buildkit-runc
+
 COPY components-image-builder-bob--app/bob /app/
 RUN chmod 4755 /app/bob
 
@@ -18,6 +23,11 @@ RUN mkdir /ide
 COPY ide-startup.sh /ide/startup.sh
 COPY supervisor-ide-config.json /ide/
 
+ARG __GIT_COMMIT
+ARG VERSION
+
+ENV GITPOD_BUILD_GIT_COMMIT=${__GIT_COMMIT}
+ENV GITPOD_BUILD_VERSION=${VERSION}
 # sudo buildctl-daemonless.sh
 ENTRYPOINT [ "/app/bob" ]
 CMD [ "build" ]

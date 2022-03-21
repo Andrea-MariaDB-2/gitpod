@@ -4,7 +4,7 @@ labels: "bug"
 body:
 - type: markdown
   attributes:
-    value: Before raising an issue, please search for existing issues to avoid creating duplicates. For questions and support please use the [community forum](https://community.gitpod.io/).
+    value: Before raising an issue, please search for existing issues to avoid creating duplicates. For questions and support please use [Discord](https://www.gitpod.io/chat).
 - type: textarea
   id: bug-description
   attributes:
@@ -19,6 +19,12 @@ body:
     description: Describe the steps to reproduce the issue
   validations:
     required: true
+- type: input
+  id: workspace
+  attributes:
+    label: Workspace affected
+    description: Does this issue affect a specific workspace?
+    placeholder: e.g. kumquat-goose-831fpnxf
 - type: textarea
   id: expected-behavior
   attributes:

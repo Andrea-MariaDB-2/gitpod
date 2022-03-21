@@ -36,8 +36,4 @@ export USER=gitpod
 grep -rl open-vsx.org /ide | xargs sed -i "s|https://open-vsx.org|$VSX_REGISTRY_URL|g"
 
 cd /ide || exit
-if [ "$SUPERVISOR_DEBUG_ENABLE" = "true" ]; then
-    exec /ide/node --inspect ./out/gitpod.js "$@" --verbose --log=trace
-else
-    exec /ide/node ./out/gitpod.js "$@"
-fi
+exec /ide/codehelper "$@"

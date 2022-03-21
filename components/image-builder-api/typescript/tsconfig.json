@@ -15,12 +15,13 @@
         "downlevelIteration": true,
         "module": "commonjs",
         "moduleResolution": "node",
-        "target": "es5",
+        "target": "es6",
         "jsx": "react",
         "sourceMap": true,
         "declaration": true,
         "declarationMap": true,
-        "skipLibCheck": true
+        "skipLibCheck": true,
+        "useUnknownInCatchVariables": false
     },
     "include": [
         "src"

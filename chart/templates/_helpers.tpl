@@ -208,6 +208,8 @@ env:
 {{- $gp := .gp -}}
 - name: DB_HOST
   value: "{{ $gp.db.host }}"
+- name: DB_USERNAME
+  value: "{{ $gp.db.username }}"
 - name: DB_PORT
   value: "{{ $gp.db.port }}"
 - name: DB_PASSWORD
@@ -257,9 +259,9 @@ env:
 {{- $comp := .comp -}}
 {{- $tracing := $comp.tracing | default $gp.tracing -}}
 {{- if $tracing }}
-{{- if $tracing.endoint }}
+{{- if $tracing.endpoint }}
 - name: JAEGER_ENDPOINT
-  value: {{ $tracing.endoint }}
+  value: {{ $tracing.endpoint }}
 {{- else }}
 - name: JAEGER_AGENT_HOST
   valueFrom:
@@ -270,6 +272,9 @@ env:
   value: {{ $tracing.samplerType }}
 - name: JAEGER_SAMPLER_PARAM
   value: "{{ $tracing.samplerParam }}"
+{{- else }}
+- name: JAEGER_DISABLED
+  value: "true"
 {{- end }}
 {{- end -}}
 
@@ -306,6 +311,13 @@ registry.{{ .Values.hostname }}
 {{- $gp := .gp -}}
 {{- $comp := .comp -}}
 {{ template "gitpod.comp.imageRepo" . }}:{{- template "gitpod.comp.version" . -}}
+{{- end -}}
+
+{{- define "gitpod.comp.imageLatest" -}}
+{{- $ := .root -}}
+{{- $gp := .gp -}}
+{{- $comp := .comp -}}
+{{ template "gitpod.comp.imageRepo" . }}:latest
 {{- end -}}
 
 {{- define "gitpod.comp.configMap" -}}

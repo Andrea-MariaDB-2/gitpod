@@ -9,14 +9,13 @@ import { AuthProviderEntry as AuthProviderEntry, User } from "@gitpod/gitpod-pro
 import { AuthProviderParams } from "./auth-provider";
 import { AuthProviderEntryDB } from "@gitpod/gitpod-db/lib";
 import { Config } from "../config";
-import * as uuidv4 from 'uuid/v4';
+import { v4 as uuidv4 } from "uuid";
 import { oauthUrls as githubUrls } from "../github/github-urls";
 import { oauthUrls as gitlabUrls } from "../gitlab/gitlab-urls";
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 
 @injectable()
 export class AuthProviderService {
-
     @inject(AuthProviderEntryDB)
     protected authProviderDB: AuthProviderEntryDB;
 
@@ -26,34 +25,41 @@ export class AuthProviderService {
     /**
      * Returns all auth providers.
      */
-    async getAllAuthProviders(): Promise<AuthProviderParams[]> {
-        const all = await this.authProviderDB.findAll();
+    async getAllAuthProviders(exceptOAuthRevisions: string[] = []): Promise<AuthProviderParams[]> {
+        const all = await this.authProviderDB.findAll(exceptOAuthRevisions);
         const transformed = all.map(this.toAuthProviderParams.bind(this));
 
         // as a precaution, let's remove duplicates
-        const unique = transformed.reduce((prev, current) => {
-            const duplicate = prev.some(a => a.host === current.host);
+        const unique = new Map<string, AuthProviderParams>();
+        for (const current of transformed) {
+            const duplicate = unique.get(current.host);
             if (duplicate) {
                 log.warn(`Duplicate dynamic Auth Provider detected.`, { rawResult: all, duplicate: current.host });
+                continue;
             }
-            return duplicate ? prev : [...prev, current];
-        }, [] as AuthProviderParams[]);
-        return unique;
+            unique.set(current.host, current);
+        }
+        return Array.from(unique.values());
     }
 
-    protected toAuthProviderParams = (oap: AuthProviderEntry) => <AuthProviderParams>{
-        ...oap,
-        host: oap.host.toLowerCase(),
-        verified: oap.status === "verified",
-        builtin: false,
-        // hiddenOnDashboard: true, // i.e. show only if it's used
-        loginContextMatcher: `https://${oap.host}/`,
-        oauth: {
-            ...oap.oauth,
-            clientId: oap.oauth.clientId || "no",
-            clientSecret: oap.oauth.clientSecret || "no",
-        }
-    };
+    async getAllAuthProviderHosts(): Promise<string[]> {
+        return this.authProviderDB.findAllHosts();
+    }
+
+    protected toAuthProviderParams = (oap: AuthProviderEntry) =>
+        <AuthProviderParams>{
+            ...oap,
+            host: oap.host.toLowerCase(),
+            verified: oap.status === "verified",
+            builtin: false,
+            // hiddenOnDashboard: true, // i.e. show only if it's used
+            loginContextMatcher: `https://${oap.host}/`,
+            oauth: {
+                ...oap.oauth,
+                clientId: oap.oauth.clientId || "no",
+                clientSecret: oap.oauth.clientSecret || "no",
+            },
+        };
 
     async getAuthProvidersOfUser(user: User | string): Promise<AuthProviderEntry[]> {
         const result = await this.authProviderDB.findByUserId(User.is(user) ? user.id : user);
@@ -64,31 +70,35 @@ export class AuthProviderService {
         await this.authProviderDB.delete(authProvider);
     }
 
-    async updateAuthProvider(entry: AuthProviderEntry.UpdateEntry | AuthProviderEntry.NewEntry): Promise<AuthProviderEntry> {
+    async updateAuthProvider(
+        entry: AuthProviderEntry.UpdateEntry | AuthProviderEntry.NewEntry,
+    ): Promise<AuthProviderEntry> {
         let authProvider: AuthProviderEntry;
         if ("id" in entry) {
             const { id, ownerId } = entry;
-            const existing = (await this.authProviderDB.findByUserId(ownerId)).find(p => p.id === id);
+            const existing = (await this.authProviderDB.findByUserId(ownerId)).find((p) => p.id === id);
             if (!existing) {
                 throw new Error("Provider does not exist.");
             }
-            const changed = entry.clientId !== existing.oauth.clientId
-                || (entry.clientSecret && entry.clientSecret !== existing.oauth.clientSecret);
+            const changed =
+                entry.clientId !== existing.oauth.clientId ||
+                (entry.clientSecret && entry.clientSecret !== existing.oauth.clientSecret);
 
             if (!changed) {
                 return existing;
             }
 
             // update config on demand
+            const oauth = {
+                ...existing.oauth,
+                clientId: entry.clientId,
+                clientSecret: entry.clientSecret || existing.oauth.clientSecret, // FE may send empty ("") if not changed
+            };
             authProvider = {
                 ...existing,
-                oauth: {
-                    ...existing.oauth,
-                    clientId: entry.clientId,
-                    clientSecret: entry.clientSecret || existing.oauth.clientSecret, // FE may send empty ("") if not changed
-                },
+                oauth,
                 status: "pending",
-            }
+            };
         } else {
             const existing = await this.authProviderDB.findByHost(entry.host);
             if (existing) {
@@ -96,24 +106,25 @@ export class AuthProviderService {
             }
             authProvider = this.initializeNewProvider(entry);
         }
-        return await this.authProviderDB.storeAuthProvider(authProvider as AuthProviderEntry);
+        return await this.authProviderDB.storeAuthProvider(authProvider as AuthProviderEntry, true);
     }
     protected initializeNewProvider(newEntry: AuthProviderEntry.NewEntry): AuthProviderEntry {
         const { host, type, clientId, clientSecret } = newEntry;
-        const urls = type === "GitHub" ? githubUrls(host) : (type === "GitLab" ? gitlabUrls(host) : undefined);
+        const urls = type === "GitHub" ? githubUrls(host) : type === "GitLab" ? gitlabUrls(host) : undefined;
         if (!urls) {
             throw new Error("Unexpected service type.");
         }
-        return <AuthProviderEntry>{
+        const oauth: AuthProviderEntry["oauth"] = {
+            ...urls,
+            callBackUrl: this.callbackUrl(host),
+            clientId: clientId!,
+            clientSecret: clientSecret!,
+        };
+        return {
             ...newEntry,
             id: uuidv4(),
             type,
-            oauth: {
-                ...urls,
-                callBackUrl: this.callbackUrl(host),
-                clientId,
-                clientSecret,
-            },
+            oauth,
             status: "pending",
         };
     }
@@ -127,28 +138,24 @@ export class AuthProviderService {
                 // "no-user" is the magic user id assigned during the initial setup
                 authProviders = await this.authProviderDB.findByUserId("no-user");
             }
-            ap = authProviders.find(p => p.id === id);
+            ap = authProviders.find((p) => p.id === id);
             if (ap) {
                 ap = {
                     ...ap,
                     ownerId: ownerId,
-                    status: "verified"
+                    status: "verified",
                 };
-                await this.authProviderDB.storeAuthProvider(ap);
+                await this.authProviderDB.storeAuthProvider(ap, true);
             } else {
                 log.warn("Failed to find the AuthProviderEntry to be activated.", { params, id, ap });
             }
         } catch (error) {
-            log.error("Failed to activate AuthProviderEntry.", { params, id, ap })
+            log.error("Failed to activate AuthProviderEntry.", { params, id, ap });
         }
     }
 
     protected callbackUrl = (host: string) => {
         const pathname = `/auth/${host}/callback`;
-        if (this.config.devBranch) {
-            // for example: https://staging.gitpod-dev.com/auth/mydomain.com/gitlab/callback
-            return this.config.hostUrl.withoutDomainPrefix(1).with({ pathname }).toString();
-        }
         return this.config.hostUrl.with({ pathname }).toString();
     };
 }

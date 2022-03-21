@@ -26,3 +26,19 @@ prometheus_alerts.yaml:
 .PHONY: promtool-lint
 promtool-lint: prometheus_alerts.yaml
 	promtool check rules prometheus_alerts.yaml
+
+.PHONY: vendor
+vendor:
+	jb install
+
+.PHONY: unit-tests
+unit-tests: vendor
+	@echo 'Testing alert severity labels'
+	jsonnet tests/alertsSeverityLabel.jsonnet -J vendor/
+	@echo 'Testing alert descripion annotation'
+	jsonnet tests/alertsDescriptionAnnotation.jsonnet -J vendor/
+
+.PHONY: dashboards_out
+dashboards_out:
+	@mkdir -p dashboards_out
+	jsonnet -J vendor -m dashboards_out dashboards.jsonnet

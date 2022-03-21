@@ -9,8 +9,8 @@ import { inject, injectable } from "inversify";
 import * as fs from 'fs';
 import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 import * as jwt from 'jsonwebtoken';
-import { PendingGithubEventDB, UserDB } from "@gitpod/gitpod-db/lib";
-import { GithubSubscriptionMapper, MarketplacePurchaseEvent } from "./subscription-mapper";
+import { PendingGithubEventDB, TransactionalPendingGithubEventDBFactory, UserDB } from "@gitpod/gitpod-db/lib";
+import { GithubSubscriptionMapper, MarketplaceEventAll } from "./subscription-mapper";
 import { User, Queue } from "@gitpod/gitpod-protocol";
 import { UserPaidSubscription } from "@gitpod/gitpod-protocol/lib/accounting-protocol";
 import { AccountingDB } from "@gitpod/gitpod-db/lib/accounting-db";
@@ -18,6 +18,8 @@ import { SubscriptionModel } from "../accounting/subscription-model";
 import { Plans, Plan } from "@gitpod/gitpod-protocol/lib/plans";
 import * as Webhooks from '@octokit/webhooks';
 import fetch from "node-fetch";
+import { EntityManager } from 'typeorm';
+import { repeat } from "@gitpod/gitpod-protocol/lib/util/repeat";
 
 @injectable()
 export class GithubSubscriptionReconciler {
@@ -26,17 +28,15 @@ export class GithubSubscriptionReconciler {
     @inject(AccountingDB) protected readonly accountingDB: AccountingDB;
     @inject(UserDB) protected readonly userDB: UserDB;
     @inject(Config) protected readonly config: Config;
+    @inject(TransactionalPendingGithubEventDBFactory) protected readonly transactionalFactory: TransactionalPendingGithubEventDBFactory;
     protected privateKey: string | undefined;
     protected reconciliationTasks = new Queue();
 
 
-    public async handleIncomingEvent(evt: MarketplacePurchaseEvent) {
+    public async handleIncomingEvent(evt: MarketplaceEventAll) {
         const authId: string = evt.payload.marketplace_purchase.account.id.toString();
         const user = await this.userDB.findUserByIdentity({ authProviderId: "Public-GitHub", authId });
         if (user) {
-            // This will become a performance bottleneck if we have too many operations coming in.
-            // The only reason we're enqueueing the event reconciliation here is because pollAndReconcilFromGithub does
-            // not run in a transaction. Maybe we should do that instead.
             await this.reconciliationTasks.enqueue(() => this.reconcileEvent(user, evt));
         } else {
             log.error("Received GitHub marketplace purchase event for an unknown user. Storing for later use.", {evt});
@@ -55,8 +55,10 @@ export class GithubSubscriptionReconciler {
         for (const evt of pendingPurchaseEvents) {
             try {
                 const githubEvt = JSON.parse(evt.event);
-                await this.reconcileEvent(evt.identity.user, githubEvt);
-                await this.pendingEventsDB.delete(evt);
+                await this.reconcileEvent(evt.identity.user, githubEvt, async (em: EntityManager) => {
+                    const pendingEventsDB = this.transactionalFactory(em);
+                    await pendingEventsDB.delete(evt);
+                });
                 log.debug({userId: evt.identity.user.id}, "followed up on pending purchasing event", {evt});
             } catch(err) {
                 log.debug("could not follow up on pending event", err);
@@ -94,6 +96,10 @@ export class GithubSubscriptionReconciler {
                     'User-Agent': 'gitpod/payment'
                 }
             });
+            if (!resp.ok) {
+                log.error(`Error getting accounts for plan ${plan.name} from GitHub: '${resp.statusText}'`, { plan, statusText: resp.statusText, status: resp.status });
+                break;
+            }
 
             const items: MarketplaceAccountListing[] = JSON.parse(await resp.text());
             if (items.length == 0) {
@@ -165,11 +171,7 @@ export class GithubSubscriptionReconciler {
 
             if (model) {
                 // we have some changes that we need to write to the database
-                const delta = model.getResult();
-                await Promise.all([
-                    ...delta.updates.map(s => this.accountingDB.storeSubscription(s)),
-                    ...delta.inserts.map(s => this.accountingDB.newSubscription(s))
-                ]);
+                await this.persistModel(model);
             }
         }
 
@@ -192,18 +194,14 @@ export class GithubSubscriptionReconciler {
                 // We have an active subscription, but not for this plan. Let's change to new plan.
                 const model = new SubscriptionModel(sub.userId, [ sub ]);
                 this.subscriptionMapper.mapSubscriptionCancel(sub.userId, new Date().toISOString(), model);
-                const delta = model.getResult();
-                await Promise.all([
-                    ...delta.updates.map(s => this.accountingDB.storeSubscription(s)),
-                    ...delta.inserts.map(s => this.accountingDB.newSubscription(s))
-                ]);
+                await this.persistModel(model);
             }
         }
     }
 
     public start() {
-        setInterval(() => this.reconciliationTasks.enqueue(() => this.reconcilePendingEvents()), 1 * 60 * 1000); // every one minute
-        setInterval(() => this.reconciliationTasks.enqueue(async () => {
+        repeat(() => this.reconciliationTasks.enqueue(() => this.reconcilePendingEvents()), 1 * 60 * 1000); // every one minute
+        repeat(() => this.reconciliationTasks.enqueue(async () => {
             try {
                 // it's important we reconcile the latest pending events first before attempting to interpret GitHub's information.
                 await this.reconcilePendingEvents();
@@ -215,27 +213,30 @@ export class GithubSubscriptionReconciler {
         }), 24 * 60 * 1000); // once a day
     }
 
-    public async reconcileEvent(user: User, evt: MarketplacePurchaseEvent) {
+    public async reconcileEvent(user: User, evt: MarketplaceEventAll, runInTransaction?: (manager: EntityManager) => Promise<void>) {
         const userId = user.id;
-        await this.accountingDB.transaction(async db => {
-            const subscriptions = await db.findAllSubscriptionsForUser(userId);
-            const userPaidSubscriptions = subscriptions.filter(s => UserPaidSubscription.is(s) && s.paymentReference.startsWith("github:"));
+        const subscriptions = await this.accountingDB.findAllSubscriptionsForUser(userId);
+        const userPaidSubscriptions = subscriptions.filter(s => UserPaidSubscription.is(s) && s.paymentReference.startsWith("github:"));
 
-            const model = new SubscriptionModel(userId, userPaidSubscriptions);
-            const success = await this.subscriptionMapper.map(evt, model);
-            if (!success) {
-                log.debug({userId}, "subscription mapper did not succeed for GitHub market purchase event. See errors above.", { evt });
-                return;
-            }
-
-            const delta = model.getResult();
-            await Promise.all([
-                ...delta.updates.map(s => db.storeSubscription(s)),
-                ...delta.inserts.map(s => db.newSubscription(s))
-            ]);
-        });
+        const model = new SubscriptionModel(userId, userPaidSubscriptions);
+        const success = await this.subscriptionMapper.map(evt, model);
+        if (!success) {
+            log.debug({userId}, "subscription mapper did not succeed for GitHub market purchase event. See errors above.", { evt });
+            return;
+        }
+        await this.persistModel(model, runInTransaction);
     }
 
+    async persistModel(model: SubscriptionModel, runInTransaction?: ((manager: EntityManager) => Promise<void>)) {
+        const closures = runInTransaction ? [runInTransaction] : [];
+        const delta = model.getResult();
+        await this.accountingDB.transaction(async db => {
+            await Promise.all([
+                ...delta.updates.map(s => db.storeSubscription(s)),
+                ...delta.inserts.map(s => db.newSubscription(s)),
+            ]);
+        }, closures);
+    }
 }
 
 
@@ -265,5 +266,5 @@ interface MarketplaceAccountListing {
     login: string;
     email?: string;
     marketplace_pending_change?: any; // this seems broken on the GitHub side
-    marketplace_purchase: Webhooks.EventPayloads.WebhookPayloadMarketplacePurchaseMarketplacePurchase;
+    marketplace_purchase: Webhooks.EmitterWebhookEvent<"marketplace_purchase">["payload"];
 }

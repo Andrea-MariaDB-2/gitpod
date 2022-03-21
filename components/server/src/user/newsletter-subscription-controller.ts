@@ -4,7 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import * as express from 'express';
+import * as express from "express";
 import { inject, injectable } from "inversify";
 import { UserDB } from "@gitpod/gitpod-db/lib";
 import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
@@ -18,23 +18,28 @@ export class NewsletterSubscriptionController {
         const router = express.Router();
 
         router.get("/unsubscribe", async (req: express.Request, res: express.Response) => {
-            const email: string = req.query.email;
-            const newsletterType: string = req.query.type;
+            const email: string | undefined = req.query.email?.toString();
+            const newsletterType: string | undefined = req.query.type?.toString();
+            if (!email || !newsletterType) {
+                res.sendStatus(400);
+                return;
+            }
+
             const acceptedNewsletterTypes: string[] = ["changelog", "devx", "onboarding"];
-            const newsletterProperties: {[key:string]: {[key: string]: string}} = {
+            const newsletterProperties: { [key: string]: { [key: string]: string } } = {
                 changelog: {
                     property: "unsubscribed_changelog",
-                    value: "allowsChangelogMail"
+                    value: "allowsChangelogMail",
                 },
                 devx: {
                     property: "unsubscribed_devx",
-                    value: "allowsDevXMail"
+                    value: "allowsDevXMail",
                 },
                 onboarding: {
                     property: "unsubscribed_onboarding",
-                    value: "allowsOnboardingMail"
-                }
-            }
+                    value: "allowsOnboardingMail",
+                },
+            };
 
             if (!acceptedNewsletterTypes.includes(newsletterType)) {
                 res.sendStatus(422);
@@ -45,7 +50,7 @@ export class NewsletterSubscriptionController {
                 // Not all newsletter subscribers are users,
                 // therefore the email address is our starting point
                 const user = (await this.userDb.findUsersByEmail(email))[0];
-                const successPageUrl: string = 'https://www.gitpod.io/unsubscribe';
+                const successPageUrl: string = "https://www.gitpod.io/unsubscribe";
 
                 if (user && user.additionalData && user.additionalData.emailNotificationSettings) {
                     await this.userDb.updateUserPartial({
@@ -54,36 +59,34 @@ export class NewsletterSubscriptionController {
                             ...user.additionalData,
                             emailNotificationSettings: {
                                 ...user.additionalData.emailNotificationSettings,
-                                [newsletterProperties[newsletterType].value]: false
-                            }
-                        }
+                                [newsletterProperties[newsletterType].value]: false,
+                            },
+                        },
                     });
                     this.analytics.identify({
                         userId: user.id,
                         traits: {
-                            [newsletterProperties[newsletterType].property]: true
-                        }
+                            [newsletterProperties[newsletterType].property]: true,
+                        },
                     });
                     res.redirect(successPageUrl);
-                }
-
-                else {
+                } else {
                     this.analytics.identify({
                         userId: email,
                         traits: {
-                            [newsletterProperties[newsletterType].property]: true
-                        }
+                            [newsletterProperties[newsletterType].property]: true,
+                        },
                     });
                     res.redirect(successPageUrl);
                 }
             } catch (error) {
                 res.send({
                     err: error.status,
-                    message: error.message
+                    message: error.message,
                 });
                 return;
             }
-        })
+        });
 
         return router;
     }

@@ -5,20 +5,27 @@
  */
 
 import { PrebuiltWorkspaceState } from "./protocol";
-import uuidv4 = require("uuid/v4");
+import { v4 as uuidv4 } from "uuid";
+import { DeepPartial } from "./util/deep-partial";
 
 export interface ProjectConfig {
-    '.gitpod.yml': string;
+    ".gitpod.yml": string;
+}
+
+export interface ProjectSettings {
+    useIncrementalPrebuilds?: boolean;
 }
 
 export interface Project {
     id: string;
     name: string;
+    slug?: string;
     cloneUrl: string;
     teamId?: string;
     userId?: string;
     appInstallationId: string;
     config?: ProjectConfig;
+    settings?: ProjectSettings;
     creationTime: string;
     /** This is a flag that triggers the HARD DELETION of this entity */
     deleted?: boolean;
@@ -26,16 +33,22 @@ export interface Project {
 }
 
 export namespace Project {
-    export const create = (project: Omit<Project, 'id' | 'creationTime'>): Project => {
+    export const create = (project: Omit<Project, "id" | "creationTime">): Project => {
         return {
             ...project,
             id: uuidv4(),
-            creationTime: new Date().toISOString()
+            creationTime: new Date().toISOString(),
         };
-    }
+    };
 
     export interface Overview {
-        branches: BranchDetails[]
+        branches: BranchDetails[];
+    }
+
+    export namespace Overview {
+        export function is(data?: any): data is Project.Overview {
+            return Array.isArray(data?.branches);
+        }
     }
 
     export interface BranchDetails {
@@ -54,6 +67,8 @@ export namespace Project {
     }
 }
 
+export type PartialProject = DeepPartial<Project> & Pick<Project, "id">;
+
 export interface PrebuildWithStatus {
     info: PrebuildInfo;
     status: PrebuiltWorkspaceState;
@@ -63,6 +78,7 @@ export interface PrebuildWithStatus {
 export interface PrebuildInfo {
     id: string;
     buildWorkspaceId: string;
+    basedOnPrebuildId?: string;
 
     teamId?: string;
     userId?: string;
@@ -87,11 +103,12 @@ export interface PrebuildInfo {
 }
 export namespace PrebuildInfo {
     export function is(data?: any): data is PrebuildInfo {
-        return typeof data === "object" && ["id", "buildWorkspaceId", "projectId", "branch"].every(p => p in data);
+        return typeof data === "object" && ["id", "buildWorkspaceId", "projectId", "branch"].every((p) => p in data);
     }
 }
 
 export interface StartPrebuildResult {
+    prebuildId: string;
     wsid: string;
     done: boolean;
 }

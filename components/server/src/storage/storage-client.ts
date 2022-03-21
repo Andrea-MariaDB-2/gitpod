@@ -4,7 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-export const StorageClient = Symbol("StorageClient")
+export const StorageClient = Symbol("StorageClient");
 
 export interface StorageClient {
     // deleteUserContent deletes the bucket of a user
@@ -21,4 +21,7 @@ export interface StorageClient {
 
     // getHash produces a hash of the of storage object
     getPluginHash(bucketName: string, objectPath: string): Promise<string>;
+
+    // checks whether the specified snashot exists or not
+    workspaceSnapshotExists(ownerId: string, workspaceId: string, snapshotUrl: string): Promise<boolean>;
 }

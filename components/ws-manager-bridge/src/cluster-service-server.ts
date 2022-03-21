@@ -7,7 +7,7 @@
 import { WorkspaceDB } from '@gitpod/gitpod-db/lib/workspace-db';
 import { Queue } from '@gitpod/gitpod-protocol';
 import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { WorkspaceCluster, WorkspaceClusterDB, WorkspaceClusterState, TLSConfig, AdmissionConstraint, AdmissionConstraintHasRole, WorkspaceClusterWoTLS } from '@gitpod/gitpod-protocol/lib/workspace-cluster';
+import { WorkspaceCluster, WorkspaceClusterDB, WorkspaceClusterState, TLSConfig, AdmissionConstraint, AdmissionConstraintHasPermission, WorkspaceClusterWoTLS, AdmissionConstraintHasUserLevel, AdmissionConstraintHasMoreResources } from '@gitpod/gitpod-protocol/lib/workspace-cluster';
 import {
     ClusterServiceService,
     ClusterState,
@@ -65,24 +65,28 @@ export class ClusterService implements IClusterServiceServer {
     protected readonly queue: Queue = new Queue();
 
     public register(call: grpc.ServerUnaryCall<RegisterRequest, RegisterResponse>, callback: grpc.sendUnaryData<RegisterResponse>) {
+        log.info("requested clusters.register", getClientInfo(call))
         this.queue.enqueue(async () => {
             try {
                 // check if the name or URL are already registered/in use
                 const req = call.request.toObject();
-                await Promise.all([
-                    async () => {
-                        const oldCluster = await this.clusterDB.findByName(req.name);
-                        if (!oldCluster) {
-                            throw new GRPCError(grpc.status.ALREADY_EXISTS, `a WorkspaceCluster with name ${req.name} already exists in the DB`);
-                        }
-                    },
-                    async () => {
-                        const oldCluster = await this.clusterDB.findFiltered({ url: req.url });
-                        if (!oldCluster) {
-                            throw new GRPCError(grpc.status.ALREADY_EXISTS, `a WorkspaceCluster with url ${req.url} already exists in the DB`);
-                        }
-                    }
+
+                const clusterByNamePromise = this.clusterDB.findByName(req.name);
+                const clusterByUrlPromise = this.clusterDB.findFiltered({ url: req.url })
+
+                const [clusterByName, clusterByUrl] = await Promise.all([
+                    clusterByNamePromise,
+                    clusterByUrlPromise
                 ]);
+
+                if (!!clusterByName) {
+                    throw new GRPCError(grpc.status.ALREADY_EXISTS, `a WorkspaceCluster with name ${req.name} already exists in the DB`);
+                }
+                if (!!clusterByUrl) {
+                    if (clusterByUrl.length > 0) {
+                        throw new GRPCError(grpc.status.ALREADY_EXISTS, `a WorkspaceCluster with url ${req.url} already exists in the DB`);
+                    }
+                }
 
                 // store the ws-manager into the database
                 let perfereability = Preferability.NONE;
@@ -120,7 +124,7 @@ export class ClusterService implements IClusterServiceServer {
                     maxScore: 100,
                     govern,
                     tls,
-                    admissionConstraints
+                    admissionConstraints,
                 };
 
                 // try to connect to validate the config. Throws an exception if it fails.
@@ -147,12 +151,13 @@ export class ClusterService implements IClusterServiceServer {
     }
 
     public update(call: grpc.ServerUnaryCall<UpdateRequest, UpdateResponse>, callback: grpc.sendUnaryData<UpdateResponse>) {
+        log.info("requested clusters.update", getClientInfo(call))
         this.queue.enqueue(async () => {
             try {
                 const req = call.request.toObject();
                 const cluster = await this.clusterDB.findByName(req.name);
                 if (!cluster) {
-                    throw new GRPCError(grpc.status.ALREADY_EXISTS, `a WorkspaceCluster with name ${req.name} already exists in the DB!`);
+                    throw new GRPCError(grpc.status.NOT_FOUND, `a WorkspaceCluster with name ${req.name} does not exist in the DB!`);
                 }
 
                 if (call.request.hasMaxScore()) {
@@ -164,8 +169,8 @@ export class ClusterService implements IClusterServiceServer {
                 if (call.request.hasCordoned()) {
                     cluster.state = mapCordoned(req.cordoned);
                 }
-                if (call.request.hasAdmissionConstraints()) {
-                    const mod = call.request.getAdmissionConstraints()!;
+                if (call.request.hasAdmissionConstraint()) {
+                    const mod = call.request.getAdmissionConstraint()!;
                     const c = mapAdmissionConstraint(mod.getConstraint());
                     if (!!c) {
                         if (mod.getAdd()) {
@@ -180,10 +185,16 @@ export class ClusterService implements IClusterServiceServer {
                                     case "has-feature-preview":
                                         return false;
                                     case "has-permission":
-                                        if (v.permission === (c as AdmissionConstraintHasRole).permission) {
+                                        if (v.permission === (c as AdmissionConstraintHasPermission).permission) {
                                             return false;
                                         }
                                         break;
+                                    case "has-user-level":
+                                        if (v.level === (c as AdmissionConstraintHasUserLevel).level) {
+                                            return false;
+                                        }
+                                    case "has-more-resources":
+                                        return false;
                                 }
                                 return true;
                             })
@@ -202,13 +213,15 @@ export class ClusterService implements IClusterServiceServer {
     }
 
     public deregister(call: grpc.ServerUnaryCall<DeregisterRequest, DeregisterResponse>, callback: grpc.sendUnaryData<DeregisterResponse>) {
+        log.info("requested clusters.deregister", getClientInfo(call))
         this.queue.enqueue(async () => {
             try {
                 const req = call.request.toObject();
 
                 const instances = await this.workspaceDB.findRegularRunningInstances();
                 const relevantInstances = instances.filter(i => i.region === req.name);
-                if (relevantInstances.length > 0) {
+                if (!req.force && relevantInstances.length > 0) {
+                    log.info({}, "forced cluster deregistration even though there are still instances running", {cluster: req.name});
                     throw new GRPCError(grpc.status.FAILED_PRECONDITION, `cluster is not empty (${relevantInstances.length} instances remaining)`);
                 }
 
@@ -224,6 +237,7 @@ export class ClusterService implements IClusterServiceServer {
     }
 
     public list(call: grpc.ServerUnaryCall<ListRequest, ListResponse>, callback: grpc.sendUnaryData<ListResponse>) {
+        log.info("requested clusters.list", getClientInfo(call))
         this.queue.enqueue(async () => {
             try {
                 const response = new ListResponse();
@@ -281,10 +295,16 @@ function convertToGRPC(ws: WorkspaceClusterWoTLS): ClusterStatus {
                 perm.setPermission(c.permission);
                 constraint.setHasPermission(perm);
                 break;
+            case "has-user-level":
+                constraint.setHasUserLevel(c.level);
+                break;
+            case "has-more-resources":
+                constraint.setHasMoreResources(true);
+                break;
             default:
                 return;
         }
-        clusterStatus.addAdmissionConstraints(constraint);
+        clusterStatus.addAdmissionConstraint(constraint);
     });
     return clusterStatus;
 }
@@ -303,7 +323,17 @@ function mapAdmissionConstraint(c: GRPCAdmissionConstraint | undefined): Admissi
             return;
         }
 
-        return <AdmissionConstraintHasRole>{type: "has-permission", permission};
+        return <AdmissionConstraintHasPermission>{type: "has-permission", permission};
+    }
+    if (c.hasHasUserLevel()) {
+        const level = c.getHasUserLevel();
+        if (!level) {
+            return;
+        }
+        return <AdmissionConstraintHasUserLevel>{type: "has-user-level", level };
+    }
+    if (c.hasHasMoreResources()) {
+        return <AdmissionConstraintHasMoreResources>{type: "has-more-resources"};
     }
     return;
 }
@@ -334,6 +364,21 @@ function mapToGRPCError(err: any): any {
         return new GRPCError(grpc.status.INTERNAL, err);
     }
     return err;
+}
+
+function getClientInfo(call: grpc.ServerUnaryCall<any,any>) {
+    const clientNameHeader = call.metadata.get("client-name")
+    const userAgentHeader = call.metadata.get("user-agent")
+
+    let [clientName, userAgent] = ["", ""]
+    if (clientNameHeader.length != 0) {
+        clientName = clientNameHeader[0].toString()
+    }
+    if (userAgentHeader.length != 0) {
+        userAgent = userAgentHeader[0].toString()
+    }
+    const clientIP = call.getPeer();
+    return {clientIP, clientName, userAgent}
 }
 
 // "grpc" does not allow additional methods on it's "ServiceServer"s so we have an additional wrapper here

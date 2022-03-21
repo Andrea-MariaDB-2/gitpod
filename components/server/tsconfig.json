@@ -19,7 +19,12 @@
         "sourceMap": true,
         "declaration": true,
         "declarationMap": true,
-        "skipLibCheck": true
+        "skipLibCheck": true,
+        "useUnknownInCatchVariables": false,
+        "typeRoots": [
+            "../../node_modules/@types",
+            "./ee/src/typings"
+        ]
     },
     "include": [
         "src",

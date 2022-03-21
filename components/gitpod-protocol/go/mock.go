@@ -195,21 +195,6 @@ func (mr *MockAPIInterfaceMockRecorder) GetAuthProviders(ctx interface{}) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAuthProviders", reflect.TypeOf((*MockAPIInterface)(nil).GetAuthProviders), ctx)
 }
 
-// GetBranding mocks base method.
-func (m *MockAPIInterface) GetBranding(ctx context.Context) (*Branding, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetBranding", ctx)
-	ret0, _ := ret[0].(*Branding)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// GetBranding indicates an expected call of GetBranding.
-func (mr *MockAPIInterfaceMockRecorder) GetBranding(ctx interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBranding", reflect.TypeOf((*MockAPIInterface)(nil).GetBranding), ctx)
-}
-
 // GetClientRegion mocks base method.
 func (m *MockAPIInterface) GetClientRegion(ctx context.Context) (string, error) {
 	m.ctrl.T.Helper()
@@ -540,6 +525,20 @@ func (mr *MockAPIInterfaceMockRecorder) GuessGitTokenScopes(ctx, params interfac
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GuessGitTokenScopes", reflect.TypeOf((*MockAPIInterface)(nil).GuessGitTokenScopes), ctx, params)
 }
 
+// TrackEvent indicates an expected call of TrackEvent.
+func (m *MockAPIInterface) TrackEvent(ctx context.Context, params *RemoteTrackMessage) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TrackEvent", ctx, params)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// TrackEvent indicates an expected call of TrackEvent.
+func (mr *MockAPIInterfaceMockRecorder) TrackEvent(ctx, params interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GuessGitTokenScopes", reflect.TypeOf((*MockAPIInterface)(nil).TrackEvent), ctx, params)
+}
+
 // HasPermission mocks base method.
 func (m *MockAPIInterface) HasPermission(ctx context.Context, permission *PermissionName) (bool, error) {
 	m.ctrl.T.Helper()
@@ -553,21 +552,6 @@ func (m *MockAPIInterface) HasPermission(ctx context.Context, permission *Permis
 func (mr *MockAPIInterfaceMockRecorder) HasPermission(ctx, permission interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasPermission", reflect.TypeOf((*MockAPIInterface)(nil).HasPermission), ctx, permission)
-}
-
-// InstallUserPlugins mocks base method.
-func (m *MockAPIInterface) InstallUserPlugins(ctx context.Context, params *InstallPluginsParams) (bool, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "InstallUserPlugins", ctx, params)
-	ret0, _ := ret[0].(bool)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// InstallUserPlugins indicates an expected call of InstallUserPlugins.
-func (mr *MockAPIInterfaceMockRecorder) InstallUserPlugins(ctx, params interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InstallUserPlugins", reflect.TypeOf((*MockAPIInterface)(nil).InstallUserPlugins), ctx, params)
 }
 
 // InstanceUpdates mocks base method.
@@ -630,21 +614,6 @@ func (mr *MockAPIInterfaceMockRecorder) OpenPort(ctx, workspaceID, port interfac
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenPort", reflect.TypeOf((*MockAPIInterface)(nil).OpenPort), ctx, workspaceID, port)
 }
 
-// PreparePluginUpload mocks base method.
-func (m *MockAPIInterface) PreparePluginUpload(ctx context.Context, params *PreparePluginUploadParams) (string, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "PreparePluginUpload", ctx, params)
-	ret0, _ := ret[0].(string)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// PreparePluginUpload indicates an expected call of PreparePluginUpload.
-func (mr *MockAPIInterfaceMockRecorder) PreparePluginUpload(ctx, params interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PreparePluginUpload", reflect.TypeOf((*MockAPIInterface)(nil).PreparePluginUpload), ctx, params)
-}
-
 // RegisterGithubApp mocks base method.
 func (m *MockAPIInterface) RegisterGithubApp(ctx context.Context, installationID string) error {
 	m.ctrl.T.Helper()
@@ -657,21 +626,6 @@ func (m *MockAPIInterface) RegisterGithubApp(ctx context.Context, installationID
 func (mr *MockAPIInterfaceMockRecorder) RegisterGithubApp(ctx, installationID interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegisterGithubApp", reflect.TypeOf((*MockAPIInterface)(nil).RegisterGithubApp), ctx, installationID)
-}
-
-// ResolvePlugins mocks base method.
-func (m *MockAPIInterface) ResolvePlugins(ctx context.Context, workspaceID string, params *ResolvePluginsParams) (*ResolvedPlugins, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ResolvePlugins", ctx, workspaceID, params)
-	ret0, _ := ret[0].(*ResolvedPlugins)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// ResolvePlugins indicates an expected call of ResolvePlugins.
-func (mr *MockAPIInterfaceMockRecorder) ResolvePlugins(ctx, workspaceID, params interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResolvePlugins", reflect.TypeOf((*MockAPIInterface)(nil).ResolvePlugins), ctx, workspaceID, params)
 }
 
 // SendFeedback mocks base method.
@@ -804,19 +758,18 @@ func (mr *MockAPIInterfaceMockRecorder) TakeSnapshot(ctx, options interface{}) *
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TakeSnapshot", reflect.TypeOf((*MockAPIInterface)(nil).TakeSnapshot), ctx, options)
 }
 
-// UninstallUserPlugin mocks base method.
-func (m *MockAPIInterface) UninstallUserPlugin(ctx context.Context, params *UninstallPluginParams) (bool, error) {
+// WaitForSnapshot mocks base method.
+func (m *MockAPIInterface) WaitForSnapshot(ctx context.Context, snapshotId string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UninstallUserPlugin", ctx, params)
-	ret0, _ := ret[0].(bool)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
+	ret := m.ctrl.Call(m, "WaitForSnapshot", ctx, snapshotId)
+	ret0, _ := ret[0].(error)
+	return ret0
 }
 
-// UninstallUserPlugin indicates an expected call of UninstallUserPlugin.
-func (mr *MockAPIInterfaceMockRecorder) UninstallUserPlugin(ctx, params interface{}) *gomock.Call {
+// WaitForSnapshot indicates an expected call of WaitForSnapshot.
+func (mr *MockAPIInterfaceMockRecorder) WaitForSnapshot(ctx, options interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UninstallUserPlugin", reflect.TypeOf((*MockAPIInterface)(nil).UninstallUserPlugin), ctx, params)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitForSnapshot", reflect.TypeOf((*MockAPIInterface)(nil).WaitForSnapshot), ctx, options)
 }
 
 // UpdateLoggedInUser mocks base method.

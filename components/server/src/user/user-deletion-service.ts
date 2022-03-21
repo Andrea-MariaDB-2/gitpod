@@ -5,15 +5,15 @@
  */
 
 import { injectable, inject } from "inversify";
-import { UserDB, WorkspaceDB, UserStorageResourcesDB, TeamDB } from '@gitpod/gitpod-db/lib';
+import { UserDB, WorkspaceDB, UserStorageResourcesDB, TeamDB, ProjectDB } from "@gitpod/gitpod-db/lib";
 import { User, Workspace } from "@gitpod/gitpod-protocol";
 import { StorageClient } from "../storage/storage-client";
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { WorkspaceManagerClientProvider } from "@gitpod/ws-manager/lib/client-provider";
 import { StopWorkspaceRequest, StopWorkspacePolicy } from "@gitpod/ws-manager/lib";
 import { WorkspaceDeletionService } from "../workspace/workspace-deletion-service";
 import { AuthProviderService } from "../auth/auth-provider-service";
-import { IAnalyticsWriter } from '@gitpod/gitpod-protocol/lib/analytics';
+import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
 import { Config } from "../config";
 
 @injectable()
@@ -23,8 +23,10 @@ export class UserDeletionService {
     @inject(WorkspaceDB) protected readonly workspaceDb: WorkspaceDB;
     @inject(UserStorageResourcesDB) protected readonly userStorageResourcesDb: UserStorageResourcesDB;
     @inject(TeamDB) protected readonly teamDb: TeamDB;
+    @inject(ProjectDB) protected readonly projectDb: ProjectDB;
     @inject(StorageClient) protected readonly storageClient: StorageClient;
-    @inject(WorkspaceManagerClientProvider) protected readonly workspaceManagerClientProvider: WorkspaceManagerClientProvider;
+    @inject(WorkspaceManagerClientProvider)
+    protected readonly workspaceManagerClientProvider: WorkspaceManagerClientProvider;
     @inject(WorkspaceDeletionService) protected readonly workspaceDeletionService: WorkspaceDeletionService;
     @inject(AuthProviderService) protected readonly authProviderService: AuthProviderService;
     @inject(IAnalyticsWriter) protected readonly analytics: IAnalyticsWriter;
@@ -74,8 +76,12 @@ export class UserDeletionService {
             this.userStorageResourcesDb.deleteAllForUser(user.id),
             // Bucket
             this.deleteUserBucket(id),
+            // Teams owned only by this user
+            this.deleteSoleOwnedTeams(id),
             // Team memberships
             this.deleteTeamMemberships(id),
+            // User projects
+            this.deleteUserProjects(id),
         ]);
 
         // Track the deletion Event for Analytics Purposes
@@ -83,33 +89,35 @@ export class UserDeletionService {
             userId: user.id,
             event: "deletion",
             properties: {
-                "deleted_at":new Date().toISOString()
-            }
+                deleted_at: new Date().toISOString(),
+            },
         });
     }
 
     protected async stopWorkspaces(user: User) {
         const runningWorkspaces = await this.workspaceDb.findRunningInstancesWithWorkspaces(undefined, user.id);
 
-        await Promise.all(runningWorkspaces.map(async wsi => {
-            const req = new StopWorkspaceRequest();
-            req.setId(wsi.latestInstance.id);
-            req.setPolicy(StopWorkspacePolicy.NORMALLY);
+        await Promise.all(
+            runningWorkspaces.map(async (wsi) => {
+                const req = new StopWorkspaceRequest();
+                req.setId(wsi.latestInstance.id);
+                req.setPolicy(StopWorkspacePolicy.NORMALLY);
 
-            const manager = await this.workspaceManagerClientProvider.get(wsi.latestInstance.region);
-            await manager.stopWorkspace({}, req);
-        }));
+                const manager = await this.workspaceManagerClientProvider.get(wsi.latestInstance.region);
+                await manager.stopWorkspace({}, req);
+            }),
+        );
     }
 
     protected anonymizeUser(user: User) {
-        user.avatarUrl = 'deleted-avatarUrl';
-        user.fullName = 'deleted-fullName';
-        user.name = 'deleted-Name';
+        user.avatarUrl = "deleted-avatarUrl";
+        user.fullName = "deleted-fullName";
+        user.name = "deleted-Name";
     }
 
     protected deleteIdentities(user: User) {
         for (const identity of user.identities) {
-            identity.deleted = true;    // This triggers the HARD DELETION of the identity
+            identity.deleted = true; // This triggers the HARD DELETION of the identity
         }
     }
 
@@ -121,10 +129,12 @@ export class UserDeletionService {
     protected async anonymizeAllWorkspaces(userId: string) {
         const workspaces = await this.workspaceDb.findWorkspacesByUser(userId);
 
-        await Promise.all(workspaces.map(ws => async () => {
-            this.anonymizeWorkspace(ws);
-            await this.workspaceDb.store(ws);
-        }));
+        await Promise.all(
+            workspaces.map((ws) => async () => {
+                this.anonymizeWorkspace(ws);
+                await this.workspaceDb.store(ws);
+            }),
+        );
     }
 
     protected async deleteUserBucket(userId: string) {
@@ -137,14 +147,31 @@ export class UserDeletionService {
 
     protected async deleteTeamMemberships(userId: string) {
         const teams = await this.teamDb.findTeamsByUser(userId);
-        await Promise.all(teams.map(t => this.teamDb.removeMemberFromTeam(userId, t.id)));
+        await Promise.all(teams.map((t) => this.teamDb.removeMemberFromTeam(userId, t.id)));
+    }
+
+    protected async deleteSoleOwnedTeams(userId: string) {
+        const ownedTeams = await this.teamDb.findTeamsByUserAsSoleOwner(userId);
+
+        for (const team of ownedTeams) {
+            const teamProjects = await this.projectDb.findTeamProjects(team.id);
+            await Promise.all(teamProjects.map((project) => this.projectDb.markDeleted(project.id)));
+        }
+
+        await Promise.all(ownedTeams.map((t) => this.teamDb.deleteTeam(t.id)));
+    }
+
+    protected async deleteUserProjects(id: string) {
+        const userProjects = await this.projectDb.findUserProjects(id);
+
+        await Promise.all(userProjects.map((project) => this.projectDb.markDeleted(project.id)));
     }
 
     anonymizeWorkspace(ws: Workspace) {
-        ws.context.title = 'deleted-title';
-        ws.context.normalizedContextURL = 'deleted-normalizedContextURL';
-        ws.contextURL = 'deleted-contextURL';
-        ws.description = 'deleted-description';
+        ws.context.title = "deleted-title";
+        ws.context.normalizedContextURL = "deleted-normalizedContextURL";
+        ws.contextURL = "deleted-contextURL";
+        ws.description = "deleted-description";
         ws.context = {} as any;
     }
 }

@@ -43,11 +43,13 @@ spec:
       - name: db-migrations
         image: "{{ template "gitpod.comp.imageFull" (dict "root" . "gp" .Values "comp" $.Values.components.dbMigrations) }}"
         env:
+        - name: "DB_USERNAME"
+          value: "{{ $.Values.db.username }}"
         - name: "DB_PASSWORD"
           value: "{{ $.Values.db.password }}"
         - name: "DB_PORT"
           value: "{{ $.Values.db.port }}"
         - name: "DB_HOST"
           value: "{{ $.Values.db.host }}"
-        command: ["sh","-c","cd /app/node_modules/@gitpod/gitpod-db && yarn run wait-for-db && yarn run typeorm migrations:run"]
+        command: ["sh","-c","/app/migrate.sh"]
 {{- end }}

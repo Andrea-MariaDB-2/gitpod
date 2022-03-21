@@ -7,7 +7,6 @@
 package protocol
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,7 +30,6 @@ type APIInterface interface {
 	GetOwnAuthProviders(ctx context.Context) (res []*AuthProviderEntry, err error)
 	UpdateOwnAuthProvider(ctx context.Context, params *UpdateOwnAuthProviderParams) (err error)
 	DeleteOwnAuthProvider(ctx context.Context, params *DeleteOwnAuthProviderParams) (err error)
-	GetBranding(ctx context.Context) (res *Branding, err error)
 	GetConfiguration(ctx context.Context) (res *Configuration, err error)
 	GetGitpodTokenScopes(ctx context.Context, tokenHash string) (res []string, err error)
 	GetToken(ctx context.Context, query *GetTokenSearchOptions) (res *Token, err error)
@@ -73,14 +71,12 @@ type APIInterface interface {
 	SendFeedback(ctx context.Context, feedback string) (res string, err error)
 	RegisterGithubApp(ctx context.Context, installationID string) (err error)
 	TakeSnapshot(ctx context.Context, options *TakeSnapshotOptions) (res string, err error)
+	WaitForSnapshot(ctx context.Context, snapshotId string) (err error)
 	GetSnapshots(ctx context.Context, workspaceID string) (res []*string, err error)
 	StoreLayout(ctx context.Context, workspaceID string, layoutData string) (err error)
 	GetLayout(ctx context.Context, workspaceID string) (res string, err error)
-	PreparePluginUpload(ctx context.Context, params *PreparePluginUploadParams) (res string, err error)
-	ResolvePlugins(ctx context.Context, workspaceID string, params *ResolvePluginsParams) (res *ResolvedPlugins, err error)
-	InstallUserPlugins(ctx context.Context, params *InstallPluginsParams) (res bool, err error)
-	UninstallUserPlugin(ctx context.Context, params *UninstallPluginParams) (res bool, err error)
 	GuessGitTokenScopes(ctx context.Context, params *GuessGitTokenScopesParams) (res *GuessedGitTokenScopes, err error)
+	TrackEvent(ctx context.Context, event *RemoteTrackMessage) (err error)
 
 	InstanceUpdates(ctx context.Context, instanceID string) (<-chan *WorkspaceInstance, error)
 }
@@ -103,8 +99,6 @@ const (
 	FunctionUpdateOwnAuthProvider FunctionName = "updateOwnAuthProvider"
 	// FunctionDeleteOwnAuthProvider is the name of the deleteOwnAuthProvider function
 	FunctionDeleteOwnAuthProvider FunctionName = "deleteOwnAuthProvider"
-	// FunctionGetBranding is the name of the getBranding function
-	FunctionGetBranding FunctionName = "getBranding"
 	// FunctionGetConfiguration is the name of the getConfiguration function
 	FunctionGetConfiguration FunctionName = "getConfiguration"
 	// FunctionGetGitpodTokenScopes is the name of the GetGitpodTokenScopes function
@@ -193,16 +187,10 @@ const (
 	FunctionStoreLayout FunctionName = "storeLayout"
 	// FunctionGetLayout is the name of the getLayout function
 	FunctionGetLayout FunctionName = "getLayout"
-	// FunctionPreparePluginUpload is the name of the preparePluginUpload function
-	FunctionPreparePluginUpload FunctionName = "preparePluginUpload"
-	// FunctionResolvePlugins is the name of the resolvePlugins function
-	FunctionResolvePlugins FunctionName = "resolvePlugins"
-	// FunctionInstallUserPlugins is the name of the installUserPlugins function
-	FunctionInstallUserPlugins FunctionName = "installUserPlugins"
-	// FunctionUninstallUserPlugin is the name of the uninstallUserPlugin function
-	FunctionUninstallUserPlugin FunctionName = "uninstallUserPlugin"
 	// FunctionGuessGitTokenScopes is the name of the guessGitTokenScopes function
 	FunctionGuessGitTokenScope FunctionName = "guessGitTokenScopes"
+	// FunctionTrackEvent is the name of the trackEvent function
+	FunctionTrackEvent FunctionName = "trackEvent"
 
 	// FunctionOnInstanceUpdate is the name of the onInstanceUpdate callback function
 	FunctionOnInstanceUpdate = "onInstanceUpdate"
@@ -217,6 +205,7 @@ type ConnectToServerOpts struct {
 	Log                 *logrus.Entry
 	ReconnectionHandler func()
 	CloseHandler        func(error)
+	ExtraHeaders        map[string]string
 }
 
 // ConnectToServer establishes a new websocket connection to the server
@@ -240,6 +229,9 @@ func ConnectToServer(endpoint string, opts ConnectToServerOpts) (*APIoverJSONRPC
 
 	reqHeader := http.Header{}
 	reqHeader.Set("Origin", origin)
+	for k, v := range opts.ExtraHeaders {
+		reqHeader.Set(k, v)
+	}
 	if opts.Token != "" {
 		reqHeader.Set("Authorization", "Bearer "+opts.Token)
 	}
@@ -468,24 +460,6 @@ func (gp *APIoverJSONRPC) DeleteOwnAuthProvider(ctx context.Context, params *Del
 	if err != nil {
 		return
 	}
-
-	return
-}
-
-// GetBranding calls getBranding on the server
-func (gp *APIoverJSONRPC) GetBranding(ctx context.Context) (res *Branding, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	var result Branding
-	err = gp.C.Call(ctx, "getBranding", _params, &result)
-	if err != nil {
-		return
-	}
-	res = &result
 
 	return
 }
@@ -1277,6 +1251,21 @@ func (gp *APIoverJSONRPC) TakeSnapshot(ctx context.Context, options *TakeSnapsho
 	return
 }
 
+// WaitForSnapshot calls waitForSnapshot on the server
+func (gp *APIoverJSONRPC) WaitForSnapshot(ctx context.Context, snapshotId string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	_params = append(_params, snapshotId)
+
+	var result string
+	err = gp.C.Call(ctx, "waitForSnapshot", _params, &result)
+	return
+}
+
 // GetSnapshots calls getSnapshots on the server
 func (gp *APIoverJSONRPC) GetSnapshots(ctx context.Context, workspaceID string) (res []*string, err error) {
 	if gp == nil {
@@ -1336,87 +1325,6 @@ func (gp *APIoverJSONRPC) GetLayout(ctx context.Context, workspaceID string) (re
 	return
 }
 
-// PreparePluginUpload calls preparePluginUpload on the server
-func (gp *APIoverJSONRPC) PreparePluginUpload(ctx context.Context, params *PreparePluginUploadParams) (res string, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, params)
-
-	var result string
-	err = gp.C.Call(ctx, "preparePluginUpload", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// ResolvePlugins calls resolvePlugins on the server
-func (gp *APIoverJSONRPC) ResolvePlugins(ctx context.Context, workspaceID string, params *ResolvePluginsParams) (res *ResolvedPlugins, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, workspaceID)
-	_params = append(_params, params)
-
-	var result ResolvedPlugins
-	err = gp.C.Call(ctx, "resolvePlugins", _params, &result)
-	if err != nil {
-		return
-	}
-	res = &result
-
-	return
-}
-
-// InstallUserPlugins calls installUserPlugins on the server
-func (gp *APIoverJSONRPC) InstallUserPlugins(ctx context.Context, params *InstallPluginsParams) (res bool, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, params)
-
-	var result bool
-	err = gp.C.Call(ctx, "installUserPlugins", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// UninstallUserPlugin calls uninstallUserPlugin on the server
-func (gp *APIoverJSONRPC) UninstallUserPlugin(ctx context.Context, params *UninstallPluginParams) (res bool, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, params)
-
-	var result bool
-	err = gp.C.Call(ctx, "uninstallUserPlugin", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
 // GuessGitTokenScopes calls GuessGitTokenScopes on the server
 func (gp *APIoverJSONRPC) GuessGitTokenScopes(ctx context.Context, params *GuessGitTokenScopesParams) (res *GuessedGitTokenScopes, err error) {
 	if gp == nil {
@@ -1434,6 +1342,19 @@ func (gp *APIoverJSONRPC) GuessGitTokenScopes(ctx context.Context, params *Guess
 	}
 	res = &result
 
+	return
+}
+
+// TrackEvent calls trackEvent on the server
+func (gp *APIoverJSONRPC) TrackEvent(ctx context.Context, params *RemoteTrackMessage) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	_params = append(_params, params)
+	err = gp.C.Call(ctx, "trackEvent", _params, nil)
 	return
 }
 
@@ -1535,11 +1456,6 @@ type APIToken struct {
 
 	// The user the token belongs to.
 	User *User `json:"user,omitempty"`
-}
-
-// InstallPluginsParams is the InstallPluginsParams message type
-type InstallPluginsParams struct {
-	PluginIds []string `json:"pluginIds,omitempty"`
 }
 
 // OAuth2Config is the OAuth2Config message type
@@ -1731,7 +1647,6 @@ type WorkspaceInstanceConditions struct {
 	FirstUserActivity string `json:"firstUserActivity,omitempty"`
 	NeededImageBuild  bool   `json:"neededImageBuild,omitempty"`
 	PullingImages     bool   `json:"pullingImages,omitempty"`
-	ServiceExists     bool   `json:"serviceExists,omitempty"`
 	Timeout           string `json:"timeout,omitempty"`
 }
 
@@ -1779,7 +1694,6 @@ type GetWorkspaceTimeoutResult struct {
 // WorkspaceInstancePort is the WorkspaceInstancePort message type
 type WorkspaceInstancePort struct {
 	Port       float64 `json:"port,omitempty"`
-	TargetPort float64 `json:"targetPort,omitempty"`
 	URL        string  `json:"url,omitempty"`
 	Visibility string  `json:"visibility,omitempty"`
 }
@@ -1792,7 +1706,7 @@ type GithubAppConfig struct {
 // GithubAppPrebuildConfig is the GithubAppPrebuildConfig message type
 type GithubAppPrebuildConfig struct {
 	AddBadge              bool        `json:"addBadge,omitempty"`
-	AddCheck              bool        `json:"addCheck,omitempty"`
+	AddCheck              interface{} `json:"addCheck,omitempty"`
 	AddComment            bool        `json:"addComment,omitempty"`
 	AddLabel              interface{} `json:"addLabel,omitempty"`
 	Branches              bool        `json:"branches,omitempty"`
@@ -1809,20 +1723,11 @@ type ImageConfigFile struct {
 
 // PortConfig is the PortConfig message type
 type PortConfig struct {
-	OnOpen     string  `json:"onOpen,omitempty"`
-	Port       float64 `json:"port,omitempty"`
-	Visibility string  `json:"visibility,omitempty"`
-}
-
-// ResolvedPlugins is the ResolvedPlugins message type
-type ResolvedPlugins struct {
-	AdditionalProperties map[string]*ResolvedPlugin `json:"-,omitempty"`
-}
-
-// ResolvePluginsParams is the ResolvePluginsParams message type
-type ResolvePluginsParams struct {
-	Builtins *ResolvedPlugins `json:"builtins,omitempty"`
-	Config   *WorkspaceConfig `json:"config,omitempty"`
+	OnOpen      string  `json:"onOpen,omitempty"`
+	Port        float64 `json:"port,omitempty"`
+	Visibility  string  `json:"visibility,omitempty"`
+	Description string  `json:"description,omitempty"`
+	Name        string  `json:"name,omitempty"`
 }
 
 // TaskConfig is the TaskConfig message type
@@ -1840,55 +1745,6 @@ type TaskConfig struct {
 // VSCodeConfig is the VSCodeConfig message type
 type VSCodeConfig struct {
 	Extensions []string `json:"extensions,omitempty"`
-}
-
-// MarshalJSON marshals to JSON
-func (strct *ResolvedPlugins) MarshalJSON() ([]byte, error) {
-	buf := bytes.NewBuffer(make([]byte, 0))
-	buf.WriteString("{")
-	comma := false
-	// Marshal any additional Properties
-	for k, v := range strct.AdditionalProperties {
-		if comma {
-			buf.WriteString(",")
-		}
-		buf.WriteString(fmt.Sprintf("\"%s\":", k))
-		tmp, err := json.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-
-		buf.Write(tmp)
-		comma = true
-	}
-
-	buf.WriteString("}")
-	rv := buf.Bytes()
-	return rv, nil
-}
-
-// UnmarshalJSON marshals from JSON
-func (strct *ResolvedPlugins) UnmarshalJSON(b []byte) error {
-	var jsonMap map[string]json.RawMessage
-	if err := json.Unmarshal(b, &jsonMap); err != nil {
-		return err
-	}
-	// parse all the defined properties
-	for k, v := range jsonMap {
-		switch k {
-		default:
-			// an additional "*ResolvedPlugin" value
-			var additionalValue *ResolvedPlugin
-			if err := json.Unmarshal([]byte(v), &additionalValue); err != nil {
-				return err // invalid additionalProperty
-			}
-			if strct.AdditionalProperties == nil {
-				strct.AdditionalProperties = make(map[string]*ResolvedPlugin)
-			}
-			strct.AdditionalProperties[k] = additionalValue
-		}
-	}
-	return nil
 }
 
 // Configuration is the Configuration message type
@@ -1925,11 +1781,7 @@ type GenerateNewGitpodTokenOptions struct {
 type TakeSnapshotOptions struct {
 	LayoutData  string `json:"layoutData,omitempty"`
 	WorkspaceID string `json:"workspaceId,omitempty"`
-}
-
-// PreparePluginUploadParams is the PreparePluginUploadParams message type
-type PreparePluginUploadParams struct {
-	FullPluginName string `json:"fullPluginName,omitempty"`
+	DontWait    bool   `json:"dontWait,omitempty"`
 }
 
 // AdminBlockUserRequest is the AdminBlockUserRequest message type
@@ -1969,21 +1821,6 @@ type CreateWorkspaceOptions struct {
 	Mode       string `json:"mode,omitempty"`
 }
 
-// Root is the Root message type
-type Root map[string]*ResolvedPlugin
-
-// ResolvedPlugin is the ResolvedPlugin message type
-type ResolvedPlugin struct {
-	FullPluginName string `json:"fullPluginName,omitempty"`
-	Kind           string `json:"kind,omitempty"`
-	URL            string `json:"url,omitempty"`
-}
-
-// UninstallPluginParams is the UninstallPluginParams message type
-type UninstallPluginParams struct {
-	PluginID string `json:"pluginId,omitempty"`
-}
-
 // DeleteOwnAuthProviderParams is the DeleteOwnAuthProviderParams message type
 type DeleteOwnAuthProviderParams struct {
 	ID string `json:"id,omitempty"`
@@ -2009,47 +1846,9 @@ type GuessedGitTokenScopes struct {
 	Message string   `json:"message,omitempty"`
 }
 
-// BrandingLink is the BrandingLink message type
-type BrandingLink struct {
-	Name string `json:"name,omitempty"`
-	URL  string `json:"url,omitempty"`
-}
-
-// BrandingSocialLink is the BrandingSocialLink message type
-type BrandingSocialLink struct {
-	Type string `json:"type,omitempty"`
-	URL  string `json:"url,omitempty"`
-}
-
-// Ide is the Ide message type
-type Ide struct {
-	HelpMenu         []*BrandingLink `json:"helpMenu,omitempty"`
-	Logo             string          `json:"logo,omitempty"`
-	ShowReleaseNotes bool            `json:"showReleaseNotes,omitempty"`
-}
-
-// Links is the Links message type
-type Links struct {
-	Footer []*BrandingLink       `json:"footer,omitempty"`
-	Header []*BrandingLink       `json:"header,omitempty"`
-	Legal  []*BrandingLink       `json:"legal,omitempty"`
-	Social []*BrandingSocialLink `json:"social,omitempty"`
-}
-
-// Branding is the Branding message type
-type Branding struct {
-	Favicon  string `json:"favicon,omitempty"`
-	Homepage string `json:"homepage,omitempty"`
-	Ide      *Ide   `json:"ide,omitempty"`
-	Links    *Links `json:"links,omitempty"`
-
-	// Either including domain OR absolute path (interpreted relative to host URL)
-	Logo                          string `json:"logo,omitempty"`
-	Name                          string `json:"name,omitempty"`
-	RedirectURLAfterLogout        string `json:"redirectUrlAfterLogout,omitempty"`
-	RedirectURLIfNotAuthenticated string `json:"redirectUrlIfNotAuthenticated,omitempty"`
-	ShowProductivityTips          bool   `json:"showProductivityTips,omitempty"`
-	StartupLogo                   string `json:"startupLogo,omitempty"`
+type RemoteTrackMessage struct {
+	Event      string      `json:"event,omitempty"`
+	Properties interface{} `json:"properties,omitempty"`
 }
 
 // WorkspaceInstanceUser is the WorkspaceInstanceUser message type
@@ -2078,6 +1877,15 @@ type UpdateUserStorageResourceOptions struct {
 type AdditionalUserData struct {
 	EmailNotificationSettings *EmailNotificationSettings `json:"emailNotificationSettings,omitempty"`
 	Platforms                 []*UserPlatform            `json:"platforms,omitempty"`
+	IdeSettings               *IDESettings               `json:"ideSettings,omitempty"`
+}
+
+// IDESettings is the IDESettings message type
+type IDESettings struct {
+	DefaultIde        string `json:"defaultIde,omitempty"`
+	UseDesktopIde     bool   `json:"useDesktopIde,omitempty"`
+	DefaultDesktopIde string `json:"defaultDesktopIde,omitempty"`
+	UseLatestVersion  bool   `json:"useLatestVersion,omitempty"`
 }
 
 // EmailNotificationSettings is the EmailNotificationSettings message type
@@ -2149,12 +1957,6 @@ type UserFeatureSettings struct {
 	// Permanent feature flags are added to each and every workspace instance
 	// this user starts.
 	PermanentWSFeatureFlags []string `json:"permanentWSFeatureFlags,omitempty"`
-
-	// This field is used as marker to grant users a free trial for using private repositories,
-	// independent of any subscription or Chargebee.
-	//   - it is set when the user uses their first private repo
-	//   - whether the trial is expired or not is juged by the UserService
-	PrivateRepoTrialStartDate string `json:"privateRepoTrialStartDate,omitempty"`
 }
 
 // UserPlatform is the UserPlatform message type

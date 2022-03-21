@@ -11,10 +11,16 @@ import { LicenseEvaluator } from "@gitpod/licensor/lib";
 import { Feature } from "@gitpod/licensor/lib/api";
 import { AuthException } from "../../../src/auth/errors";
 import { EligibilityService } from "./eligibility-service";
+import { SubscriptionService } from "@gitpod/gitpod-payment-endpoint/lib/accounting";
+import { OssAllowListDB } from "@gitpod/gitpod-db/lib/oss-allowlist-db";
+import { HostContextProvider } from "../../../src/auth/host-context-provider";
 
 export class UserServiceEE extends UserService {
     @inject(LicenseEvaluator) protected readonly licenseEvaluator: LicenseEvaluator;
     @inject(EligibilityService) protected readonly eligibilityService: EligibilityService;
+    @inject(SubscriptionService) protected readonly subscriptionService: SubscriptionService;
+    @inject(OssAllowListDB) protected readonly OssAllowListDb: OssAllowListDB;
+    @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
 
     async getDefaultWorkspaceTimeout(user: User, date: Date): Promise<WorkspaceTimeoutDuration> {
         if (this.config.enablePayment) {
@@ -22,16 +28,25 @@ export class UserServiceEE extends UserService {
             return this.eligibilityService.getDefaultWorkspaceTimeout(user, date);
         }
 
+        const userCount = await this.userDb.getUserCount(true);
+
         // the self-hosted case
-        if (!this.licenseEvaluator.isEnabled(Feature.FeatureSetTimeout)) {
+        if (!this.licenseEvaluator.isEnabled(Feature.FeatureSetTimeout, userCount)) {
             return "30m";
         }
 
         return "60m";
     }
 
-    async checkSignUp(params: CheckSignUpParams) {
+    async userGetsMoreResources(user: User): Promise<boolean> {
+        if (this.config.enablePayment) {
+            return this.eligibilityService.userGetsMoreResources(user);
+        }
 
+        return false;
+    }
+
+    async checkSignUp(params: CheckSignUpParams) {
         // todo@at: check if we need an optimization for SaaS here. used to be a no-op there.
 
         // 1. check the license
@@ -63,4 +78,18 @@ export class UserServiceEE extends UserService {
         return true;
     }
 
+    async checkAutomaticOssEligibility(user: User): Promise<boolean> {
+        const idsWithHost = user.identities
+            .map((id) => {
+                const hostContext = this.hostContextProvider.findByAuthProviderId(id.authProviderId);
+                if (!hostContext) {
+                    return undefined;
+                }
+                const info = hostContext.authProvider.info;
+                return `${info.host}/${id.authName}`;
+            })
+            .filter((i) => !!i) as string[];
+
+        return this.OssAllowListDb.hasAny(idsWithHost);
+    }
 }

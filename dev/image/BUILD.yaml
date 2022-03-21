@@ -1,20 +1,15 @@
 packages:
   - name: docker
     type: docker
+    deps:
+      - dev/gpctl:app
+      - dev/kubecdl:app
     argdeps:
       - imageRepoBase
     srcs:
       - gcloud-default-config
       - kubeconfig.yaml
-      - code
-      - config
-      - prepare-bpf-dev-environment.sh
-      - workspace.automount
-      - workspace.mount
     config:
       dockerfile: Dockerfile
       image:
         - ${imageRepoBase}/dev-environment:${version}
-scripts:
-- name: prepare-environment
-  script: prepare-bpf-dev-environment.sh

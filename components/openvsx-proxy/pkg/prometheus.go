@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -33,8 +34,8 @@ func (p *Prometheus) Start(cfg *Config) {
 
 	if cfg.PrometheusAddr != "" {
 		p.reg.MustRegister(
-			prometheus.NewGoCollector(),
-			prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+			collectors.NewGoCollector(),
+			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		)
 
 		handler := http.NewServeMux()
@@ -135,6 +136,14 @@ func (p *Prometheus) createMetrics() {
 	})
 }
 
+var expectedPaths = map[string]struct{}{
+	"/api/-/query":                   {},
+	"/vscode/asset":                  {},
+	"/vscode/gallery/extensionquery": {},
+	"/vscode/gallery/itemName":       {},
+	"/vscode/gallery/publishers":     {},
+}
+
 func (p *Prometheus) IncStatusCounter(r *http.Request, status string) {
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/vscode/asset/") {
@@ -149,6 +158,11 @@ func (p *Prometheus) IncStatusCounter(r *http.Request, status string) {
 	// since path starts with a / the first segment is an emtpy string, therefore len > 4 and not len > 3
 	if s := strings.SplitN(path, "/", 5); len(s) > 4 {
 		path = strings.Join(s[:4], "/")
+	}
+	// don't track unexepected paths (e.g. requests from crawlers/bots)
+	if _, ok := expectedPaths[strings.TrimSuffix(path, "/")]; !ok {
+		log.WithField("path", path).Debug("unexpected path")
+		path = "(other)"
 	}
 	p.RequestsCounter.WithLabelValues(status, fmt.Sprintf("%s %s", r.Method, path)).Inc()
 }

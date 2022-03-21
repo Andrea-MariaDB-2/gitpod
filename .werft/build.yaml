@@ -14,6 +14,9 @@ pod:
   - name: monitoring-satellite-preview-token
     secret:
       secretName: monitoring-satellite-preview-token
+  - name: monitoring-satellite-stackdriver-credentials
+    secret:
+      secretName: monitoring-satellite-stackdriver-credentials
   - name: gcp-sa
     secret:
       secretName: gcp-sa-gitpod-dev-deployer
@@ -23,6 +26,9 @@ pod:
   - name: gpsh-coredev-license
     secret:
       secretName: gpsh-coredev-license
+  - name: gpsh-harvester-license
+    secret:
+      secretName: gpsh-harvester-license
   - name: payment-provider-secret
     secret:
       secretName: payment-provider-secret
@@ -33,6 +39,15 @@ pod:
     hostPath:
       path: /mnt/disks/ssd0/go-build-cache
       type: DirectoryOrCreate
+  - name: harvester-kubeconfig
+    secret:
+      secretName: harvester-kubeconfig
+  - name: harvester-vm-ssh-keys
+    secret:
+      secretName: harvester-vm-ssh-keys
+  - name: fluent-bit-external
+    secret:
+      secretName: fluent-bit-external
   # - name: deploy-key
   #   secret:
   #     secretName: deploy-key
@@ -53,10 +68,12 @@ pod:
     - name: MYSQL_TCP_PORT
       value: 23306
   - name: build
-    image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:as-migrate-mixins.73
+    image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:prs-update-dep.2
     workingDir: /workspace
     imagePullPolicy: Always
     volumeMounts:
+    - name: monitoring-satellite-stackdriver-credentials
+      mountPath: /mnt/secrets/monitoring-satellite-stackdriver-credentials
     - name: monitoring-satellite-preview-token
       mountPath: /mnt/secrets/monitoring-satellite-preview-token
     - name: gcp-sa
@@ -68,6 +85,9 @@ pod:
     - name: gpsh-coredev-license
       mountPath: /mnt/secrets/gpsh-coredev
       readOnly: true
+    - name: gpsh-harvester-license
+      mountPath: /mnt/secrets/gpsh-harvester
+      readOnly: true
     - name: payment-webhook-secret
       mountPath: /mnt/secrets/payment-webhook-config
       readOnly: true
@@ -77,6 +97,12 @@ pod:
     - name: go-build-cache
       mountPath: /go-build-cache
       readOnly: false
+    - name: harvester-kubeconfig
+      mountPath: /mnt/secrets/harvester-kubeconfig
+    - name: harvester-vm-ssh-keys
+      mountPath: /mnt/secrets/harvester-vm-ssh-keys
+    - name: fluent-bit-external
+      mountPath: /mnt/fluent-bit-external
     # - name: deploy-key
     #   mountPath: /mnt/secrets/deploy-key
     #   readOnly: true
@@ -87,8 +113,8 @@ pod:
     - name: LEEWAY_WORKSPACE_ROOT
       value: /workspace
     - name: LEEWAY_REMOTE_CACHE_BUCKET
-      {{- if eq .Repository.Ref "refs/heads/master" }}
-      value: gitpod-core-leeway-cache-master
+      {{- if eq .Repository.Ref "refs/heads/main" }}
+      value: gitpod-core-leeway-cache-main
       {{- else }}
       value: gitpod-core-leeway-cache-branch
       {{- end }}
@@ -107,6 +133,11 @@ pod:
         secretKeyRef:
           name: npm-auth-token
           key: npm-auth-token.json
+    - name: JB_MARKETPLACE_PUBLISH_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: jb-marketplace-publish-token
+          key: token
     - name: SLACK_NOTIFICATION_PATH
       valueFrom:
         secretKeyRef:
@@ -138,6 +169,20 @@ pod:
         secretKeyRef:
           name: codecov
           key: token
+    - name: HONEYCOMB_DATASET
+      value: "werft"
+    - name: HONEYCOMB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: honeycomb-api-key
+          key: apikey
+    - name: SEGMENT_IO_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: self-hosted
+          key: segmentIOToken
+    - name: JAVA_HOME
+      value: /home/gitpod/.sdkman/candidates/java/current
     command:
       - bash
       - -c
@@ -150,6 +195,12 @@ pod:
 
         export DOCKER_HOST=tcp://$NODENAME:2375
         sudo chown -R gitpod:gitpod /workspace
+
+        mkdir /workspace/.ssh
+        cp /mnt/secrets/harvester-vm-ssh-keys/id_rsa /workspace/.ssh/id_rsa_harvester_vm
+        cp /mnt/secrets/harvester-vm-ssh-keys/id_rsa.pub /workspace/.ssh/id_rsa_harvester_vm.pub
+        sudo chmod 600 /workspace/.ssh/id_rsa_harvester_vm
+        sudo chmod 644 /workspace/.ssh/id_rsa_harvester_vm.pub
 
         (cd .werft && yarn install && mv node_modules ..) | werft log slice prep
         printf '{{ toJson . }}' > context.json

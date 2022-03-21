@@ -34,9 +34,9 @@ workspaceSizing:
   requests:
     cpu: "1m"
     memory: "2.25Gi"
-    storage: "5Gi"
+    ephemeral-storage: "5Gi"
   limits:
-    cpu: "5"
+    cpu: "6"
     memory: "12Gi"
   dynamic:
     # Gitpod supports dynamic CPU limiting. We express those limits in "buckets of CPU time" (jiffies where 1 jiffie is 1% of a vCPU).
@@ -62,6 +62,7 @@ workspaceSizing:
 db:
   host: db
   port: 3306
+  username: gitpod
   password: test
 
 defaults:
@@ -96,41 +97,6 @@ authProviders: []
 #     settingsUrl: "https://gitlab.com/-/profile/applications"
 #   description: ""
 #   icon: ""
-branding:
-  logo: /images/gitpod-ddd.svg
-  homepage: https://www.gitpod.io/
-  links:
-    header:
-      - name: Workspaces
-        url: /workspaces/
-      - name: Docs
-        url: https://www.gitpod.io/docs/
-      - name: Blog
-        url: https://www.gitpod.io/blog/
-      - name: Community
-        url: https://community.gitpod.io/
-    footer:
-      - name: Docs
-        url: https://www.gitpod.io/docs/
-      - name: Blog
-        url: https://www.gitpod.io/blog/
-      - name: Status
-        url: https://status.gitpod.io/
-    social:
-      - type: GitHub
-        url: https://github.com/gitpod-io/gitpod
-      - type: Discourse
-        url: https://community.gitpod.io/
-      - type: Twitter
-        url: https://twitter.com/gitpod
-    legal:
-      - name: Imprint
-        url: https://www.gitpod.io/imprint/
-      - name: Privacy Policy
-        url: https://www.gitpod.io/privacy/
-      - name: Terms of Service
-        url: https://www.gitpod.io/terms/
-workspaceScheduler: workspace-scheduler
 
 components:
 
@@ -187,6 +153,18 @@ components:
     name: "db-sync"
     disabled: true
 
+  ideProxy:
+    name: "ide-proxy"
+    resources:
+      cpu: 100m
+      memory: 32Mi
+    ports:
+      http:
+        expose: true
+        containerPort: 80
+        servicePort: 80
+    serviceType: ClusterIP
+
   dashboard:
     name: "dashboard"
     resources:
@@ -199,11 +177,8 @@ components:
         servicePort: 3001
     serviceType: ClusterIP
 
-  imageBuilder:
-    name: "image-builder"
-    dependsOn:
-    - "image-builder-configmap.yaml"
-    hostDindData: /var/gitpod/docker
+  imageBuilderMk3:
+    name: "image-builder-mk3"
     registry:
       name: builtin
       secretName: builtin-registry-auth
@@ -219,24 +194,9 @@ components:
     #   - name: builtin
     #     secret: builtin-registry-certs
     registryCerts: []
-    dindImage: docker:19.03-dind
-    dindMtu: ""
-    dindResources:
-      requests:
-        cpu: 100m
-        memory: 128Mi
-    alpineImage: alpine:3.14
-    selfBuildBaseImage: ""
-    ports:
-      rpc:
-        expose: true
-        containerPort: 8080
-
-  imageBuilderMk3:
-    name: "image-builder-mk3"
     dependsOn:
     - "image-builder-mk3-configmap.yaml"
-    alpineImage: alpine:3.14
+    alpineImage: alpine:3.15
     builderImage:
       imageName: "image-builder-mk3/bob"
     ports:
@@ -372,6 +332,8 @@ components:
       timeoutSeconds: 300
     insecureNoDomain: false
     chargebeeProviderOptionsFile: "/chargebee/providerOptions"
+    prebuildLimiter:
+      '*': 50
 
   serviceWaiter:
     imageName: "service-waiter"
@@ -394,13 +356,27 @@ components:
       imagePrefix: "gitpod/"
       imageName: "workspace-full"
       version: "latest"
-    theiaImage:
-      imageName: "ide/theia"
     codeImage:
       imageName: "ide/code"
-      stableVersion: "commit-8be670686186fcc71076bc95166de1ada9c232d8"
+      stableVersion: "commit-93edb90833d8d662f4c1a64b2ad8ced456e62862"
+      insidersVersion: "nightly"
+    desktopIdeImages:
+      codeDesktop:
+        imageName: "ide/code-desktop"
+      codeDesktopInsiders:
+        imageName: "ide/code-desktop-insiders"
+      intellij:
+        imageName: "ide/intellij"
+      goland:
+        imageName: "ide/goland"
+      pycharm:
+        imageName: "ide/pycharm"
+      phpstorm:
+        imageName: "ide/phpstorm"
     supervisor:
       imageName: "supervisor"
+    workspacekit:
+      imageName: "workspacekit"
     dockerUp:
       imageName: "docker-up"
     pullSecret:
@@ -426,6 +402,9 @@ components:
       https:
         expose: true
         containerPort: 443
+      ssh:
+        expose: true
+        containerPort: 22
       metrics:
         expose: false
         containerPort: 9500
@@ -499,6 +478,13 @@ components:
     clusterIP: "None"
     selectorKind: daemonset
     workspaceSizeLimit: "50g"
+    cpuLimit:
+      enabled: true
+      totalBandwidth: 12
+      limit: 2
+      burstLimit: 6
+      controlPeriod: "15s"
+      cgroupBasePath: "/mnt/node-cgroups"
     containerRuntime:
       enabled: true
       runtime: containerd
@@ -525,27 +511,6 @@ components:
         enabled: true
         imageName: "seccomp-profile-installer"
 
-  wsScheduler:
-    name: "ws-scheduler"
-    disabled: false
-    resources:
-      cpu: 100m
-      memory: 32Mi
-    schedulerName: "workspace-scheduler"
-    ratelimit:
-      # Limits the # of scheduling attempts (per second) to limit traffic to the k8s master.
-      maxRPS: 10
-    scaler:
-      enabled: false
-      maxGhostWorkspaces: 10
-      renewal:
-        interval: "5m"
-        percentage: 20
-      controller:
-        kind: "constant"
-        constant:
-          setpoint: 5
-
   wsProxy:
     name: "ws-proxy"
     disabled: false
@@ -554,6 +519,7 @@ components:
       memory: 64Mi
     replicas: 1
     hostHeader: "x-wsproxy-host"
+    # hostKeySecretName: "host-key"
     ports:
       httpProxy:
         expose: true
@@ -564,6 +530,10 @@ components:
       metrics:
         expose: false
         containerPort: 9500
+      ssh:
+        expose: false
+        containerPort: 2200
+        servicePort: 22
 
 docker-registry:
   enabled: true
@@ -612,9 +582,6 @@ mysql:
 rabbitmq:
   enabled: true
   fullnameOverride: "messagebus"
-  # non-standard configuration
-  # defined by gitpod.io
-  shovels: []
   persistence:
     enabled: false
   replicaCount: 1
@@ -637,7 +604,7 @@ rabbitmq:
     enabled: true
     allowExternal: true
   plugins: "rabbitmq_management rabbitmq_peer_discovery_k8s"
-  extraPlugins: "rabbitmq_shovel rabbitmq_shovel_management"
+  extraPlugins: ""
   extraSecrets:
     load-definition:
       load_definition.json: |
@@ -650,7 +617,7 @@ rabbitmq:
           "vhosts": [{
             "name": "/"
           }],
-          "parameters": {{ tpl (.Values.shovelsTemplate) . | fromYamlArray | toJson }},
+          "parameters": [],
           "permissions": [{
             "user": {{ .Values.auth.username | quote }},
             "vhost": "/",
@@ -659,22 +626,10 @@ rabbitmq:
             "read": ".*"
           }],
           "exchanges": [{
-            "name": "gitpod.ws",
-            "vhost": "/",
-            "type": "topic",
-            "durable": true,
-            "auto_delete": false
-          }, {
             "name": "gitpod.ws.local",
             "vhost": "/",
             "type": "topic",
             "durable": true,
-            "auto_delete": false
-          }, {
-            "name": "wsman",
-            "vhost": "/",
-            "type": "topic",
-            "durable": false,
             "auto_delete": false
           }, {
             "name": "consensus-leader",
@@ -683,14 +638,7 @@ rabbitmq:
             "durable": false,
             "auto_delete": false
           }],
-          "bindings": [{
-            "source": "gitpod.ws.local",
-            "vhost": "/",
-            "destination": "gitpod.ws",
-            "destination_type": "exchange",
-            "routing_key": "#",
-            "arguments": {}
-          }],
+          "bindings": [],
           "queues": [{
             "name": "consensus-peers",
             "vhost": "/",
@@ -726,25 +674,6 @@ rabbitmq:
     create: true
     minAvailable: 0
     maxUnavailable: 1
-  shovelsTemplate: |
-    {{ $auth := .Values.auth }}
-    {{- range $index, $shovel := .Values.shovels }}
-    - name: {{ $shovel.name | default (randAlphaNum 20) | quote }}
-      vhost: "/"
-      component: "shovel"
-      value:
-        ack-mode: "on-publish"
-        src-delete-after: "never"
-        src-exchange: {{ $shovel.srcExchange | default "gitpod.ws.local" | quote }}
-        src-exchange-key: {{ $shovel.srcExchangeKey | default "#" | quote  }}
-        src-protocol: "amqp091"
-        src-uri: {{ $shovel.srcUri | replace "$USERNAME" $auth.username | replace "$PASSWORD" $auth.password | quote }}
-        dest-add-forward-headers: {{ $shovel.destAddForwardHeaders | default true }}
-        dest-exchange: {{ $shovel.destExchange | default "gitpod.ws" | quote }}
-        dest-protocol: "amqp091"
-        dest-uri: {{ $shovel.destUri | default "amqp://" | quote }}
-        reconnect-delay: {{ $shovel.reconnectDelay | default 5 }}
-    {{- end }}
 
 cert-manager:
   enabled: false

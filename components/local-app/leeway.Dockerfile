@@ -2,7 +2,7 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License-AGPL.txt in the project root for license information.
 
-FROM alpine:3.14
+FROM alpine:3.15
 
 WORKDIR /app
 COPY components-local-app--app/components-local-app--app-linux-amd64/local-app local-app-linux
@@ -18,4 +18,9 @@ COPY components-local-app--app/components-local-app--app-darwin-arm64/local-app 
 COPY components-local-app--app/components-local-app--app-windows-arm64/local-app.exe local-app-windows-arm64.exe
 COPY components-local-app--app/components-local-app--app-windows-386/local-app.exe local-app-windows-386.exe
 
+ARG __GIT_COMMIT
+ARG VERSION
+
+ENV GITPOD_BUILD_GIT_COMMIT=${__GIT_COMMIT}
+ENV GITPOD_BUILD_VERSION=${VERSION}
 CMD ["/bin/sh", "-c", "cp /app/* /out"]

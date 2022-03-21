@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2022 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
  * See License-AGPL.txt in the project root for license information.
  */
@@ -133,6 +133,16 @@ export class AdmissionConstraint extends jspb.Message {
     getHasPermission(): AdmissionConstraint.HasPermission | undefined;
     setHasPermission(value?: AdmissionConstraint.HasPermission): AdmissionConstraint;
 
+    hasHasUserLevel(): boolean;
+    clearHasUserLevel(): void;
+    getHasUserLevel(): string;
+    setHasUserLevel(value: string): AdmissionConstraint;
+
+    hasHasMoreResources(): boolean;
+    clearHasMoreResources(): void;
+    getHasMoreResources(): boolean;
+    setHasMoreResources(value: boolean): AdmissionConstraint;
+
     getConstraintCase(): AdmissionConstraint.ConstraintCase;
 
     serializeBinary(): Uint8Array;
@@ -149,6 +159,8 @@ export namespace AdmissionConstraint {
     export type AsObject = {
         hasFeaturePreview?: AdmissionConstraint.FeaturePreview.AsObject,
         hasPermission?: AdmissionConstraint.HasPermission.AsObject,
+        hasUserLevel: string,
+        hasMoreResources: boolean,
     }
 
 
@@ -194,6 +206,8 @@ export namespace AdmissionConstraint {
         CONSTRAINT_NOT_SET = 0,
         HAS_FEATURE_PREVIEW = 1,
         HAS_PERMISSION = 2,
+        HAS_USER_LEVEL = 3,
+        HAS_MORE_RESOURCES = 4,
     }
 
 }
@@ -211,10 +225,10 @@ export class ClusterStatus extends jspb.Message {
     setMaxScore(value: number): ClusterStatus;
     getGoverned(): boolean;
     setGoverned(value: boolean): ClusterStatus;
-    clearAdmissionConstraintsList(): void;
-    getAdmissionConstraintsList(): Array<AdmissionConstraint>;
-    setAdmissionConstraintsList(value: Array<AdmissionConstraint>): ClusterStatus;
-    addAdmissionConstraints(value?: AdmissionConstraint, index?: number): AdmissionConstraint;
+    clearAdmissionConstraintList(): void;
+    getAdmissionConstraintList(): Array<AdmissionConstraint>;
+    setAdmissionConstraintList(value: Array<AdmissionConstraint>): ClusterStatus;
+    addAdmissionConstraint(value?: AdmissionConstraint, index?: number): AdmissionConstraint;
     getStatic(): boolean;
     setStatic(value: boolean): ClusterStatus;
 
@@ -236,7 +250,7 @@ export namespace ClusterStatus {
         score: number,
         maxScore: number,
         governed: boolean,
-        admissionConstraintsList: Array<AdmissionConstraint.AsObject>,
+        admissionConstraintList: Array<AdmissionConstraint.AsObject>,
         pb_static: boolean,
     }
 }
@@ -260,10 +274,10 @@ export class UpdateRequest extends jspb.Message {
     getCordoned(): boolean;
     setCordoned(value: boolean): UpdateRequest;
 
-    hasAdmissionConstraints(): boolean;
-    clearAdmissionConstraints(): void;
-    getAdmissionConstraints(): ModifyAdmissionConstraint | undefined;
-    setAdmissionConstraints(value?: ModifyAdmissionConstraint): UpdateRequest;
+    hasAdmissionConstraint(): boolean;
+    clearAdmissionConstraint(): void;
+    getAdmissionConstraint(): ModifyAdmissionConstraint | undefined;
+    setAdmissionConstraint(value?: ModifyAdmissionConstraint): UpdateRequest;
 
     getPropertyCase(): UpdateRequest.PropertyCase;
 
@@ -283,7 +297,7 @@ export namespace UpdateRequest {
         score: number,
         maxScore: number,
         cordoned: boolean,
-        admissionConstraints?: ModifyAdmissionConstraint.AsObject,
+        admissionConstraint?: ModifyAdmissionConstraint.AsObject,
     }
 
     export enum PropertyCase {
@@ -291,7 +305,7 @@ export namespace UpdateRequest {
         SCORE = 2,
         MAX_SCORE = 3,
         CORDONED = 4,
-        ADMISSION_CONSTRAINTS = 5,
+        ADMISSION_CONSTRAINT = 5,
     }
 
 }
@@ -342,6 +356,8 @@ export namespace UpdateResponse {
 export class DeregisterRequest extends jspb.Message {
     getName(): string;
     setName(value: string): DeregisterRequest;
+    getForce(): boolean;
+    setForce(value: boolean): DeregisterRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): DeregisterRequest.AsObject;
@@ -356,6 +372,7 @@ export class DeregisterRequest extends jspb.Message {
 export namespace DeregisterRequest {
     export type AsObject = {
         name: string,
+        force: boolean,
     }
 }
 

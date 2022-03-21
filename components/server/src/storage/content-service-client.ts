@@ -4,28 +4,48 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { ContentServiceClient } from '@gitpod/content-service/lib/content_grpc_pb';
 import { DeleteUserContentRequest, DeleteUserContentResponse } from "@gitpod/content-service/lib/content_pb";
-import { IDEPluginServiceClient } from '@gitpod/content-service/lib/ideplugin_grpc_pb';
-import { PluginDownloadURLRequest, PluginDownloadURLResponse, PluginHashRequest, PluginHashResponse, PluginUploadURLRequest, PluginUploadURLResponse } from "@gitpod/content-service/lib/ideplugin_pb";
-import { WorkspaceServiceClient } from '@gitpod/content-service/lib/workspace_grpc_pb';
-import { DeleteWorkspaceRequest, DeleteWorkspaceResponse, WorkspaceDownloadURLRequest, WorkspaceDownloadURLResponse } from "@gitpod/content-service/lib/workspace_pb";
+import {
+    PluginDownloadURLRequest,
+    PluginDownloadURLResponse,
+    PluginHashRequest,
+    PluginHashResponse,
+    PluginUploadURLRequest,
+    PluginUploadURLResponse,
+} from "@gitpod/content-service/lib/ideplugin_pb";
+import {
+    DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse,
+    WorkspaceDownloadURLRequest,
+    WorkspaceDownloadURLResponse,
+    WorkspaceSnapshotExistsRequest,
+    WorkspaceSnapshotExistsResponse,
+} from "@gitpod/content-service/lib/workspace_pb";
+import {
+    CachingContentServiceClientProvider,
+    CachingIDEPluginClientProvider,
+    CachingWorkspaceServiceClientProvider,
+} from "@gitpod/content-service/lib/sugar";
+import { SnapshotUrl } from "@gitpod/gitpod-protocol";
 import { inject, injectable } from "inversify";
 import { StorageClient } from "./storage-client";
 
 @injectable()
 export class ContentServiceStorageClient implements StorageClient {
-
-    @inject(ContentServiceClient) private readonly contentServiceClient: ContentServiceClient;
-    @inject(WorkspaceServiceClient) private readonly workspaceServiceClient: WorkspaceServiceClient;
-    @inject(IDEPluginServiceClient) private readonly idePluginServiceClient: IDEPluginServiceClient;
+    @inject(CachingContentServiceClientProvider)
+    private readonly contentServiceClientProvider: CachingContentServiceClientProvider;
+    @inject(CachingWorkspaceServiceClientProvider)
+    private readonly workspaceServiceClientProvider: CachingWorkspaceServiceClientProvider;
+    @inject(CachingIDEPluginClientProvider)
+    private readonly idePluginServiceClientProvider: CachingIDEPluginClientProvider;
 
     public async deleteUserContent(ownerId: string): Promise<void> {
         const request = new DeleteUserContentRequest();
         request.setOwnerId(ownerId);
 
         await new Promise<DeleteUserContentResponse>((resolve, reject) => {
-            this.contentServiceClient.deleteUserContent(request, (err: any, resp: DeleteUserContentResponse) => {
+            const client = this.contentServiceClientProvider.getDefault();
+            client.deleteUserContent(request, (err: any, resp: DeleteUserContentResponse) => {
                 if (err) {
                     reject(err);
                 } else {
@@ -35,14 +55,19 @@ export class ContentServiceStorageClient implements StorageClient {
         });
     }
 
-    public async deleteWorkspaceBackups(ownerId: string, workspaceId: string, includeSnapshots: boolean): Promise<void> {
+    public async deleteWorkspaceBackups(
+        ownerId: string,
+        workspaceId: string,
+        includeSnapshots: boolean,
+    ): Promise<void> {
         const request = new DeleteWorkspaceRequest();
         request.setOwnerId(ownerId);
         request.setWorkspaceId(workspaceId);
         request.setIncludeSnapshots(includeSnapshots);
 
         await new Promise<DeleteWorkspaceResponse>((resolve, reject) => {
-            this.workspaceServiceClient.deleteWorkspace(request, (err: any, resp: DeleteWorkspaceResponse) => {
+            const client = this.workspaceServiceClientProvider.getDefault();
+            client.deleteWorkspace(request, (err: any, resp: DeleteWorkspaceResponse) => {
                 if (err) {
                     reject(err);
                 } else {
@@ -58,7 +83,8 @@ export class ContentServiceStorageClient implements StorageClient {
         request.setWorkspaceId(workspaceId);
 
         const response = await new Promise<WorkspaceDownloadURLResponse>((resolve, reject) => {
-            this.workspaceServiceClient.workspaceDownloadURL(request, (err: any, resp: WorkspaceDownloadURLResponse) => {
+            const client = this.workspaceServiceClientProvider.getDefault();
+            client.workspaceDownloadURL(request, (err: any, resp: WorkspaceDownloadURLResponse) => {
                 if (err) {
                     reject(err);
                 } else {
@@ -75,7 +101,8 @@ export class ContentServiceStorageClient implements StorageClient {
         request.setName(objectPath);
 
         const response = await new Promise<PluginUploadURLResponse>((resolve, reject) => {
-            this.idePluginServiceClient.uploadURL(request, (err: any, resp: PluginUploadURLResponse) => {
+            const client = this.idePluginServiceClientProvider.getDefault();
+            client.uploadURL(request, (err: any, resp: PluginUploadURLResponse) => {
                 if (err) {
                     reject(err);
                 } else {
@@ -92,7 +119,8 @@ export class ContentServiceStorageClient implements StorageClient {
         request.setName(objectPath);
 
         const response = await new Promise<PluginDownloadURLResponse>((resolve, reject) => {
-            this.idePluginServiceClient.downloadURL(request, (err: any, resp: PluginDownloadURLResponse) => {
+            const client = this.idePluginServiceClientProvider.getDefault();
+            client.downloadURL(request, (err: any, resp: PluginDownloadURLResponse) => {
                 if (err) {
                     reject(err);
                 } else {
@@ -109,7 +137,8 @@ export class ContentServiceStorageClient implements StorageClient {
         request.setName(objectPath);
 
         const response = await new Promise<PluginHashResponse>((resolve, reject) => {
-            this.idePluginServiceClient.pluginHash(request, (err: any, resp: PluginHashResponse) => {
+            const client = this.idePluginServiceClientProvider.getDefault();
+            client.pluginHash(request, (err: any, resp: PluginHashResponse) => {
                 if (err) {
                     reject(err);
                 } else {
@@ -118,5 +147,25 @@ export class ContentServiceStorageClient implements StorageClient {
             });
         });
         return response.toObject().hash;
+    }
+
+    public async workspaceSnapshotExists(ownerId: string, workspaceId: string, snapshotUrl: string): Promise<boolean> {
+        const { filename } = SnapshotUrl.parse(snapshotUrl);
+        const response = await new Promise<WorkspaceSnapshotExistsResponse>((resolve, reject) => {
+            const request = new WorkspaceSnapshotExistsRequest();
+            request.setOwnerId(ownerId);
+            request.setWorkspaceId(workspaceId);
+            request.setFilename(filename);
+
+            const client = this.workspaceServiceClientProvider.getDefault();
+            client.workspaceSnapshotExists(request, (err: any, resp: WorkspaceSnapshotExistsResponse) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(resp);
+                }
+            });
+        });
+        return response.getExists();
     }
 }

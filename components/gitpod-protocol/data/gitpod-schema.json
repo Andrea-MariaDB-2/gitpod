@@ -39,8 +39,7 @@
                     },
                     "name": {
                         "type": "string",
-                        "deprecationMessage": "The 'name' property is deprecated.",
-                        "description": "Port name (deprecated)."
+                        "description": "Port name."
                     },
                     "protocol": {
                         "type": "string",
@@ -51,6 +50,10 @@
                         ],
                         "deprecationMessage": "The 'protocol' property is deprecated.",
                         "description": "The protocol to be used. (deprecated)"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "A description to identify what is this port used for."
                     }
                 },
                 "additionalProperties": false
@@ -133,13 +136,38 @@
             },
             "additionalProperties": false
         },
+        "additionalRepositories": {
+            "type": "array",
+            "description": "List of additional repositories that are part of this project.",
+            "items": {
+                "type": "object",
+                "required": [
+                    "url"
+                ],
+                "properties": {
+                    "url": {
+                        "type": ["string"],
+                        "description": "The url of the git repository to clone. Supports any context URLs."
+                    },
+                    "checkoutLocation": {
+                        "type": "string",
+                        "description": "Path to where the repository should be checked out relative to `/workspace`. Defaults to the simple repository name."
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        "mainConfiguration": {
+            "type": "string",
+            "description": "The main repository, containing the dev environment configuration."
+        },
         "checkoutLocation": {
             "type": "string",
-            "description": "Path to where the repository should be checked out."
+            "description": "Path to where the repository should be checked out relative to `/workspace`. Defaults to the simple repository name."
         },
         "workspaceLocation": {
             "type": "string",
-            "description": "Path to where the IDE's workspace should be opened."
+            "description": "Path to where the IDE's workspace should be opened. Supports vscode's `*.code-workspace` files."
         },
         "gitConfig": {
             "type": [
@@ -181,6 +209,18 @@
                             "type": "boolean",
                             "description": "Add a Review in Gitpod badge to pull requests. Defaults to true."
                         },
+                        "addCheck": {
+                            "type": [
+                                "boolean",
+                                "string"
+                            ],
+                            "enum": [
+                                true,
+                                false,
+                                "prevent-merge-on-error"
+                            ],
+                            "description": "Add a commit check to pull requests. Set to 'fail-on-error' if you want broken prebuilds to block merging. Defaults to true."
+                        },
                         "addLabel": {
                             "type": [
                                 "boolean",
@@ -206,6 +246,11 @@
                     }
                 }
             }
+        },
+        "experimentalNetwork": {
+            "type": "boolean",
+            "deprecationMessage": "The 'experimentalNetwork' property is deprecated.",
+            "description": "Experimental network configuration in workspaces (deprecated). Enabled by default"
         }
     },
     "additionalProperties": false

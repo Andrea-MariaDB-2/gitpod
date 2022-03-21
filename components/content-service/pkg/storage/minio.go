@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -36,14 +37,39 @@ func ValidateMinIOConfig(c *config.MinIOConfig) error {
 	)
 }
 
+// addMinioParamsFromMounts allows for access/secret key to be read from a file
+func addMinioParamsFromMounts(c *config.MinIOConfig) error {
+	// Allow volume mounts to be passed in for access/secret key
+	if c.AccessKeyIdFile != "" {
+		value, err := os.ReadFile(c.AccessKeyIdFile)
+		if err != nil {
+			return err
+		}
+		c.AccessKeyID = string(value)
+	}
+	if c.SecretAccessKeyFile != "" {
+		value, err := os.ReadFile(c.SecretAccessKeyFile)
+		if err != nil {
+			return err
+		}
+		c.SecretAccessKey = string(value)
+	}
+	return nil
+}
+
 // MinIOClient produces a new minio client based on this configuration
 func NewMinIOClient(c *config.MinIOConfig) (*minio.Client, error) {
 	if c.ParallelUpload == 0 {
 		c.ParallelUpload = 1
 	}
 
+	err := addMinioParamsFromMounts(c)
+	if err != nil {
+		return nil, err
+	}
+
 	// now that we have all the information complete, validate if we're good to go
-	err := ValidateMinIOConfig(c)
+	err = ValidateMinIOConfig(c)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +87,12 @@ func NewMinIOClient(c *config.MinIOConfig) (*minio.Client, error) {
 
 // newDirectMinIOAccess provides direct access to the remote storage system
 func newDirectMinIOAccess(cfg config.MinIOConfig) (*DirectMinIOStorage, error) {
-	if err := ValidateMinIOConfig(&cfg); err != nil {
+	err := addMinioParamsFromMounts(&cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = ValidateMinIOConfig(&cfg); err != nil {
 		return nil, err
 	}
 	return &DirectMinIOStorage{MinIOConfig: cfg}, nil
@@ -463,6 +494,21 @@ func (s *presignedMinIOStorage) ObjectHash(ctx context.Context, bucket string, o
 		return "", translateMinioError(err)
 	}
 	return info.ETag, nil
+}
+
+func (s *presignedMinIOStorage) ObjectExists(ctx context.Context, bucket, obj string) (exists bool, err error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "minio.ObjectExists")
+	defer tracing.FinishSpan(span, &err)
+
+	_, err = s.client.StatObject(ctx, bucket, obj, minio.StatObjectOptions{})
+	if err != nil {
+		e := translateMinioError(err)
+		if e == ErrNotFound {
+			return false, nil
+		}
+		return false, e
+	}
+	return true, nil
 }
 
 func annotationToAmzMetaHeader(annotation string) string {

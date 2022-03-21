@@ -6,11 +6,13 @@ package config
 
 import (
 	"crypto/tls"
-	"crypto/x509"
+	"os"
+
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"os"
+
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 )
 
 // StorageConfig configures the remote storage we use
@@ -22,10 +24,10 @@ type StorageConfig struct {
 	Kind RemoteStorageType `json:"kind"`
 
 	// GCloudConfig configures the Google Bucket remote storage
-	GCloudConfig GCPConfig `json:"gcloud"`
+	GCloudConfig GCPConfig `json:"gcloud,omitempty"`
 
 	// MinIOConfig configures the MinIO remote storage
-	MinIOConfig MinIOConfig `json:"minio"`
+	MinIOConfig MinIOConfig `json:"minio,omitempty"`
 
 	// BackupTrail maintains a number of backups for the same workspace
 	BackupTrail struct {
@@ -101,10 +103,12 @@ type GCPConfig struct {
 
 // MinIOConfig MinIOconfigures the MinIO remote storage backend
 type MinIOConfig struct {
-	Endpoint        string `json:"endpoint"`
-	AccessKeyID     string `json:"accessKey"`
-	SecretAccessKey string `json:"secretKey"`
-	Secure          bool   `json:"secure,omitempty"`
+	Endpoint            string `json:"endpoint"`
+	AccessKeyID         string `json:"accessKey"`
+	AccessKeyIdFile     string `json:"accessKeyFile"`
+	SecretAccessKey     string `json:"secretKey"`
+	SecretAccessKeyFile string `json:"secretKeyFile"`
+	Secure              bool   `json:"secure,omitempty"`
 
 	Region         string `json:"region"`
 	ParallelUpload uint   `json:"parallelUpload,omitempty"`
@@ -143,28 +147,15 @@ func (c *TLSConfig) ServerOption() (grpc.ServerOption, error) {
 		return nil, nil
 	}
 
-	// Load certs
-	certificate, err := tls.LoadX509KeyPair(c.Certificate, c.PrivateKey)
+	tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+		c.Authority, c.Certificate, c.PrivateKey,
+		common_grpc.WithSetClientCAs(true),
+		common_grpc.WithClientAuth(tls.RequireAndVerifyClientCert),
+		common_grpc.WithServerName("ws-manager"),
+	)
 	if err != nil {
-		return nil, xerrors.Errorf("cannot load TLS certificate: %w", err)
+		return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
 	}
 
-	// Create a certificate pool from the certificate authority
-	certPool := x509.NewCertPool()
-	ca, err := os.ReadFile(c.Authority)
-	if err != nil {
-		return nil, xerrors.Errorf("cannot not read ca certificate: %w", err)
-	}
-	if ok := certPool.AppendCertsFromPEM(ca); !ok {
-		return nil, xerrors.Errorf("failed to append ca certs")
-	}
-
-	creds := credentials.NewTLS(&tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		Certificates: []tls.Certificate{certificate},
-		ClientCAs:    certPool,
-		MinVersion:   tls.VersionTLS12,
-	})
-
-	return grpc.Creds(creds), nil
+	return grpc.Creds(credentials.NewTLS(tlsConfig)), nil
 }

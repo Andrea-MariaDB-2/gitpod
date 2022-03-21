@@ -7,6 +7,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,18 +18,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 )
 
-// RouteHandlerConfig configures a RouteHandler
+// RouteHandlerConfig configures a RouteHandler.
 type RouteHandlerConfig struct {
 	Config               *Config
 	DefaultTransport     http.RoundTripper
@@ -36,17 +37,17 @@ type RouteHandlerConfig struct {
 	WorkspaceAuthHandler mux.MiddlewareFunc
 }
 
-// RouteHandlerConfigOpt modifies the router handler config
+// RouteHandlerConfigOpt modifies the router handler config.
 type RouteHandlerConfigOpt func(*Config, *RouteHandlerConfig)
 
-// WithDefaultAuth enables workspace access authentication
+// WithDefaultAuth enables workspace access authentication.
 func WithDefaultAuth(infoprov WorkspaceInfoProvider) RouteHandlerConfigOpt {
 	return func(config *Config, c *RouteHandlerConfig) {
 		c.WorkspaceAuthHandler = WorkspaceAuthHandler(config.GitpodInstallation.HostName, infoprov)
 	}
 }
 
-// NewRouteHandlerConfig creates a new instance
+// NewRouteHandlerConfig creates a new instance.
 func NewRouteHandlerConfig(config *Config, opts ...RouteHandlerConfigOpt) (*RouteHandlerConfig, error) {
 	corsHandler, err := corsHandler(config.GitpodInstallation.Scheme, config.GitpodInstallation.HostName)
 	if err != nil {
@@ -65,16 +66,21 @@ func NewRouteHandlerConfig(config *Config, opts ...RouteHandlerConfigOpt) (*Rout
 	return cfg, nil
 }
 
-// RouteHandler is a function that handles a HTTP route
+// RouteHandler is a function that handles a HTTP route.
 type RouteHandler = func(r *mux.Router, config *RouteHandlerConfig)
 
-// installWorkspaceRoutes configures routing of workspace and IDE requests
-func installWorkspaceRoutes(r *mux.Router, config *RouteHandlerConfig, ip WorkspaceInfoProvider) {
+// installWorkspaceRoutes configures routing of workspace and IDE requests.
+func installWorkspaceRoutes(r *mux.Router, config *RouteHandlerConfig, ip WorkspaceInfoProvider, hostKeyList []ssh.Signer) {
 	r.Use(logHandler)
 
 	// Note: the order of routes defines their priority.
 	//       Routes registered first have priority over those that come afterwards.
 	routes := newIDERoutes(config, ip)
+
+	// if host key is not empty, we use /_ssh/host_keys to provider public host key
+	if len(hostKeyList) > 0 {
+		routes.HandleSSHHostKeyRoute(r.Path("/_ssh/host_keys"), hostKeyList)
+	}
 
 	// The favicon warants special handling, because we pull that from the supervisor frontend
 	// rather than the IDE.
@@ -133,6 +139,29 @@ type ideRoutes struct {
 	workspaceMustExistHandler mux.MiddlewareFunc
 }
 
+func (ir *ideRoutes) HandleSSHHostKeyRoute(route *mux.Route, hostKeyList []ssh.Signer) {
+	shk := make([]struct {
+		Type    string `json:"type"`
+		HostKey string `json:"host_key"`
+	}, len(hostKeyList))
+	for i, hk := range hostKeyList {
+		shk[i].Type = hk.PublicKey().Type()
+		shk[i].HostKey = base64.StdEncoding.EncodeToString(hk.PublicKey().Marshal())
+	}
+	byt, err := json.Marshal(shk)
+	if err != nil {
+		log.WithError(err).Error("ssh_host_key router setup failed")
+		return
+	}
+	r := route.Subrouter()
+	r.Use(logRouteHandlerHandler("HandleSSHHostKeyRoute"))
+	r.Use(ir.Config.CorsHandler)
+	r.NewRoute().HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Add("Content-Type", "application/json")
+		rw.Write(byt)
+	})
+}
+
 func (ir *ideRoutes) HandleDirectIDERoute(route *mux.Route) {
 	r := route.Subrouter()
 	r.Use(logRouteHandlerHandler("HandleDirectIDERoute"))
@@ -140,7 +169,7 @@ func (ir *ideRoutes) HandleDirectIDERoute(route *mux.Route) {
 	r.Use(ir.Config.WorkspaceAuthHandler)
 	r.Use(ir.workspaceMustExistHandler)
 
-	r.NewRoute().HandlerFunc(proxyPass(ir.Config, workspacePodResolver, withWorkspaceTransport()))
+	r.NewRoute().HandlerFunc(proxyPass(ir.Config, ir.InfoProvider, workspacePodResolver, withWorkspaceTransport()))
 }
 
 func (ir *ideRoutes) HandleDirectSupervisorRoute(route *mux.Route, authenticated bool) {
@@ -152,7 +181,7 @@ func (ir *ideRoutes) HandleDirectSupervisorRoute(route *mux.Route, authenticated
 		r.Use(ir.Config.WorkspaceAuthHandler)
 	}
 
-	r.NewRoute().HandlerFunc(proxyPass(ir.Config, workspacePodSupervisorResolver))
+	r.NewRoute().HandlerFunc(proxyPass(ir.Config, ir.InfoProvider, workspacePodSupervisorResolver))
 }
 
 func (ir *ideRoutes) HandleSupervisorFrontendRoute(route *mux.Route) {
@@ -164,6 +193,7 @@ func (ir *ideRoutes) HandleSupervisorFrontendRoute(route *mux.Route) {
 
 	r := route.Subrouter()
 	r.Use(logRouteHandlerHandler("SupervisorIDEHostHandler"))
+	r.Use(ir.workspaceMustExistHandler)
 	// strip the frontend prefix, just for good measure
 	r.Use(func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
@@ -172,17 +202,27 @@ func (ir *ideRoutes) HandleSupervisorFrontendRoute(route *mux.Route) {
 		})
 	})
 	// always hit the blobserver to ensure that blob is downloaded
-	r.NewRoute().HandlerFunc(proxyPass(ir.Config, func(cfg *Config, req *http.Request) (*url.URL, error) {
-		return resolveSupervisorURL(cfg), nil
+	r.NewRoute().HandlerFunc(proxyPass(ir.Config, ir.InfoProvider, func(cfg *Config, infoProvider WorkspaceInfoProvider, req *http.Request) (*url.URL, error) {
+		info := getWorkspaceInfoFromContext(req.Context())
+		return resolveSupervisorURL(cfg, info, req)
 	}, func(h *proxyPassConfig) {
 		h.Transport = &blobserveTransport{
 			transport: h.Transport,
 			Config:    ir.Config.Config,
 			resolveImage: func(t *blobserveTransport, req *http.Request) string {
-				var (
-					image = ir.Config.Config.WorkspacePodConfig.SupervisorImage
-					path  = strings.TrimPrefix(req.URL.Path, "/"+image)
-				)
+				info := getWorkspaceInfoFromContext(req.Context())
+				if info == nil && len(ir.Config.Config.WorkspacePodConfig.SupervisorImage) == 0 {
+					// no workspace information available - cannot resolve supervisor image
+					return ""
+				}
+
+				// use the config value for backwards compatibility when info.SupervisorImage is not set
+				image := ir.Config.Config.WorkspacePodConfig.SupervisorImage
+				if info != nil && len(info.SupervisorImage) > 0 {
+					image = info.SupervisorImage
+				}
+
+				path := strings.TrimPrefix(req.URL.Path, "/"+image)
 				if path == "/worker-proxy.js" {
 					// worker must be served from the same origin
 					return ""
@@ -193,12 +233,23 @@ func (ir *ideRoutes) HandleSupervisorFrontendRoute(route *mux.Route) {
 	}))
 }
 
-func resolveSupervisorURL(cfg *Config) *url.URL {
+func resolveSupervisorURL(cfg *Config, info *WorkspaceInfo, req *http.Request) (*url.URL, error) {
+	if info == nil && len(cfg.WorkspacePodConfig.SupervisorImage) == 0 {
+		log.WithFields(log.OWI("", getWorkspaceCoords(req).ID, "")).Warn("no workspace info available - cannot resolve supervisor route")
+		return nil, xerrors.Errorf("no workspace information available - cannot resolve supervisor route")
+	}
+
+	// use the config value for backwards compatibility when info.SupervisorImage is not set
+	supervisorImage := cfg.WorkspacePodConfig.SupervisorImage
+	if info != nil && len(info.SupervisorImage) > 0 {
+		supervisorImage = info.SupervisorImage
+	}
+
 	var dst url.URL
 	dst.Scheme = cfg.BlobServer.Scheme
 	dst.Host = cfg.BlobServer.Host
-	dst.Path = "/" + cfg.WorkspacePodConfig.SupervisorImage
-	return &dst
+	dst.Path = "/" + supervisorImage
+	return &dst, nil
 }
 
 type BlobserveInlineVars struct {
@@ -213,10 +264,10 @@ func (ir *ideRoutes) HandleRoot(route *mux.Route) {
 	r.Use(ir.workspaceMustExistHandler)
 
 	workspaceIDEPass := ir.Config.WorkspaceAuthHandler(
-		proxyPass(ir.Config, workspacePodResolver),
+		proxyPass(ir.Config, ir.InfoProvider, workspacePodResolver),
 	)
 	// always hit the blobserver to ensure that blob is downloaded
-	r.NewRoute().HandlerFunc(proxyPass(ir.Config, dynamicIDEResolver, func(h *proxyPassConfig) {
+	r.NewRoute().HandlerFunc(proxyPass(ir.Config, ir.InfoProvider, dynamicIDEResolver, func(h *proxyPassConfig) {
 		h.Transport = &blobserveTransport{
 			transport: h.Transport,
 			Config:    ir.Config.Config,
@@ -234,9 +285,14 @@ func (ir *ideRoutes) HandleRoot(route *mux.Route) {
 				// blobserve can inline static links in index.html for IDE and supervisor to avoid redirects for each resource
 				// but it has to know exposed URLs in the context of current workspace cluster
 				// so first we ask blobserve to preload the supervisor image
-				// and if it is succesful we pass exposed URLs to IDE and supervisor to blobserve for inlining
-				supervisorURL := resolveSupervisorURL(t.Config).String() + "/main.js"
-				preloadSupervisorReq, err := http.NewRequest("GET", supervisorURL, nil)
+				// and if it is successful we pass exposed URLs to IDE and supervisor to blobserve for inlining
+				supervisorURL, err := resolveSupervisorURL(t.Config, info, req)
+				if err != nil {
+					log.WithError(err).Error("could not preload supervisor")
+					return image
+				}
+				supervisorURLString := supervisorURL.String() + "/main.js"
+				preloadSupervisorReq, err := http.NewRequest("GET", supervisorURLString, nil)
 				if err != nil {
 					log.WithField("supervisorURL", supervisorURL).WithError(err).Error("could not preload supervisor")
 					return image
@@ -252,9 +308,15 @@ func (ir *ideRoutes) HandleRoot(route *mux.Route) {
 					return image
 				}
 
+				// use the config value for backwards compatibility when info.SupervisorImage is not set
+				supervisorImage := t.Config.WorkspacePodConfig.SupervisorImage
+				if len(info.SupervisorImage) > 0 {
+					supervisorImage = info.SupervisorImage
+				}
+
 				inlineVars := &BlobserveInlineVars{
 					IDE:             t.asBlobserveURL(image, ""),
-					SupervisorImage: t.asBlobserveURL(t.Config.WorkspacePodConfig.SupervisorImage, ""),
+					SupervisorImage: t.asBlobserveURL(supervisorImage, ""),
 				}
 				inlinveVarsValue, err := json.Marshal(inlineVars)
 				if err != nil {
@@ -272,7 +334,7 @@ func (ir *ideRoutes) HandleRoot(route *mux.Route) {
 const imagePathSeparator = "/__files__"
 
 // installBlobserveRoutes  implements long-lived caching with versioned URLs, see https://web.dev/http-cache/#versioned-urls
-func installBlobserveRoutes(r *mux.Router, config *RouteHandlerConfig) {
+func installBlobserveRoutes(r *mux.Router, config *RouteHandlerConfig, infoProvider WorkspaceInfoProvider) {
 	r.Use(logHandler)
 	r.Use(handlers.CompressHandler)
 	r.Use(logRouteHandlerHandler("BlobserveRootHandler"))
@@ -282,7 +344,7 @@ func installBlobserveRoutes(r *mux.Router, config *RouteHandlerConfig) {
 		handlers.AllowedMethods([]string{"GET", "OPTIONS"}),
 	))
 
-	targetResolver := func(cfg *Config, req *http.Request) (tgt *url.URL, err error) {
+	targetResolver := func(cfg *Config, infoProvider WorkspaceInfoProvider, req *http.Request) (tgt *url.URL, err error) {
 		segments := strings.SplitN(req.URL.Path, imagePathSeparator, 2)
 		if len(segments) < 2 {
 			return nil, xerrors.Errorf("invalid URL")
@@ -298,11 +360,11 @@ func installBlobserveRoutes(r *mux.Router, config *RouteHandlerConfig) {
 		dst.Path = image
 		return &dst, nil
 	}
-	r.NewRoute().Handler(proxyPass(config, targetResolver, withLongTermCaching()))
+	r.NewRoute().Handler(proxyPass(config, infoProvider, targetResolver, withLongTermCaching()))
 }
 
-// installWorkspacePortRoutes configures routing for exposed ports
-func installWorkspacePortRoutes(r *mux.Router, config *RouteHandlerConfig) error {
+// installWorkspacePortRoutes configures routing for exposed ports.
+func installWorkspacePortRoutes(r *mux.Router, config *RouteHandlerConfig, infoProvider WorkspaceInfoProvider) error {
 	showPortNotFoundPage, err := servePortNotFoundPage(config.Config)
 	if err != nil {
 		return err
@@ -328,6 +390,7 @@ func installWorkspacePortRoutes(r *mux.Router, config *RouteHandlerConfig) error
 			r.Header.Add("X-Forwarded-Host", r.Host+":443")
 			proxyPass(
 				config,
+				infoProvider,
 				workspacePodPortResolver,
 				withHTTPErrorHandler(showPortNotFoundPage),
 				withXFrameOptionsFilter(),
@@ -339,25 +402,28 @@ func installWorkspacePortRoutes(r *mux.Router, config *RouteHandlerConfig) error
 	return nil
 }
 
-// workspacePodResolver resolves to the workspace pod's url from the given request
-func workspacePodResolver(config *Config, req *http.Request) (url *url.URL, err error) {
+// workspacePodResolver resolves to the workspace pod's url from the given request.
+func workspacePodResolver(config *Config, infoProvider WorkspaceInfoProvider, req *http.Request) (url *url.URL, err error) {
 	coords := getWorkspaceCoords(req)
-	return buildWorkspacePodURL(config.WorkspacePodConfig.ServiceTemplate, coords.ID, fmt.Sprint(config.WorkspacePodConfig.TheiaPort))
+	workspaceInfo := infoProvider.WorkspaceInfo(coords.ID)
+	return buildWorkspacePodURL(workspaceInfo.IPAddress, fmt.Sprint(config.WorkspacePodConfig.TheiaPort))
 }
 
-// workspacePodPortResolver resolves to the workspace pods ports
-func workspacePodPortResolver(config *Config, req *http.Request) (url *url.URL, err error) {
+// workspacePodPortResolver resolves to the workspace pods ports.
+func workspacePodPortResolver(config *Config, infoProvider WorkspaceInfoProvider, req *http.Request) (url *url.URL, err error) {
 	coords := getWorkspaceCoords(req)
-	return buildWorkspacePodURL(config.WorkspacePodConfig.PortServiceTemplate, coords.ID, coords.Port)
+	workspaceInfo := infoProvider.WorkspaceInfo(coords.ID)
+	return buildWorkspacePodURL(workspaceInfo.IPAddress, coords.Port)
 }
 
-// workspacePodSupervisorResolver resolves to the workspace pods Supervisor url from the given request
-func workspacePodSupervisorResolver(config *Config, req *http.Request) (url *url.URL, err error) {
+// workspacePodSupervisorResolver resolves to the workspace pods Supervisor url from the given request.
+func workspacePodSupervisorResolver(config *Config, infoProvider WorkspaceInfoProvider, req *http.Request) (url *url.URL, err error) {
 	coords := getWorkspaceCoords(req)
-	return buildWorkspacePodURL(config.WorkspacePodConfig.ServiceTemplate, coords.ID, fmt.Sprint(config.WorkspacePodConfig.SupervisorPort))
+	workspaceInfo := infoProvider.WorkspaceInfo(coords.ID)
+	return buildWorkspacePodURL(workspaceInfo.IPAddress, fmt.Sprint(config.WorkspacePodConfig.SupervisorPort))
 }
 
-func dynamicIDEResolver(config *Config, req *http.Request) (res *url.URL, err error) {
+func dynamicIDEResolver(config *Config, infoProvider WorkspaceInfoProvider, req *http.Request) (res *url.URL, err error) {
 	info := getWorkspaceInfoFromContext(req.Context())
 	if info == nil {
 		log.WithFields(log.OWI("", getWorkspaceCoords(req).ID, "")).Warn("no workspace info available - cannot resolve Theia route")
@@ -372,26 +438,11 @@ func dynamicIDEResolver(config *Config, req *http.Request) (res *url.URL, err er
 	return &dst, nil
 }
 
-// TODO(gpl) This is currently executed per request: cache/use more performant solution?
-func buildWorkspacePodURL(tmpl string, workspaceID string, port string) (*url.URL, error) {
-	tpl, err := template.New("host").Parse(tmpl)
-	if err != nil {
-		return nil, err
-	}
-
-	var out bytes.Buffer
-	err = tpl.Execute(&out, map[string]string{
-		"workspaceID": workspaceID,
-		"port":        port,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return url.Parse(out.String())
+func buildWorkspacePodURL(ipAddress string, port string) (*url.URL, error) {
+	return url.Parse(fmt.Sprintf("http://%v:%v", ipAddress, port))
 }
 
-// corsHandler produces the CORS handler for workspaces
+// corsHandler produces the CORS handler for workspaces.
 func corsHandler(scheme, hostname string) (mux.MiddlewareFunc, error) {
 	origin := fmt.Sprintf("%s://%s", scheme, hostname)
 
@@ -526,10 +577,10 @@ func workspaceMustExistHandler(config *Config, infoProvider WorkspaceInfoProvide
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
 			coords := getWorkspaceCoords(req)
-			info := infoProvider.WorkspaceInfo(req.Context(), coords.ID)
+			info := infoProvider.WorkspaceInfo(coords.ID)
 			if info == nil {
 				log.WithFields(log.OWI("", coords.ID, "")).Info("no workspace info found - redirecting to start")
-				redirectURL := fmt.Sprintf("%s://%s/start/#%s", config.GitpodInstallation.Scheme, config.GitpodInstallation.HostName, coords.ID)
+				redirectURL := fmt.Sprintf("%s://%s/start/?not_found=true#%s", config.GitpodInstallation.Scheme, config.GitpodInstallation.HostName, coords.ID)
 				http.Redirect(resp, req, redirectURL, http.StatusFound)
 				return
 			}
@@ -539,7 +590,7 @@ func workspaceMustExistHandler(config *Config, infoProvider WorkspaceInfoProvide
 	}
 }
 
-// getWorkspaceInfoFromContext retrieves workspace information put there by the workspaceMustExistHandler
+// getWorkspaceInfoFromContext retrieves workspace information put there by the workspaceMustExistHandler.
 func getWorkspaceInfoFromContext(ctx context.Context) *WorkspaceInfo {
 	r := ctx.Value(infoContextValueKey)
 	rl, ok := r.(*WorkspaceInfo)
@@ -579,7 +630,7 @@ func removeSensitiveCookies(cookies []*http.Cookie, domain string) []*http.Cooki
 	return cookies[:n]
 }
 
-// region blobserve transport
+// region blobserve transport.
 type blobserveTransport struct {
 	transport    http.RoundTripper
 	Config       *Config
@@ -713,6 +764,6 @@ func servePortNotFoundPage(config *Config) (http.Handler, error) {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write(page)
+		_, _ = w.Write(page)
 	}), nil
 }

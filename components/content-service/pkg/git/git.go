@@ -260,29 +260,28 @@ func (c *Client) Status(ctx context.Context) (res *Status, err error) {
 
 // Clone runs git clone
 func (c *Client) Clone(ctx context.Context) (err error) {
-	if err := os.MkdirAll(c.Location, 0755); err != nil {
-		log.WithError(err).Error()
+	err = os.MkdirAll(c.Location, 0755)
+	if err != nil {
+		log.WithError(err).Error("cannot create clone location")
 	}
 
-	args := make([]string, 0)
-	args = append(args, c.RemoteURI)
+	args := []string{"--depth=1", "--no-single-branch", c.RemoteURI}
 
 	for key, value := range c.Config {
 		args = append(args, "--config")
 		args = append(args, strings.TrimSpace(key)+"="+strings.TrimSpace(value))
 	}
 
-	// TODO(cw): re-introduce this when we have a better story for repo forking
-	// args = append(args, "--filter=blob:none")
-
 	args = append(args, ".")
 
 	return c.Git(ctx, "clone", args...)
 }
 
-// Fetch runs git fetch
+// Fetch runs git fetch and prunes remote-tracking references as well as ALL LOCAL TAGS.
 func (c *Client) Fetch(ctx context.Context) (err error) {
-	return c.Git(ctx, "fetch")
+	// we need to fetch with pruning to avoid issues like github.com/gitpod-io/gitpod/issues/7561.
+	// See https://git-scm.com/docs/git-fetch#Documentation/git-fetch.txt---prune for more details.
+	return c.Git(ctx, "fetch", "-p", "-P", "--tags", "-f")
 }
 
 // UpdateRemote performs a git fetch on the upstream remote URI

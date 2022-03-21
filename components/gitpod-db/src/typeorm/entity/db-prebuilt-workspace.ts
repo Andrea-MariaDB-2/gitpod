@@ -9,12 +9,16 @@ import { PrimaryColumn, Column, Entity, Index } from "typeorm";
 import { PrebuiltWorkspace, PrebuiltWorkspaceState } from "@gitpod/gitpod-protocol";
 import { TypeORM } from "../typeorm";
 import { Transformer } from "../transformer";
+import { PrebuildWorkspaceRateLimiterMigration1646739309660 } from "../migration/1646739309660-PrebuildWorskace-rate-limiter-migration";
 
 @Entity()
 @Index("ind_ac4a9aece1a455da0dc653888f", ["cloneURL", "commit"])
+@Index(
+    PrebuildWorkspaceRateLimiterMigration1646739309660.INDEX_NAME,
+    PrebuildWorkspaceRateLimiterMigration1646739309660.FIELDS,
+)
 // on DB but not Typeorm: @Index("ind_lastModified", ["_lastModified"])   // DBSync
 export class DBPrebuiltWorkspace implements PrebuiltWorkspace {
-
     @PrimaryColumn(TypeORM.UUID_COLUMN_TYPE)
     id: string;
 
@@ -25,14 +29,15 @@ export class DBPrebuiltWorkspace implements PrebuiltWorkspace {
     commit: string;
 
     @Column({
-        default: '',
-        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED
+        default: "",
+        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED,
     })
+    @Index("ind_projectId")
     projectId?: string;
 
     @Column({
-        default: '',
-        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED
+        default: "",
+        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED,
     })
     branch?: string;
 
@@ -41,26 +46,26 @@ export class DBPrebuiltWorkspace implements PrebuiltWorkspace {
     state: PrebuiltWorkspaceState;
 
     @Column({
-        type: 'timestamp',
+        type: "timestamp",
         precision: 6,
-        default: () => 'CURRENT_TIMESTAMP(6)',
-        transformer: Transformer.MAP_ISO_STRING_TO_TIMESTAMP_DROP
+        default: () => "CURRENT_TIMESTAMP(6)",
+        transformer: Transformer.MAP_ISO_STRING_TO_TIMESTAMP_DROP,
     })
     creationTime: string;
 
     @Column(TypeORM.WORKSPACE_ID_COLUMN_TYPE)
-    @Index('ind_buildWorkspaceId')
+    @Index("ind_buildWorkspaceId")
     buildWorkspaceId: string;
 
     @Column({
-        default: '',
-        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED
+        default: "",
+        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED,
     })
     snapshot?: string;
 
     @Column({
-        default: '',
-        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED
+        default: "",
+        transformer: Transformer.MAP_EMPTY_STR_TO_UNDEFINED,
     })
     error?: string;
 }

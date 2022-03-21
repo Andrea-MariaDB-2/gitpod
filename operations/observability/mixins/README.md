@@ -12,6 +12,7 @@ Gitpod's mixin is based on the [Prometheus Monitoring Mixins project](https://gi
     * [Recording Rules](#Recording-Rules)
     * [Alerts](#Alerts)
     * [Rules and Alerts validation](#Rules-and-Alerts-validation)
+* [Deploying merged changes to production](#Deploying-merged-changes-to-production)
 * [Frequently asked Questions](#FAQ)
     * [Any recommendations when developing new dashboards?](#Any-recommendations-when-developing-new-dashboards)
     * [How is our mixin consumed?](#How-is-our-mixin-consumed)
@@ -268,6 +269,14 @@ By running `make promtool-lint`, you'll generate a new file called `prometheus_a
 
 We also have this same validation running in our CI, to make sure we don't merge stuff that can break our monitoring system.
 
+## Deploying merged changes to production
+
+Alright, you got your changes merged, now what? The changes need to land on our [gitpod-io/observability](https://github.com/gitpod-io/observability) repository by updating the `vendor/` folder.
+
+The `vendor/` folder can be updated by triggering this [workflow](https://github.com/gitpod-io/observability/actions/workflows/dep-update.yaml). Yes, you just need to click the button and the workflow will open a new Pull Request with the updates.
+
+After all CI checks pass, it is safe to merge the Pull Request. It is now ArgoCD's duty to synchronize the monitoring-satellite applications across all clusters. If you want to check progress, you can do that through [ArgoCD UI](https://argo-cd.gitpod-io-dev.com/applications?labels=application%253Dmonitoring-satellite).
+
 ## FAQ
 
 ### Any recommendations when developing new dashboards?
@@ -286,28 +295,55 @@ This `jsonnetfile.json` lists all dependencies that we use, which includes this 
 
 ### How do I review dashboards before merging PRs?
 
-There are a couple of ways to trigger a werft job that will deploy a preview environment with Prometheus+Grafana with your changes:
+There are a couple of options to trigger a werft job that will deploy a preview environment with Prometheus+Grafana with your changes:
 
-1. You can open a Pull Request with the following line in the description:
-```
-/werft with-observability
+#### Pull request description
 
-# Just in case your PR requires extra configuration on Prometheus side
-# (and you have a new branch on https://github.com/gitpod-io/observability with such changes)
-# you can add the line below
-/werft withObservabilityBranch="<my-branch>"
-```
+By adding werft annotations to Pull Request descriptions, you make sure that all following job will have those annotations set.
 
-2. After opening a Pull Request, you can add a Github comment:
+The following combination of annotations can be used to deploy monitoring satellite
+* Use harvester previews. Monitoring-satellite is deployed on those previews by default
 ```
-/werft run with-observability
-/werft run withObservabilityBranch="<my-branch>"
+/werft with-vm=true
+# Just in case your PR requires extra configuration on Prometheus side (and you have a new branch on https://github.com/gitpod-io/observability with such changes)
+# You can add the line below
+/werft withObservabilityBranch=<my-branch>
 ```
 
-3. Inside your workspace, run:
+* Use Gitpod helm charts to deploy a preview, and add the observability annotation
 ```
-werft run github -a with-observability="" -a withObservabilityBranch="<my-branch>"
+/werft with-helm=true with-observability=true
+# Just in case your PR requires extra configuration on Prometheus side (and you have a new branch on https://github.com/gitpod-io/observability with such changes)
+# You can add the line below
+/werft withObservabilityBranch=<my-branch>
 ```
+
+#### Github comment
+
+If you want to run **one** particular job with different annotations, you can add them to a particular Github comment
+
+```
+/werft run with-vm=true
+/werft run withObservabilityBranch=<my-branch>
+```
+or
+```
+/werft run with-helm=true with-observability=true
+/werft run withObservabilityBranch=<my-branch>
+```
+
+#### Werft CLI inside a workspace
+
+One last option is to open a workspace, then use Werft command line interface to start a job
+
+```
+werft run github -a with-vm=true # Optional-a withObservabilityBranch="<my-branch>"
+```
+or
+```
+werft run github -a with-helm=true -a with-observability=true # Optional-a withObservabilityBranch="<my-branch>"
+```
+
 
 As mentioned in [How is our mixin consumed?](#How-is-our-mixin-consumed), please remember that a commit must be done for us to update monitoring-satellite with the dashboards/alerts/recording rule changes.
 

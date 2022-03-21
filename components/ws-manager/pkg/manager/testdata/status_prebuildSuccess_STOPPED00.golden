@@ -11,7 +11,7 @@
         },
         "spec": {
             "workspace_image": "eu.gcr.io/gitpod-core-dev/registry/workspace-images:81c4fb602a540d261f210cfc8ba0435b63b24238c1762ec029d8edaec816afb6",
-            "ide_image": "eu.gcr.io/gitpod-core-dev/build/ide/code:gpl-headless-log-wsman.17",
+            "deprecated_ide_image": "eu.gcr.io/gitpod-core-dev/build/ide/code:gpl-headless-log-wsman.17",
             "headless": true,
             "url": "https://green-wombat-62dzneud.ws-dev.gpl-headless-log-wsman.staging.gitpod-dev.com",
             "exposed_ports": [
@@ -75,14 +75,15 @@
                     "url": "https://13444-green-wombat-62dzneud.ws-dev.gpl-headless-log-wsman.staging.gitpod-dev.com"
                 }
             ],
-            "type": 1
+            "type": 1,
+            "ide_image": {
+                "web_ref": "eu.gcr.io/gitpod-core-dev/build/ide/code:gpl-headless-log-wsman.17"
+            }
         },
         "phase": 6,
         "conditions": {
-            "service_exists": 1,
             "snapshot": "workspaces/green-wombat-62dzneud/snapshot-1622206186881521445.tar@gitpod-user-d98c5b92-2066-4fce-bea6-1e08b58642ab",
-            "final_backup_complete": 1,
-            "deployed": 1
+            "final_backup_complete": 1
         },
         "runtime": {
             "node_name": "gke-dev-workload-1-49d27f81-pd35",

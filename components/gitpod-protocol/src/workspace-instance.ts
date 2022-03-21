@@ -51,6 +51,11 @@ export interface WorkspaceInstance {
 
     // instance is hard-deleted on the database and about to be collected by db-sync
     readonly deleted?: boolean;
+
+    /**
+     * Contains information about the image build, if there was any
+     */
+    imageBuildInfo?: ImageBuildInfo;
 }
 
 // WorkspaceInstanceStatus describes the current state of a workspace instance
@@ -90,52 +95,50 @@ export interface WorkspaceInstanceStatus {
 export type WorkspaceInstancePhase =
     // unknown indicates an issue within the system in that it cannot determine the actual phase of
     // a workspace. This phase is usually accompanied by an error.
-    "unknown" |
+    | "unknown"
 
     // Preparing means that we haven't actually started the workspace instance just yet, but rather
     // are still preparing for launch. This means we're building the Docker image for the workspace.
-    "preparing" |
+    | "preparing"
 
     // Pending means the workspace does not yet consume resources in the cluster, but rather is looking for
     // some space within the cluster. If for example the cluster needs to scale up to accomodate the
     // workspace, the workspace will be in Pending state until that happened.
-    "pending" |
+    | "pending"
 
     // Creating means the workspace is currently being created. Thati includes downloading the images required
     // to run the workspace over the network. The time spent in this phase varies widely and depends on the current
     // network speed, image size and cache states.
-    "creating" |
+    | "creating"
 
     // Initializing is the phase in which the workspace is executing the appropriate workspace initializer (e.g. Git
     // clone or backup download). After this phase one can expect the workspace to either be Running or Failed.
-    "initializing" |
+    | "initializing"
 
     // Running means the workspace is able to actively perform work, either by serving a user through Theia,
     // or as a headless workspace.
-    "running" |
+    | "running"
 
     // Interrupted is an exceptional state where the container should be running but is temporarily unavailable.
     // When in this state, we expect it to become running or stopping anytime soon.
-    "interrupted" |
+    | "interrupted"
 
     // Stopping means that the workspace is currently shutting down. It could go to stopped every moment.
-    "stopping" |
+    | "stopping"
 
     // Stopped means the workspace ended regularly because it was shut down.
-    "stopped";
+    | "stopped";
 
 export interface WorkspaceInstanceConditions {
     // Failed contains the reason the workspace failed to operate. If this field is empty, the workspace has not failed.
-    failed?: string
+    // failed contains technical details for the failure of the workspace.
+    failed?: string;
 
     // timeout contains the reason the workspace has timed out. If this field is empty, the workspace has not timed out.
-    timeout?: string
+    timeout?: string;
 
     // PullingImages marks if the workspace is currently pulling its images. This condition can only be set during PhaseCreating
-    pullingImages?: boolean
-
-    // ServiceExists denotes if the workspace theia-/ports- services exist. This condition will be true if either of the two services exist.
-    serviceExists?: boolean
+    pullingImages?: boolean;
 
     // deployed marks that a workspace instance was sent/deployed at a workspace manager
     deployed?: boolean;
@@ -146,23 +149,26 @@ export interface WorkspaceInstanceConditions {
     // ISO8601 timestamp when the first user activity was registered in the frontend. Only set if the workspace is running.
     firstUserActivity?: string;
 
-    // headless_task_failed indicates that a headless workspace task failed
+    // headlessTaskFailed indicates that a headless workspace task failed
+    // headlessTaskFailed is only set if:
+    //  * this workspace is headless
+    //  * the task being run returned a non 0 exit status code
     headlessTaskFailed?: string;
+
+    // stopped_by_request is true if the workspace was stopped using a StopWorkspace call
+    stoppedByRequest?: boolean;
 }
 
 // AdmissionLevel describes who can access a workspace instance and its ports.
-export type AdmissionLevel = 'owner_only' | 'everyone';
+export type AdmissionLevel = "owner_only" | "everyone";
 
 // PortVisibility describes how a port can be accessed
-export type PortVisibility = 'public' | 'private';
+export type PortVisibility = "public" | "private";
 
 // WorkspaceInstancePort describes a port exposed on a workspace instance
 export interface WorkspaceInstancePort {
     // The outward-facing port number
     port: number;
-
-    // An optional inward-facing port number. If not present we'll use port.
-    targetPort?: number;
 
     // The visiblity of this port. Optional for backwards compatibility.
     visibility?: PortVisibility;
@@ -183,19 +189,19 @@ export interface WorkspaceInstanceRepoStatus {
     uncommitedFiles?: string[];
 
     // the total number of uncommited files
-    totalUncommitedFiles?: number
+    totalUncommitedFiles?: number;
 
     // untrackedFiles is the list of untracked files in the workspace, possibly truncated
     untrackedFiles?: string[];
 
     // the total number of untracked files
-    totalUntrackedFiles?: number
+    totalUntrackedFiles?: number;
 
     // unpushedCommits is the list of unpushed changes in the workspace, possibly truncated
     unpushedCommits?: string[];
 
     // the total number of unpushed changes
-    totalUnpushedCommits?: number
+    totalUnpushedCommits?: number;
 }
 
 // WorkspaceInstanceConfiguration contains all per-instance configuration
@@ -209,4 +215,25 @@ export interface WorkspaceInstanceConfiguration {
 
     // ideImage is the ref of the IDE image this instance uses.
     ideImage: string;
+
+    // desktopIdeImage is the ref of the desktop IDE image this instance uses.
+    desktopIdeImage?: string;
+
+    // supervisorImage is the ref of the supervisor image this instance uses.
+    supervisorImage?: string;
+}
+
+/**
+ * Holds information about the image build (if there was one) for this WorkspaceInstance
+ */
+export interface ImageBuildInfo {
+    log?: ImageBuildLogInfo;
+}
+
+/**
+ * Holds information about how to access logs for this an image build
+ */
+export interface ImageBuildLogInfo {
+    url: string;
+    headers: { [key: string]: string };
 }

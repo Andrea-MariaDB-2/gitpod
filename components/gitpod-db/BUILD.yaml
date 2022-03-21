@@ -16,16 +16,8 @@ packages:
   - name: migrations
     type: yarn
     srcs:
-      - "src/typeorm/migration/**/*.ts"
-      - "src/typeorm/entity/*.ts"
-      - "src/typeorm/ormconfig.ts"
-      - "src/typeorm/typeorm.ts"
-      - "src/typeorm/user-db-impl.ts"
-      - "src/typeorm/transformer.ts"
-      - "src/config.ts"
-      - "src/wait-for-db.ts"
-      - "src/user-db.ts"
-      - "package.json"
+      - "src/**/*.ts"
+      - package.json
     deps:
       - components/gitpod-protocol:lib
     config:
@@ -48,7 +40,7 @@ packages:
       tsconfig: tsconfig.json
       commands:
         test: ["yarn", "db-test"]
-        build: ["npx", "tsc"]
+        build: ["yarn", "build"]
   - name: dbtest-init
     type: generic
     srcs:
@@ -61,6 +53,7 @@ packages:
       - DB_PORT=23306
       - DB_USER=root
       - DB_PASSWORD=test
+      - DB_ENCRYPTION_KEYS=[{"name":"general","version":1,"primary":true,"material":"5vRrp0H4oRgdkPnX1qQcS54Q0xggr6iyho42IQ1rO+c="}]
     ephemeral: true
     config:
       commands:
@@ -72,7 +65,12 @@ packages:
         - ["sh", "-c", "find chart-config-db-init--init-scripts -name \"*.sql\" | sort | xargs cat | mysql -h \"$DB_HOST\" -P \"$DB_PORT\" -p$DB_PASSWORD -u $DB_USER"]
         # Run DB migrations
         - ["sh", "-c", "mkdir -p mig; cd mig; ../components-gitpod-db--migrations/install.sh"]
+        # migrate 'migrations'
+        - ["yarn", "--cwd", "mig/node_modules/@gitpod/gitpod-db", "run", "migrate-migrations"]
+        # Run actual migrations
         - ["yarn", "--cwd", "mig/node_modules/@gitpod/gitpod-db", "typeorm", "migrations:run"]
+        # Clean out package to not bload the build artifact
+        - ["rm", "-rf", "mig"]
   - name: docker
     type: docker
     srcs:
@@ -85,6 +83,8 @@ packages:
     argdeps:
       - imageRepoBase
     config:
+      buildArgs:
+        VERSION: ${version}
       dockerfile: leeway.Dockerfile
       metadata:
         helm-component: dbMigrations

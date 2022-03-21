@@ -12,7 +12,6 @@ import { BitbucketTokenHelper } from "./bitbucket-token-handler";
 
 @injectable()
 export class BitbucketApiFactory {
-
     @inject(AuthProviderParams) protected readonly config: AuthProviderParams;
     @inject(BitbucketTokenHelper) protected readonly tokenHelper: BitbucketTokenHelper;
 
@@ -27,10 +26,11 @@ export class BitbucketApiFactory {
 
     protected createBitbucket(baseUrl: string, token: Token): APIClient {
         return new Bitbucket({
+            notice: false,
             baseUrl,
             auth: {
-                token: token.value
-            }
+                token: token.value,
+            },
         });
     }
 
@@ -42,13 +42,13 @@ export class BitbucketApiFactory {
 @injectable()
 export class BasicAuthBitbucketApiFactory extends BitbucketApiFactory {
     protected createBitbucket(baseUrl: string, token: Token): APIClient {
-
         return new Bitbucket({
+            notice: false,
             baseUrl,
             auth: {
                 username: token.username!,
-                password: token.value
-            }
+                password: token.value,
+            },
         });
     }
 }

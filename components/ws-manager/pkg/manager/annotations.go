@@ -7,8 +7,10 @@ package manager
 import (
 	"context"
 	"strings"
+	"time"
 
 	"golang.org/x/xerrors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -22,9 +24,6 @@ const (
 
 	// servicePrefixAnnotation is the annotation on the WS pod which contains the service prefix
 	servicePrefixAnnotation = "gitpod/servicePrefix"
-
-	// workspaceURLAnnotation is the annotation on the WS pod which contains the public workspace URL
-	workspaceURLAnnotation = "gitpod/url"
 
 	// workspaceNeverReadyAnnotation marks a workspace as having never been ready. It's the inverse of the former workspaceReadyAnnotation
 	workspaceNeverReadyAnnotation = "gitpod/never-ready"
@@ -49,10 +48,6 @@ const (
 	//   https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#attaching-metadata-to-objects
 	workspaceInitializerAnnotation = "gitpod/contentInitializer"
 
-	// workspaceImageSpecAnnotation contains the protobuf serialized image spec in base64 encoding. We need to keep this around post-request
-	// to provide this information to the registry facade later in the workspace's lifecycle.
-	workspaceImageSpecAnnotation = "gitpod/imageSpec"
-
 	// workspaceFailedBeforeStoppingAnnotation marks a workspace as failed even before we tried
 	// to stop it. We do not extract the failure state from this annotation, but just stabilize
 	// the state computation.
@@ -68,12 +63,6 @@ const (
 	// fullWorkspaceBackupAnnotation is set on workspaces which operate using a full workspace backup
 	fullWorkspaceBackupAnnotation = "gitpod/fullWorkspaceBackup"
 
-	// ownerTokenAnnotation contains the owner token of the workspace
-	ownerTokenAnnotation = "gitpod/ownerToken"
-
-	// workspaceAdmissionAnnotation determines the user admission to a workspace, i.e. if it can be accessed by everyone without token
-	workspaceAdmissionAnnotation = "gitpod/admission"
-
 	// gitpodFinalizerName is the name of the Gitpod finalizer we use to clean up a workspace
 	gitpodFinalizerName = "gitpod.io/finalizer"
 
@@ -85,12 +74,24 @@ const (
 
 	// workspaceAnnotationPrefix prefixes pod annotations that contain annotations specified during the workspaces start request
 	workspaceAnnotationPrefix = "gitpod.io/annotation."
+
+	// stoppedByRequestAnnotation is set on a pod when it was requested to stop using a StopWorkspace call
+	stoppedByRequestAnnotation = "gitpod.io/stoppedByRequest"
 )
 
 // markWorkspaceAsReady adds annotations to a workspace pod
 func (m *Manager) markWorkspace(ctx context.Context, workspaceID string, annotations ...*annotation) error {
+	// use custom backoff, as default one fails after 1.5s, this one will try for about 25s
+	// we want to try harder to remove or add annotation, as failure to remove "gitpod/never-ready" annotation
+	// would cause whole workspace to be marked as failed, hence the reason to try harder here.
+	var backoff = wait.Backoff{
+		Steps:    7,
+		Duration: 100 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.1,
+	}
 	// Retry on failure. Sometimes this doesn't work because of concurrent modification. The Kuberentes way is to just try again after waiting a bit.
-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+	err := retry.RetryOnConflict(backoff, func() error {
 		pod, err := m.findWorkspacePod(ctx, workspaceID)
 		if err != nil {
 			return xerrors.Errorf("cannot find workspace %s: %w", workspaceID, err)

@@ -5,13 +5,11 @@
 package integration
 
 import (
-	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/rpc"
 	"os"
 	"os/exec"
@@ -22,18 +20,73 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/rest"
+	kubectlcp "k8s.io/kubectl/pkg/cmd/cp"
+	kubectlexec "k8s.io/kubectl/pkg/cmd/exec"
 	"sigs.k8s.io/e2e-framework/klient"
 
 	"github.com/gitpod-io/gitpod/test/pkg/integration/common"
 )
+
+type PodExec struct {
+	RestConfig *rest.Config
+	*kubernetes.Clientset
+}
+
+func NewPodExec(config rest.Config, clientset *kubernetes.Clientset) *PodExec {
+	config.APIPath = "/api"                                   // Make sure we target /api and not just /
+	config.GroupVersion = &schema.GroupVersion{Version: "v1"} // this targets the core api groups so the url path will be /api/v1
+	config.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs}
+	config.TLSClientConfig = rest.TLSClientConfig{Insecure: true}
+	return &PodExec{
+		RestConfig: &config,
+		Clientset:  clientset,
+	}
+}
+
+func (p *PodExec) PodCopyFile(src string, dst string, containername string) (*bytes.Buffer, *bytes.Buffer, *bytes.Buffer, error) {
+	ioStreams, in, out, errOut := genericclioptions.NewTestIOStreams()
+	copyOptions := kubectlcp.NewCopyOptions(ioStreams)
+	copyOptions.Clientset = p.Clientset
+	copyOptions.ClientConfig = p.RestConfig
+	copyOptions.Container = containername
+	err := copyOptions.Run([]string{src, dst})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("Could not run copy operation: %v", err)
+	}
+	return in, out, errOut, nil
+}
+
+func (p *PodExec) ExecCmd(command []string, podname string, namespace string, containername string) (*bytes.Buffer, *bytes.Buffer, *bytes.Buffer, error) {
+	ioStreams, in, out, errOut := genericclioptions.NewTestIOStreams()
+	execOptions := &kubectlexec.ExecOptions{
+		StreamOptions: kubectlexec.StreamOptions{
+			IOStreams:     ioStreams,
+			Namespace:     namespace,
+			PodName:       podname,
+			ContainerName: containername,
+		},
+
+		Command:   command,
+		Executor:  &kubectlexec.DefaultRemoteExecutor{},
+		PodClient: p.Clientset.CoreV1(),
+		Config:    p.RestConfig,
+	}
+	err := execOptions.Run()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("Could not run exec operation: %v", err)
+	}
+	return in, out, errOut, nil
+}
 
 // InstrumentOption configures an Instrument call
 type InstrumentOption func(*instrumentOptions) error
@@ -83,7 +136,7 @@ func WithWorkspacekitLift(lift bool) InstrumentOption {
 // If there isn't, we attempt to build `<agentName>_agent/main.go`.
 // The binary is copied to the destination pod, started and port-forwarded. Then we
 // create an RPC client.
-func Instrument(component ComponentType, agentName string, namespace string, client klient.Client, opts ...InstrumentOption) (*rpc.Client, []func() error, error) {
+func Instrument(component ComponentType, agentName string, namespace string, kubeconfig string, client klient.Client, opts ...InstrumentOption) (*rpc.Client, []func() error, error) {
 	var closer []func() error
 
 	options := instrumentOptions{
@@ -111,8 +164,15 @@ func Instrument(component ComponentType, agentName string, namespace string, cli
 	if err != nil {
 		return nil, closer, err
 	}
+
+	clientConfig, err := kubernetes.NewForConfig(client.RESTConfig())
+	if err != nil {
+		return nil, closer, err
+	}
+	podExec := NewPodExec(*client.RESTConfig(), clientConfig)
+
 	tgtFN := filepath.Base(agentLoc)
-	err = uploadAgent(agentLoc, tgtFN, podName, containerName, namespace, client)
+	_, _, _, err = podExec.PodCopyFile(agentLoc, fmt.Sprintf("%s/%s:/home/gitpod/%s", namespace, podName, tgtFN), containerName)
 	if err != nil {
 		return nil, closer, err
 	}
@@ -122,7 +182,7 @@ func Instrument(component ComponentType, agentName string, namespace string, cli
 		return nil, closer, err
 	}
 
-	cmd := []string{filepath.Join("/tmp", tgtFN), "-rpc-port", strconv.Itoa(localAgentPort)}
+	cmd := []string{filepath.Join("/home/gitpod/", tgtFN), "-rpc-port", strconv.Itoa(localAgentPort)}
 	if options.WorkspacekitLift {
 		cmd = append([]string{"/.supervisor/workspacekit", "lift"}, cmd...)
 	}
@@ -130,7 +190,7 @@ func Instrument(component ComponentType, agentName string, namespace string, cli
 	execErrs := make(chan error, 1)
 	go func() {
 		defer close(execErrs)
-		execErr := executeAgent(cmd, podName, containerName, namespace, client)
+		_, _, _, execErr := podExec.ExecCmd(cmd, podName, namespace, containerName)
 		if execErr != nil {
 			execErrs <- execErr
 		}
@@ -156,7 +216,7 @@ func Instrument(component ComponentType, agentName string, namespace string, cli
 		}
 	}()
 
-	fwdReady, fwdErr := common.ForwardPort(ctx, client.RESTConfig(), namespace, podName, strconv.Itoa(localAgentPort))
+	fwdReady, fwdErr := common.ForwardPort(ctx, kubeconfig, namespace, podName, strconv.Itoa(localAgentPort))
 	select {
 	case <-fwdReady:
 	case err := <-execErrs:
@@ -216,98 +276,6 @@ func getFreePort() (int, error) {
 	return result.Port, nil
 }
 
-func executeAgent(cmd []string, pod, container string, namespace string, client klient.Client) error {
-	args := []string{"exec", pod, fmt.Sprintf("--namespace=%v", namespace)}
-	if len(container) > 0 {
-		args = append(args, fmt.Sprintf("--container=%s", container))
-	}
-	args = append(args, "--")
-	args = append(args, cmd...)
-
-	command := exec.Command("kubectl", args...)
-	out, err := command.CombinedOutput()
-	if err != nil {
-		return xerrors.Errorf("cannot run kubectl command: %w\n%v", err, string(out))
-	}
-
-	return nil
-}
-
-func uploadAgent(srcFN, tgtFN string, pod, container string, namespace string, client klient.Client) (err error) {
-	clientset, err := kubernetes.NewForConfig(client.RESTConfig())
-	if err != nil {
-		return xerrors.Errorf("cannot create Kubernetes client: %w", err)
-	}
-
-	stat, err := os.Stat(srcFN)
-	if err != nil {
-		return xerrors.Errorf("cannot upload agent: %w", err)
-	}
-	srcIn, err := os.Open(srcFN)
-	if err != nil {
-		return xerrors.Errorf("cannot upload agent: %w", err)
-	}
-	defer srcIn.Close()
-
-	tarIn, tarOut := io.Pipe()
-
-	req := clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(pod).
-		Namespace(namespace).
-		SubResource("exec")
-
-	req.VersionedParams(&corev1.PodExecOptions{
-		Container: container,
-		Command:   []string{"tar", "-xmf", "-", "-C", "/tmp"},
-		Stdin:     true,
-		Stdout:    false,
-		Stderr:    false,
-		TTY:       false,
-	}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(client.RESTConfig(), http.MethodPost, req.URL())
-	if err != nil {
-		return xerrors.Errorf("cannot upload agent: %w", err)
-	}
-
-	var eg errgroup.Group
-	eg.Go(func() error {
-		err := exec.Stream(remotecommand.StreamOptions{
-			Stdin: tarIn,
-			Tty:   false,
-		})
-		if err != nil {
-			return xerrors.Errorf("cannot upload agent: %w", err)
-		}
-		return nil
-	})
-	eg.Go(func() error {
-		tarw := tar.NewWriter(tarOut)
-		err = tarw.WriteHeader(&tar.Header{
-			Typeflag: tar.TypeReg,
-			Name:     tgtFN,
-			Size:     stat.Size(),
-			Mode:     0777,
-		})
-		if err != nil {
-			return xerrors.Errorf("cannot upload agent: %w", err)
-		}
-
-		_, err = io.Copy(tarw, srcIn)
-		if err != nil {
-			return xerrors.Errorf("cannot upload agent: %w", err)
-		}
-
-		tarw.Close()
-		tarOut.Close()
-
-		return nil
-	})
-
-	return eg.Wait()
-}
-
 func buildAgent(name string) (loc string, err error) {
 	defer func() {
 		if err != nil {
@@ -340,6 +308,11 @@ func buildAgent(name string) (loc string, err error) {
 }
 
 func selectPod(component ComponentType, options selectPodOptions, namespace string, client klient.Client) (string, string, error) {
+	clientSet, err := kubernetes.NewForConfig(client.RESTConfig())
+	if err != nil {
+		return "", "", err
+	}
+
 	listOptions := metav1.ListOptions{
 		LabelSelector: "component=" + string(component),
 	}
@@ -349,9 +322,8 @@ func selectPod(component ComponentType, options selectPodOptions, namespace stri
 	}
 
 	if component == ComponentWorkspaceDaemon && options.InstanceID != "" {
-		var pods corev1.PodList
-		err := client.Resources(namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
-			opts.LabelSelector = "component=workspace,workspaceID=" + options.InstanceID
+		pods, err := clientSet.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+			LabelSelector: "component=workspace,workspaceID=" + options.InstanceID,
 		})
 		if err != nil {
 			return "", "", xerrors.Errorf("cannot list pods: %w", err)
@@ -364,13 +336,7 @@ func selectPod(component ComponentType, options selectPodOptions, namespace stri
 		listOptions.FieldSelector = "spec.nodeName=" + pods.Items[0].Spec.NodeName
 	}
 
-	var pods corev1.PodList
-	err := client.Resources(namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
-		opts.LabelSelector = listOptions.LabelSelector
-		if listOptions.FieldSelector != "" {
-			opts.FieldSelector = listOptions.FieldSelector
-		}
-	})
+	pods, err := clientSet.CoreV1().Pods(namespace).List(context.Background(), listOptions)
 	if err != nil {
 		return "", "", xerrors.Errorf("cannot list pods: %w", err)
 	}
@@ -384,17 +350,15 @@ func selectPod(component ComponentType, options selectPodOptions, namespace stri
 	}
 
 	p := pods.Items[0]
-
-	if !isPodRunningReady(p) {
+	err = waitForPodRunningReady(clientSet, p.Name, namespace, 10*time.Second)
+	if err != nil {
 		return "", "", xerrors.Errorf("pods for component %s is not running", component)
 	}
-
-	pod := p.Name
 
 	var container string
 	if options.Container != "" {
 		var found bool
-		for _, container := range pods.Items[0].Spec.Containers {
+		for _, container := range p.Spec.Containers {
 			if container.Name == options.Container {
 				found = true
 				break
@@ -407,8 +371,7 @@ func selectPod(component ComponentType, options selectPodOptions, namespace stri
 
 		container = options.Container
 	}
-
-	return pod, container, nil
+	return p.Name, container, nil
 }
 
 // ServerConfigPartial is the subset of server config we're using for integration tests.
@@ -419,6 +382,9 @@ type ServerConfigPartial struct {
 	WorkspaceDefaults struct {
 		WorkspaceImage string `json:"workspaceImage"`
 	} `json:"workspaceDefaults"`
+	Session struct {
+		Secret string `json:"secret"`
+	} `json:"session"`
 }
 
 func GetServerConfig(namespace string, client klient.Client) (*ServerConfigPartial, error) {
@@ -445,12 +411,16 @@ func GetServerConfig(namespace string, client klient.Client) (*ServerConfigParti
 // ServerIDEConfigPartial is the subset of server IDE config we're using for integration tests.
 // NOTE: keep in sync with chart/templates/server-ide-configmap.yaml
 type ServerIDEConfigPartial struct {
-	IDEVersion      string `json:"ideVersion"`
-	IDEImageRepo    string `json:"ideImageRepo"`
-	IDEImageAliases struct {
-		Code       string `json:"code"`
-		CodeLatest string `json:"code-latest"`
-	} `json:"ideImageAliases"`
+	IDEOptions struct {
+		Options struct {
+			Code struct {
+				Image string `json:"image"`
+			} `json:"code"`
+			CodeLatest struct {
+				Image string `json:"image"`
+			} `json:"code-latest"`
+		} `json:"options"`
+	} `json:"ideOptions"`
 }
 
 func GetServerIDEConfig(namespace string, client klient.Client) (*ServerIDEConfigPartial, error) {
@@ -492,13 +462,25 @@ const (
 	ComponentImageBuilderMK3 ComponentType = "image-builder-mk3"
 )
 
-func isPodRunningReady(p corev1.Pod) bool {
-	if p.Status.Phase != corev1.PodRunning {
-		return false
-	}
-
-	return isPodReady(&p.Status)
+func waitForPodRunningReady(c kubernetes.Interface, podName string, namespace string, timeout time.Duration) error {
+	return wait.PollImmediate(time.Second, timeout, isPodRunningReady(c, podName, namespace))
 }
+
+func isPodRunningReady(c kubernetes.Interface, podName string, namespace string) wait.ConditionFunc {
+	return func() (bool, error) {
+		pod, err := c.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		if pod.Status.Phase != corev1.PodRunning {
+			return false, nil
+		}
+
+		return isPodReady(&pod.Status), nil
+	}
+}
+
 func isPodReady(s *corev1.PodStatus) bool {
 	for i := range s.Conditions {
 		if s.Conditions[i].Type == corev1.PodReady {

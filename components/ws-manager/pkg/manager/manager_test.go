@@ -17,7 +17,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -60,7 +59,6 @@ func TestControlPort(t *testing.T) {
 	}
 	type gold struct {
 		Error            string                   `json:"error,omitempty"`
-		PortsService     *corev1.Service          `json:"portsService,omitempty"`
 		Response         *api.ControlPortResponse `json:"response,omitempty"`
 		PostChangeStatus []*api.PortSpec          `json:"postChangeStatus,omitempty"`
 	}
@@ -81,7 +79,7 @@ func TestControlPort(t *testing.T) {
 
 			pod, err := manager.createDefiniteWorkspacePod(startCtx)
 			if err != nil {
-				t.Errorf("cannot create test pod; this is a bug in the unit test itself: %v", err)
+				t.Fatalf("cannot create test pod; this is a bug in the unit test itself: %v", err)
 				return nil
 			}
 
@@ -89,7 +87,7 @@ func TestControlPort(t *testing.T) {
 			if fixture.PortsService != nil {
 				err := manager.Clientset.Create(context.Background(), fixture.PortsService)
 				if err != nil {
-					t.Errorf("cannot create test service; this is a bug in the unit test itself: %v", err)
+					t.Fatalf("cannot create test service; this is a bug in the unit test itself: %v", err)
 					return nil
 				}
 			}
@@ -109,31 +107,6 @@ func TestControlPort(t *testing.T) {
 
 			// wait for informer sync of any change introduced by ControlPort
 			time.Sleep(500 * time.Millisecond)
-
-			var svc corev1.Service
-			_ = manager.Clientset.Get(context.Background(), types.NamespacedName{
-				Namespace: manager.Config.Namespace,
-				Name:      getPortsServiceName(startCtx.Request.ServicePrefix),
-			}, &svc)
-
-			cleanTemporalAttributes := func(svc *corev1.Service) *corev1.Service {
-				// only process services from the API server
-				if svc.ResourceVersion == "" {
-					return nil
-				}
-
-				copy := svc.DeepCopy()
-				copy.ObjectMeta.SelfLink = ""
-				copy.ObjectMeta.ResourceVersion = ""
-				copy.ObjectMeta.SetCreationTimestamp(metav1.Time{})
-				copy.ObjectMeta.UID = ""
-				copy.Spec.ClusterIP = ""
-				copy.Spec.SessionAffinity = ""
-
-				return copy
-			}
-
-			result.PortsService = cleanTemporalAttributes(&svc)
 
 			return &result
 		},
@@ -329,7 +302,7 @@ func TestConnectToWorkspaceDaemon(t *testing.T) {
 					},
 				},
 			},
-			ExpectedErr: "no matching endpoint",
+			ExpectedErr: "no running ws-daemon pod found",
 		},
 		{
 			Name: "handles no endpoint on current node",
@@ -343,40 +316,32 @@ func TestConnectToWorkspaceDaemon(t *testing.T) {
 					},
 				},
 				Objs: []client.Object{
-					&corev1.Endpoints{
-						TypeMeta: metav1.TypeMeta{
-							Kind:       "Endpoints",
-							APIVersion: "v1",
-						},
+					&corev1.Pod{
 						ObjectMeta: metav1.ObjectMeta{
-							Name:      "ws-daemon-endpoints",
+							Name:      "ws-daemon",
 							Namespace: "default",
 							Labels: labels.Set{
 								"component": "ws-daemon",
-								"kind":      "service",
+								"app":       "gitpod",
 							},
 						},
-						Subsets: []corev1.EndpointSubset{
-							{
-								Addresses: []corev1.EndpointAddress{
-									{
-										IP:       "10.1.2.3",
-										NodeName: &badNodeName,
-									},
-								},
-								Ports: []corev1.EndpointPort{
-									{
-										Name:     "port1",
-										Port:     7766,
-										Protocol: "TCP",
-									},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "workspace",
+									Image: "dummy",
 								},
 							},
+							NodeName: badNodeName,
+						},
+						Status: corev1.PodStatus{
+							Phase: corev1.PodRunning,
+							PodIP: "10.1.2.3",
 						},
 					},
 				},
 			},
-			ExpectedErr: "no matching endpoint",
+			ExpectedErr: "no running ws-daemon pod found",
 		},
 		{
 			Name: "finds endpoint on current node",
@@ -390,35 +355,27 @@ func TestConnectToWorkspaceDaemon(t *testing.T) {
 					},
 				},
 				Objs: []client.Object{
-					&corev1.Endpoints{
-						TypeMeta: metav1.TypeMeta{
-							Kind:       "Endpoints",
-							APIVersion: "v1",
-						},
+					&corev1.Pod{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "ws-daemon-endpoints",
 							Namespace: "default",
 							Labels: labels.Set{
 								"component": "ws-daemon",
-								"kind":      "service",
+								"app":       "gitpod",
 							},
 						},
-						Subsets: []corev1.EndpointSubset{
-							{
-								Addresses: []corev1.EndpointAddress{
-									{
-										IP:       "10.1.2.3",
-										NodeName: &goodNodeName,
-									},
-								},
-								Ports: []corev1.EndpointPort{
-									{
-										Name:     "port1",
-										Port:     7766,
-										Protocol: "TCP",
-									},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "workspace",
+									Image: "dummy",
 								},
 							},
+							NodeName: goodNodeName,
+						},
+						Status: corev1.PodStatus{
+							Phase: corev1.PodRunning,
+							PodIP: "10.1.2.3",
 						},
 					},
 				},
@@ -465,34 +422,27 @@ func TestCheckWSDaemonEntpoint(t *testing.T) {
 			Name: "handles no endpoint on current node",
 			Args: Args{
 				Objs: []client.Object{
-					&corev1.Endpoints{
-						TypeMeta: metav1.TypeMeta{
-							Kind:       "Endpoints",
-							APIVersion: "v1",
-						},
+					&corev1.Pod{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "ws-daemon-endpoints",
 							Namespace: "default",
 							Labels: labels.Set{
 								"component": "ws-daemon",
-								"kind":      "service",
+								"app":       "gitpod",
 							},
 						},
-						Subsets: []corev1.EndpointSubset{
-							{
-								Addresses: []corev1.EndpointAddress{
-									{
-										IP: "10.1.2.2",
-									},
-								},
-								Ports: []corev1.EndpointPort{
-									{
-										Name:     "port1",
-										Port:     7766,
-										Protocol: "TCP",
-									},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "workspace",
+									Image: "dummy",
 								},
 							},
+							NodeName: "nodeName",
+						},
+						Status: corev1.PodStatus{
+							Phase: corev1.PodRunning,
+							PodIP: "10.1.2.2",
 						},
 					},
 				},
@@ -504,34 +454,27 @@ func TestCheckWSDaemonEntpoint(t *testing.T) {
 			Input: "10.1.2.3",
 			Args: Args{
 				Objs: []client.Object{
-					&corev1.Endpoints{
-						TypeMeta: metav1.TypeMeta{
-							Kind:       "Endpoints",
-							APIVersion: "v1",
-						},
+					&corev1.Pod{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "ws-daemon-endpoints",
 							Namespace: "default",
 							Labels: labels.Set{
 								"component": "ws-daemon",
-								"kind":      "service",
+								"app":       "gitpod",
 							},
 						},
-						Subsets: []corev1.EndpointSubset{
-							{
-								Addresses: []corev1.EndpointAddress{
-									{
-										IP: "10.1.2.3",
-									},
-								},
-								Ports: []corev1.EndpointPort{
-									{
-										Name:     "port1",
-										Port:     7766,
-										Protocol: "TCP",
-									},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "workspace",
+									Image: "dummy",
 								},
 							},
+							NodeName: "nodeName",
+						},
+						Status: corev1.PodStatus{
+							Phase: corev1.PodRunning,
+							PodIP: "10.1.2.3",
 						},
 					},
 				},

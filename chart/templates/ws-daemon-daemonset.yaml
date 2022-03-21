@@ -154,8 +154,7 @@ spec:
             RAID_DEVICE="/dev/md42"
             RAID_DIR="/mnt/hostfs{{ $comp.hostWorkspaceArea }}"
             DISK_DEV_PREFIX="/dev/sd"
-            ls -l /dev/md*
-            cat /proc/mdstat
+
             # If the disk has already been created, sleep indefinitely
             if [ -b "${RAID_DEVICE}" ] && [ -d "${RAID_DIR}" ]; then
                 echo "raid array already created!"
@@ -163,7 +162,7 @@ spec:
                 exit 0
             fi
             # Discover how many disks there are
-            DISK_DEV_SUFFIX=(c d e f g h i j)
+            DISK_DEV_SUFFIX=(b c d e f g h i)
             MAX_NUM_DISKS=8
             NUM_DISKS=0
             declare -a DISKS
@@ -289,6 +288,19 @@ spec:
             path: "/"
           initialDelaySeconds: 5
           periodSeconds: 10
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - kubectl label --overwrite nodes ${NODENAME} gitpod.io/ws-daemon_ready_ns_${KUBE_NAMESPACE}=true
+          preStop:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - kubectl label nodes ${NODENAME} gitpod.io/ws-daemon_ready_ns_${KUBE_NAMESPACE}-
         livenessProbe:
           httpGet:
             port: 9999

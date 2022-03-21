@@ -6,23 +6,28 @@
 
 import { inject, injectable } from "inversify";
 import { DBWithTracing, ProjectDB, TeamDB, TracedWorkspaceDB, UserDB, WorkspaceDB } from "@gitpod/gitpod-db/lib";
-import { Branch, CommitContext, PrebuildWithStatus, CreateProjectParams, FindPrebuildsParams, Project, ProjectConfig, User, WorkspaceConfig } from "@gitpod/gitpod-protocol";
-import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
+import {
+    AuthProviderInfo,
+    Branch,
+    PrebuildWithStatus,
+    CreateProjectParams,
+    FindPrebuildsParams,
+    Project,
+    ProjectEnvVar,
+    User,
+} from "@gitpod/gitpod-protocol";
 import { HostContextProvider } from "../auth/host-context-provider";
-import { FileProvider, parseRepoUrl } from "../repohost";
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { ContextParser } from "../workspace/context-parser-service";
-import { ConfigInferrer } from "./config-inferrer";
+import { RepoURL } from "../repohost";
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
+import { PartialProject } from "@gitpod/gitpod-protocol/src/teams-projects-protocol";
 
 @injectable()
 export class ProjectsService {
-
     @inject(ProjectDB) protected readonly projectDB: ProjectDB;
     @inject(TeamDB) protected readonly teamDB: TeamDB;
     @inject(UserDB) protected readonly userDB: UserDB;
     @inject(TracedWorkspaceDB) protected readonly workspaceDb: DBWithTracing<WorkspaceDB>;
     @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
-    @inject(ContextParser) protected contextParser: ContextParser;
 
     async getProject(projectId: string): Promise<Project | undefined> {
         return this.projectDB.findProjectById(projectId);
@@ -36,23 +41,40 @@ export class ProjectsService {
         return this.projectDB.findUserProjects(userId);
     }
 
-    async getProjectsByCloneUrls(cloneUrls: string[]): Promise<Project[]> {
+    async getProjectsByCloneUrls(cloneUrls: string[]): Promise<(Project & { teamOwners?: string[] })[]> {
         return this.projectDB.findProjectsByCloneUrls(cloneUrls);
     }
 
-    async getProjectOverview(user: User, project: Project): Promise<Project.Overview | undefined> {
-        const branches = await this.getBranchDetails(user, project);
-        return { branches };
+    async getProjectOverviewCached(user: User, project: Project): Promise<Project.Overview | undefined> {
+        // Check for a cached project overview (fast!)
+        const cachedPromise = this.projectDB.findCachedProjectOverview(project.id);
+
+        // ...but also refresh the cache on every request (asynchronously / in the background)
+        const refreshPromise = this.getBranchDetails(user, project).then((branches) => {
+            const overview = { branches };
+            // No need to await here
+            this.projectDB.storeCachedProjectOverview(project.id, overview).catch((error) => {
+                log.error(`Could not store cached project overview: ${error}`, { cloneUrl: project.cloneUrl });
+            });
+            return overview;
+        });
+
+        const cachedOverview = await cachedPromise;
+        if (cachedOverview) {
+            return cachedOverview;
+        }
+        return await refreshPromise;
     }
 
     protected getRepositoryProvider(project: Project) {
-        const parsedUrl = parseRepoUrl(project.cloneUrl);
-        const repositoryProvider = parsedUrl && this.hostContextProvider.get(parsedUrl.host)?.services?.repositoryProvider;
+        const parsedUrl = RepoURL.parseRepoUrl(project.cloneUrl);
+        const repositoryProvider =
+            parsedUrl && this.hostContextProvider.get(parsedUrl.host)?.services?.repositoryProvider;
         return repositoryProvider;
     }
 
     async getBranchDetails(user: User, project: Project, branchName?: string): Promise<Project.BranchDetails[]> {
-        const parsedUrl = parseRepoUrl(project.cloneUrl);
+        const parsedUrl = RepoURL.parseRepoUrl(project.cloneUrl);
         if (!parsedUrl) {
             return [];
         }
@@ -82,48 +104,66 @@ export class ProjectsService {
                 changeTitle: commit.commitMessage,
                 changeAuthorAvatar: commit.authorAvatarUrl,
                 isDefault: repository.defaultBranch === branch.name,
-                changePR: "changePR", // todo: compute in repositoryProvider
-                changeUrl: "changeUrl", // todo: compute in repositoryProvider
             });
         }
         result.sort((a, b) => (b.changeDate || "").localeCompare(a.changeDate || ""));
         return result;
     }
 
-    async createProject({ name, cloneUrl, teamId, userId, appInstallationId }: CreateProjectParams): Promise<Project> {
+    async createProject(
+        { name, slug, cloneUrl, teamId, userId, appInstallationId }: CreateProjectParams,
+        installer: User,
+    ): Promise<Project> {
         const projects = await this.getProjectsByCloneUrls([cloneUrl]);
         if (projects.length > 0) {
             throw new Error("Project for repository already exists.");
         }
+        // If the desired project slug already exists in this team or user account, add a unique suffix to avoid collisions.
+        let uniqueSlug = slug;
+        let uniqueSuffix = 0;
+        const existingProjects = await (!!userId ? this.getUserProjects(userId) : this.getTeamProjects(teamId!));
+        while (existingProjects.some((p) => p.slug === uniqueSlug)) {
+            uniqueSuffix++;
+            uniqueSlug = `${slug}-${uniqueSuffix}`;
+        }
         const project = Project.create({
             name,
+            slug: uniqueSlug,
             cloneUrl,
             ...(!!userId ? { userId } : { teamId }),
-            appInstallationId
+            appInstallationId,
         });
         await this.projectDB.storeProject(project);
-        await this.onDidCreateProject(project);
+        await this.onDidCreateProject(project, installer);
         return project;
     }
 
-    protected async onDidCreateProject(project: Project) {
+    protected async onDidCreateProject(project: Project, installer: User) {
+        // Pre-fetch project details in the background -- don't await
+        /** no await */ this.getProjectOverviewCached(installer, project).catch((err) => {
+            /** ignore */
+        });
+
+        // Install the prebuilds webhook if possible
         let { userId, teamId, cloneUrl } = project;
-        const parsedUrl = parseRepoUrl(project.cloneUrl);
-        if ("gitlab.com" === parsedUrl?.host) {
-            const repositoryService = this.hostContextProvider.get(parsedUrl?.host)?.services?.repositoryService;
+        const parsedUrl = RepoURL.parseRepoUrl(project.cloneUrl);
+        const hostContext = parsedUrl?.host ? this.hostContextProvider.get(parsedUrl?.host) : undefined;
+        const authProvider = hostContext && hostContext.authProvider.info;
+        const type = authProvider && authProvider.authProviderType;
+        if (type === "GitLab" || type === "Bitbucket" || AuthProviderInfo.isGitHubEnterprise(authProvider)) {
+            const repositoryService = hostContext?.services?.repositoryService;
             if (repositoryService) {
-                if (teamId) {
-                    const owner = (await this.teamDB.findMembersByTeam(teamId)).find(m => m.role === "owner");
-                    userId = owner?.userId;
-                }
-                const user = userId && await this.userDB.findUserById(userId);
-                if (user) {
-                    if (await repositoryService.canInstallAutomatedPrebuilds(user, cloneUrl)) {
-                        log.info("Update prebuild installation for project.", { cloneUrl, teamId, userId });
-                        await repositoryService.installAutomatedPrebuilds(user, cloneUrl);
-                    }
-                } else {
-                    log.error("Cannot find user for project.", { cloneUrl })
+                // Note: For GitLab, we expect .canInstallAutomatedPrebuilds() to always return true, because earlier
+                // in the project creation flow, we only propose repositories where the user is actually allowed to
+                // install a webhook.
+                if (await repositoryService.canInstallAutomatedPrebuilds(installer, cloneUrl)) {
+                    log.info("Update prebuild installation for project.", {
+                        cloneUrl,
+                        teamId,
+                        userId,
+                        installerId: installer.id,
+                    });
+                    await repositoryService.installAutomatedPrebuilds(installer, cloneUrl);
                 }
             }
         }
@@ -133,13 +173,13 @@ export class ProjectsService {
         return this.projectDB.markDeleted(projectId);
     }
 
-    async findPrebuilds(user: User, params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
+    async findPrebuilds(params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
         const { projectId, prebuildId } = params;
         const project = await this.projectDB.findProjectById(projectId);
         if (!project) {
             return [];
         }
-        const parsedUrl = parseRepoUrl(project.cloneUrl);
+        const parsedUrl = RepoURL.parseRepoUrl(project.cloneUrl);
         if (!parsedUrl) {
             return [];
         }
@@ -161,73 +201,46 @@ export class ProjectsService {
                 limit = 1;
             }
             let branch = params.branch;
-            const prebuilds = await this.workspaceDb.trace({}).findPrebuiltWorkspacesByProject(project.id, branch, limit);
-            const infos = await this.workspaceDb.trace({}).findPrebuildInfos([...prebuilds.map(p => p.id)]);
-            result.push(...infos.map(info => {
-                const p = prebuilds.find(p => p.id === info.id)!;
-                const r: PrebuildWithStatus = { info, status: p.state };
-                if (p.error) {
-                    r.error = p.error;
-                }
-                return r;
-            }));
+            const prebuilds = await this.workspaceDb
+                .trace({})
+                .findPrebuiltWorkspacesByProject(project.id, branch, limit);
+            const infos = await this.workspaceDb.trace({}).findPrebuildInfos([...prebuilds.map((p) => p.id)]);
+            result.push(
+                ...infos.map((info) => {
+                    const p = prebuilds.find((p) => p.id === info.id)!;
+                    const r: PrebuildWithStatus = { info, status: p.state };
+                    if (p.error) {
+                        r.error = p.error;
+                    }
+                    return r;
+                }),
+            );
         }
         return result;
     }
 
-    async setProjectConfiguration(projectId: string, config: ProjectConfig): Promise<void> {
-        return this.projectDB.setProjectConfiguration(projectId, config);
+    async updateProjectPartial(partialProject: PartialProject): Promise<void> {
+        return this.projectDB.updateProject(partialProject);
     }
 
-    protected async getRepositoryFileProviderAndCommitContext(ctx: TraceContext, user: User, projectId: string): Promise<{fileProvider: FileProvider, commitContext: CommitContext}> {
-        const project = await this.getProject(projectId);
-        if (!project) {
-            throw new Error("Project not found");
-        }
-        const normalizedContextUrl = this.contextParser.normalizeContextURL(project.cloneUrl);
-        const commitContext = (await this.contextParser.handle(ctx, user, normalizedContextUrl)) as CommitContext;
-        const { host } = commitContext.repository;
-        const hostContext = this.hostContextProvider.get(host);
-        if (!hostContext || !hostContext.services) {
-            throw new Error(`Cannot fetch repository configuration for host: ${host}`);
-        }
-        const fileProvider = hostContext.services.fileProvider;
-        return { fileProvider, commitContext };
+    async setProjectEnvironmentVariable(
+        projectId: string,
+        name: string,
+        value: string,
+        censored: boolean,
+    ): Promise<void> {
+        return this.projectDB.setProjectEnvironmentVariable(projectId, name, value, censored);
     }
 
-    async fetchProjectRepositoryConfiguration(ctx: TraceContext, user: User, projectId: string): Promise<string | undefined> {
-        const { fileProvider, commitContext } = await this.getRepositoryFileProviderAndCommitContext(ctx, user, projectId);
-        const configString = await fileProvider.getGitpodFileContent(commitContext, user);
-        return configString;
+    async getProjectEnvironmentVariables(projectId: string): Promise<ProjectEnvVar[]> {
+        return this.projectDB.getProjectEnvironmentVariables(projectId);
     }
 
-    // a static cache used to prefetch inferrer related files in parallel in advance
-    private requestedPaths = new Set<string>();
-
-    async guessProjectConfiguration(ctx: TraceContext, user: User, projectId: string): Promise<string | undefined> {
-        const { fileProvider, commitContext } = await this.getRepositoryFileProviderAndCommitContext(ctx, user, projectId);
-        const cache: { [path: string]: Promise<string | undefined> } = {};
-        const readFile = async (path: string) => {
-            if (path in cache) {
-                return await cache[path];
-            }
-            this.requestedPaths.add(path);
-            const content = fileProvider.getFileContent(commitContext, user, path);
-            cache[path] = content;
-            return await content;
-        }
-        // eagerly fetch for all files that the inferrer usually asks for.
-        this.requestedPaths.forEach(path => !(path in cache) && readFile(path));
-        const config: WorkspaceConfig = await new ConfigInferrer().getConfig({
-            config: {},
-            read: readFile,
-            exists: async (path: string) => !!(await readFile(path)),
-        });
-        if (!config.tasks) {
-            return;
-        }
-        const configString = `tasks:\n  - ${config.tasks.map(task => Object.entries(task).map(([phase, command]) => `${phase}: ${command}`).join('\n    ')).join('\n  - ')}`;
-        return configString;
+    async getProjectEnvironmentVariableById(variableId: string): Promise<ProjectEnvVar | undefined> {
+        return this.projectDB.getProjectEnvironmentVariableById(variableId);
     }
 
+    async deleteProjectEnvironmentVariable(variableId: string): Promise<void> {
+        return this.projectDB.deleteProjectEnvironmentVariable(variableId);
+    }
 }

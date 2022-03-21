@@ -4,21 +4,23 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-
 export enum HeadlessWorkspaceEventType {
     LogOutput = "log-output",
     FinishedSuccessfully = "finish-success",
     FinishedButFailed = "finish-fail",
     AbortedTimedOut = "aborted-timeout",
     Aborted = "aborted",
-    Started = "started"
+    Failed = "failed",
+    Started = "started",
 }
 export namespace HeadlessWorkspaceEventType {
     export function isRunning(t: HeadlessWorkspaceEventType) {
         return t === HeadlessWorkspaceEventType.LogOutput;
     }
     export function didFinish(t: HeadlessWorkspaceEventType) {
-        return t === HeadlessWorkspaceEventType.FinishedButFailed || t === HeadlessWorkspaceEventType.FinishedSuccessfully;
+        return (
+            t === HeadlessWorkspaceEventType.FinishedButFailed || t === HeadlessWorkspaceEventType.FinishedSuccessfully
+        );
     }
 }
 

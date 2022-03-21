@@ -30,7 +30,9 @@ func TestCreateDefiniteWorkspacePod(t *testing.T) {
 		ImagebuildTemplate *corev1.Pod                   `json:"imagebuildTemplate,omitempty"`
 		RegularTemplate    *corev1.Pod                   `json:"regularTemplate,omitempty"`
 		ResourceRequests   *config.ResourceConfiguration `json:"resourceRequests,omitempty"`
-		EnforceAffinity    bool                          `json:"enforceAffinity,omitempty"`
+		ResourceLimits     *config.ResourceConfiguration `json:"resourceLimits,omitempty"`
+
+		EnforceAffinity bool `json:"enforceAffinity,omitempty"`
 	}
 	type gold struct {
 		Pod   corev1.Pod `json:"reason,omitempty"`
@@ -44,15 +46,22 @@ func TestCreateDefiniteWorkspacePod(t *testing.T) {
 			fixture := input.(*fixture)
 
 			mgmtCfg := forTestingOnlyManagerConfig()
-			if fixture.EnforceAffinity {
-				mgmtCfg.EnforceWorkspaceNodeAffinity = true
-			}
 			if fixture.ResourceRequests != nil {
 				var (
 					cont = mgmtCfg.Container
 					ws   = cont.Workspace
 				)
 				ws.Requests = *fixture.ResourceRequests
+				cont.Workspace = ws
+				mgmtCfg.Container = cont
+			}
+
+			if fixture.ResourceLimits != nil {
+				var (
+					cont = mgmtCfg.Container
+					ws   = cont.Workspace
+				)
+				ws.Limits = *fixture.ResourceLimits
 				cont.Workspace = ws
 				mgmtCfg.Container = cont
 			}

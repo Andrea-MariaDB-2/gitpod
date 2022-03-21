@@ -59,6 +59,9 @@ func TestGitHubContexts(t *testing.T) {
 }
 
 func TestGitLabContexts(t *testing.T) {
+	if !gitlab {
+		t.Skip("Skipping gitlab integration tests")
+	}
 	tests := []ContextTest{
 		{
 			Name:           "open repository",
@@ -91,6 +94,7 @@ func TestGitLabContexts(t *testing.T) {
 }
 
 func runContextTests(t *testing.T, tests []ContextTest) {
+	integration.SkipWithoutUsername(t, username)
 	f := features.New("context").
 		WithLabel("component", "server").
 		Assess("should run context tests", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
@@ -105,15 +109,10 @@ func runContextTests(t *testing.T, tests []ContextTest) {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 					defer cancel()
 
-					api := integration.NewComponentAPI(ctx, cfg.Namespace(), cfg.Client())
+					api := integration.NewComponentAPI(ctx, cfg.Namespace(), kubeconfig, cfg.Client())
 					t.Cleanup(func() {
 						api.Done(t)
 					})
-
-					if username == "" && test.ExpectedBranchFunc != nil {
-						t.Logf("skipping '%s' because there is not username configured", test.Name)
-						t.SkipNow()
-					}
 
 					nfo, stopWS, err := integration.LaunchWorkspaceFromContextURL(ctx, test.ContextURL, username, api)
 					if err != nil {
@@ -126,7 +125,7 @@ func runContextTests(t *testing.T, tests []ContextTest) {
 						t.Fatal(err)
 					}
 
-					rsa, closer, err := integration.Instrument(integration.ComponentWorkspace, "workspace", cfg.Namespace(), cfg.Client(), integration.WithInstanceID(nfo.LatestInstance.ID))
+					rsa, closer, err := integration.Instrument(integration.ComponentWorkspace, "workspace", cfg.Namespace(), kubeconfig, cfg.Client(), integration.WithInstanceID(nfo.LatestInstance.ID))
 					if err != nil {
 						t.Fatal(err)
 					}

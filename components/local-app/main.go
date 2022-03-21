@@ -108,6 +108,14 @@ func main() {
 				},
 				Value: 30,
 			},
+			&cli.StringFlag{
+				Name:  "timeout",
+				Usage: "How long the local app can run if last workspace was stopped",
+				EnvVars: []string{
+					"GITPOD_LCA_TIMEOUT",
+				},
+				Value: "0",
+			},
 		},
 		Commands: []*cli.Command{
 			{
@@ -117,7 +125,7 @@ func main() {
 						keyring.MockInit()
 					}
 					return run(c.String("gitpod-host"), c.String("ssh_config"), c.Int("api-port"), c.Bool("allow-cors-from-port"),
-						c.Bool("auto-tunnel"), c.String("auth-redirect-url"), c.Bool("verbose"), c.Duration("auth-timeout"))
+						c.Bool("auto-tunnel"), c.String("auth-redirect-url"), c.Bool("verbose"), c.Duration("auth-timeout"), c.Duration("timeout"))
 				},
 				Flags: []cli.Flag{
 					&cli.PathFlag{
@@ -141,7 +149,7 @@ func DefaultCommand(name string) cli.ActionFunc {
 	}
 }
 
-func run(origin, sshConfig string, apiPort int, allowCORSFromPort bool, autoTunnel bool, authRedirectUrl string, verbose bool, authTimeout time.Duration) error {
+func run(origin, sshConfig string, apiPort int, allowCORSFromPort bool, autoTunnel bool, authRedirectUrl string, verbose bool, authTimeout time.Duration, localAppTimeout time.Duration) error {
 	if verbose {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
@@ -154,7 +162,7 @@ func run(origin, sshConfig string, apiPort int, allowCORSFromPort bool, autoTunn
 		return err
 	}
 	wsHostRegex := "(\\.[^.]+)\\." + strings.ReplaceAll(originURL.Host, ".", "\\.")
-	wsHostRegex = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-z]{2,16}-[0-9a-z]{2,16}-[0-9a-z]{8})" + wsHostRegex
+	wsHostRegex = "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-z]{2,16}-[0-9a-z]{2,16}-[0-9a-z]{8,11})" + wsHostRegex
 	if allowCORSFromPort {
 		wsHostRegex = "([0-9]+)-" + wsHostRegex
 	}
@@ -185,7 +193,7 @@ func run(origin, sshConfig string, apiPort int, allowCORSFromPort bool, autoTunn
 		cb = append(cb, s)
 	}
 
-	b = bastion.New(client, cb)
+	b = bastion.New(client, localAppTimeout, cb)
 	b.EnableAutoTunnel = autoTunnel
 	grpcServer := grpc.NewServer()
 	appapi.RegisterLocalAppServer(grpcServer, bastion.NewLocalAppService(b, s))
@@ -261,6 +269,10 @@ func tryConnectToServer(gitpodUrl string, tkn string, reconnectionHandler func()
 		Log:                 logrus.NewEntry(logrus.StandardLogger()),
 		ReconnectionHandler: reconnectionHandler,
 		CloseHandler:        closeHandler,
+		ExtraHeaders: map[string]string{
+			"User-Agent":       "gitpod/local-companion",
+			"X-Client-Version": Version,
+		},
 	})
 	if err != nil {
 		return nil, err

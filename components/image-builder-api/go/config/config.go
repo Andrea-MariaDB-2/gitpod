@@ -6,12 +6,12 @@ package config
 
 import (
 	"crypto/tls"
-	"crypto/x509"
-	//wsmanapi "github.com/gitpod-io/gitpod/ws-manager/api"
+
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"io/ioutil"
+
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 )
 
 type PProf struct {
@@ -48,37 +48,30 @@ func (c *TLSConfig) ServerOption() (grpc.ServerOption, error) {
 		return nil, nil
 	}
 
-	// Load certs
-	certificate, err := tls.LoadX509KeyPair(c.Certificate, c.PrivateKey)
+	tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+		c.Authority, c.Certificate, c.PrivateKey,
+		common_grpc.WithSetClientCAs(true),
+		common_grpc.WithClientAuth(tls.RequireAndVerifyClientCert),
+		common_grpc.WithServerName("ws-manager"),
+	)
 	if err != nil {
-		return nil, xerrors.Errorf("cannot load TLS certificate: %w", err)
+		return nil, xerrors.Errorf("cannot load certs: %w", err)
 	}
 
-	// Create a certificate pool from the certificate authority
-	certPool := x509.NewCertPool()
-	ca, err := ioutil.ReadFile(c.Authority)
-	if err != nil {
-		return nil, xerrors.Errorf("cannot not read ca certificate: %w", err)
-	}
-	if ok := certPool.AppendCertsFromPEM(ca); !ok {
-		return nil, xerrors.Errorf("failed to append ca certs")
-	}
-
-	creds := credentials.NewTLS(&tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		Certificates: []tls.Certificate{certificate},
-		ClientCAs:    certPool,
-	})
-
-	return grpc.Creds(creds), nil
+	return grpc.Creds(credentials.NewTLS(tlsConfig)), nil
 }
 
 // Configuration configures the orchestrator
 type Configuration struct {
 	WorkspaceManager WorkspaceManagerConfig `json:"wsman"`
 
-	// AuthFile points to a Docker configuration file from which we draw registry authentication
-	AuthFile string `json:"authFile"`
+	// PullSecret names a Kubernetes secret which contains a `.dockerconfigjson` entry
+	// carrying the Docker authentication credentials to interact with the baseImageRepository
+	// and workspaceImageRepository.
+	PullSecret string `json:"pullSecret,omitempty"`
+
+	// PullSecretFile points to a mount of the .dockerconfigjson file of the PullSecret.
+	PullSecretFile string `json:"pullSecretFile,omitempty"`
 
 	// BaseImageRepository configures repository where we'll push base images to.
 	BaseImageRepository string `json:"baseImageRepository"`
@@ -89,10 +82,6 @@ type Configuration struct {
 
 	// BuilderImage is an image ref to the workspace builder image
 	BuilderImage string `json:"builderImage"`
-
-	// BuilderAuthKeyFile points to a keyfile shared by the builder workspaces and this service.
-	// The key is used to encypt authentication data shipped across environment varibales.
-	BuilderAuthKeyFile string `json:"builderAuthKeyFile,omitempty"`
 }
 
 type TLS struct {

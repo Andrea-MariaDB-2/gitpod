@@ -5,12 +5,12 @@
  */
 
 import { IPrefixContextParser } from "./context-parser";
-import { User, WorkspaceContext, UserEnvVarValue, WithEnvvarsContext } from "@gitpod/gitpod-protocol";
+import { User, WorkspaceContext, WithEnvvarsContext } from "@gitpod/gitpod-protocol";
 import { injectable } from "inversify";
+import { EnvVarWithValue } from "@gitpod/gitpod-protocol/src/protocol";
 
 @injectable()
 export class EnvvarPrefixParser implements IPrefixContextParser {
-
     public findPrefix(user: User, context: string): string | undefined {
         const result = this.parse(context);
         return result && result.prefix;
@@ -22,13 +22,13 @@ export class EnvvarPrefixParser implements IPrefixContextParser {
             return context;
         }
 
-        const envvars: UserEnvVarValue[] = [];
+        const envvars: EnvVarWithValue[] = [];
         for (const [k, v] of result.envVarMap.entries()) {
-            envvars.push({ name: k, value: decodeURIComponent(v), repositoryPattern: "#/#" });
+            envvars.push({ name: k, value: decodeURIComponent(v) });
         }
         return <WithEnvvarsContext>{
             ...context,
-            envvars
+            envvars,
         };
     }
 
@@ -52,8 +52,7 @@ export class EnvvarPrefixParser implements IPrefixContextParser {
         }
         return {
             prefix: prefix + "/",
-            envVarMap
-        }
+            envVarMap,
+        };
     }
-
 }

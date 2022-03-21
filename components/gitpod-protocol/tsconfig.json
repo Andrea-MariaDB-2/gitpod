@@ -9,7 +9,7 @@
         "downlevelIteration": true,
         "module": "commonjs",
         "moduleResolution": "node",
-        "target": "es5",
+        "target": "es6",
         "jsx": "react",
         "lib": [
             "es6",
@@ -22,7 +22,8 @@
         "declarationMap": true,
         "skipLibCheck": true,
         "rootDir": "src",
-        "outDir": "lib"
+        "outDir": "lib",
+        "useUnknownInCatchVariables": false
     },
     "include": [
         "src"

@@ -5,41 +5,133 @@
 package licensor
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
+	"io/ioutil"
+	"net/http"
 	"testing"
 	"time"
 )
 
 const (
-	seats  = 5
-	domain = "foobar.com"
-	someID = "730d5134-768c-4a05-b7cd-ecf3757cada9"
+	seats                = 5
+	domain               = "foobar.com"
+	someID               = "730d5134-768c-4a05-b7cd-ecf3757cada9"
+	replicatedLicenseUrl = "http://kotsadm:3000/license/v1/license"
 )
 
 type licenseTest struct {
-	Name     string
-	License  *LicensePayload
-	Validate func(t *testing.T, eval *Evaluator)
+	Name                  string
+	License               *LicensePayload
+	Validate              func(t *testing.T, eval *Evaluator)
+	Type                  LicenseType
+	NeverExpires          bool
+	ReplicatedLicenseType *ReplicatedLicenseType
+}
+
+// roundTripFunc .
+type roundTripFunc func(req *http.Request) *http.Response
+
+// roundTrip .
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req), nil
+}
+
+// newTestClient returns *http.Client with Transport replaced to avoid making real calls
+func newTestClient(fn roundTripFunc) *http.Client {
+	return &http.Client{
+		Transport: roundTripFunc(fn),
+	}
 }
 
 func (test *licenseTest) Run(t *testing.T) {
 	t.Run(test.Name, func(t *testing.T) {
 		var eval *Evaluator
-		if test.License == nil {
-			eval = NewEvaluator(nil, "")
-		} else {
-			priv, err := rsa.GenerateKey(rand.Reader, 2048)
-			if err != nil {
-				t.Fatalf("cannot generate key: %q", err)
-			}
-			publicKeys = []*rsa.PublicKey{&priv.PublicKey}
-			lic, err := Sign(*test.License, priv)
-			if err != nil {
-				t.Fatalf("cannot sign license: %q", err)
+		if test.Type == LicenseTypeGitpod {
+			if test.NeverExpires {
+				t.Fatal("gitpod licenses must have an expiry date")
 			}
 
-			eval = NewEvaluator(lic, domain)
+			if test.License == nil {
+				eval = NewGitpodEvaluator(nil, "")
+			} else {
+				priv, err := rsa.GenerateKey(rand.Reader, 2048)
+				if err != nil {
+					t.Fatalf("cannot generate key: %q", err)
+				}
+				publicKeys = []*rsa.PublicKey{&priv.PublicKey}
+				lic, err := Sign(*test.License, priv)
+				if err != nil {
+					t.Fatalf("cannot sign license: %q", err)
+				}
+
+				eval = NewGitpodEvaluator(lic, domain)
+			}
+		} else if test.Type == LicenseTypeReplicated {
+			client := newTestClient(func(req *http.Request) *http.Response {
+				act := req.URL.String()
+				if act != "http://kotsadm:3000/license/v1/license" {
+					t.Fatalf("invalid kotsadm url match: expected %s, got %v", replicatedLicenseUrl, act)
+				}
+
+				payload, err := json.Marshal(replicatedLicensePayload{
+					LicenseType: func() ReplicatedLicenseType {
+						if test.ReplicatedLicenseType == nil {
+							return ReplicatedLicenseTypePaid
+						}
+						return *test.ReplicatedLicenseType
+					}(),
+					ExpirationTime: func() *time.Time {
+						if test.License != nil {
+							return &test.License.ValidUntil
+						}
+						if !test.NeverExpires {
+							t := time.Now().Add(-6 * time.Hour)
+							return &t
+						}
+						return nil
+					}(),
+					Fields: []replicatedFields{
+						{
+							Field: "domain",
+							Value: func() string {
+								if test.License != nil {
+									return test.License.Domain
+								}
+								return domain
+							}(),
+						},
+						{
+							Field: "seats",
+							Value: func() int {
+								if test.License != nil {
+									return test.License.Seats
+								}
+								return seats
+							}(),
+						},
+					},
+				})
+				if err != nil {
+					t.Fatalf("failed to convert payload: %v", err)
+				}
+
+				return &http.Response{
+					StatusCode: 200,
+					Body:       ioutil.NopCloser(bytes.NewBuffer(payload)),
+					Header:     make(http.Header),
+				}
+			})
+
+			if test.License == nil {
+				eval = newReplicatedEvaluator(client, domain)
+			} else {
+				eval = newReplicatedEvaluator(client, test.License.Domain)
+			}
+		} else {
+			t.Fatalf("unknown license type: '%s'", test.Type)
 		}
 
 		test.Validate(t, eval)
@@ -54,16 +146,36 @@ func TestSeats(t *testing.T) {
 		WithinLimits   bool
 		DefaultLicense bool
 		InvalidLicense bool
+		LicenseType    LicenseType
+		NeverExpires   bool
 	}{
-		{"unlimited seats", 0, 1000, true, false, false},
-		{"within limited seats", 50, 40, true, false, false},
-		{"within limited seats (edge)", 50, 50, true, false, false},
-		{"beyond limited seats", 50, 150, false, false, false},
-		{"beyond limited seats (edge)", 50, 51, false, false, false},
-		{"invalid license", 50, 50, false, false, true},
-		{"within default license seats", 0, 7, true, true, false},
-		{"within default license seats (edge)", 0, 10, true, true, false},
-		{"beyond default license seats", 0, 11, false, true, false},
+		{"Gitpod: unlimited seats", 0, 1000, true, false, false, LicenseTypeGitpod, false},
+		{"Gitpod: within limited seats", 50, 40, true, false, false, LicenseTypeGitpod, false},
+		{"Gitpod: within limited seats (edge)", 50, 50, true, false, false, LicenseTypeGitpod, false},
+		{"Gitpod: beyond limited seats", 50, 150, false, false, false, LicenseTypeGitpod, false},
+		{"Gitpod: beyond limited seats (edge)", 50, 51, false, false, false, LicenseTypeGitpod, false},
+		{"Gitpod: invalid license", 50, 50, false, false, true, LicenseTypeGitpod, false},
+		{"Gitpod: within default license seats", 0, 7, true, true, false, LicenseTypeGitpod, false},
+		{"Gitpod: within default license seats (edge)", 0, 10, true, true, false, LicenseTypeGitpod, false},
+		{"Gitpod: beyond default license seats", 0, 11, false, true, false, LicenseTypeGitpod, false},
+
+		// correctly missing the default license tests as Replicated always has a license
+		{"Replicated: unlimited seats", 0, 1000, true, false, false, LicenseTypeReplicated, false},
+		{"Replicated: within limited seats", 50, 40, true, false, false, LicenseTypeReplicated, false},
+		{"Replicated: within limited seats (edge)", 50, 50, true, false, false, LicenseTypeReplicated, false},
+		{"Replicated: beyond limited seats", 50, 150, false, false, false, LicenseTypeReplicated, false},
+		{"Replicated: beyond limited seats (edge)", 50, 51, false, false, false, LicenseTypeReplicated, false},
+		{"Replicated: invalid license", 50, 50, false, false, true, LicenseTypeReplicated, false},
+		{"Replicated: beyond default license seats", 0, 11, false, true, false, LicenseTypeReplicated, false},
+
+		{"Replicated: unlimited seats", 0, 1000, true, false, false, LicenseTypeReplicated, true},
+		{"Replicated: within limited seats", 50, 40, true, false, false, LicenseTypeReplicated, true},
+		{"Replicated: within limited seats (edge)", 50, 50, true, false, false, LicenseTypeReplicated, true},
+		{"Replicated: beyond limited seats", 50, 150, false, false, false, LicenseTypeReplicated, true},
+		{"Replicated: beyond limited seats (edge)", 50, 51, false, false, false, LicenseTypeReplicated, true},
+		{"Replicated: invalid license", 50, 50, false, false, true, LicenseTypeReplicated, true},
+		{"Replicated: beyond default license seats", 0, 11, false, true, false, LicenseTypeReplicated, true},
+		{"Replicated: invalid license within default seats", 50, 5, true, false, true, LicenseTypeReplicated, false},
 	}
 
 	for _, test := range tests {
@@ -82,11 +194,13 @@ func TestSeats(t *testing.T) {
 				ValidUntil: validUntil,
 			},
 			Validate: func(t *testing.T, eval *Evaluator) {
-				withinLimits := eval.HasEnoughSeats(test.Probe)
+				withinLimits := eval.hasEnoughSeats(test.Probe)
 				if withinLimits != test.WithinLimits {
-					t.Errorf("HasEnoughSeats did not behave as expected: lic=%d probe=%d expected=%v actual=%v", test.Licensed, test.Probe, test.WithinLimits, withinLimits)
+					t.Errorf("hasEnoughSeats did not behave as expected: lic=%d probe=%d expected=%v actual=%v", test.Licensed, test.Probe, test.WithinLimits, withinLimits)
 				}
 			},
+			Type:         test.LicenseType,
+			NeverExpires: test.NeverExpires,
 		}
 		if test.DefaultLicense {
 			lt.License = nil
@@ -96,21 +210,70 @@ func TestSeats(t *testing.T) {
 }
 
 func TestFeatures(t *testing.T) {
+	replicatedCommunity := ReplicatedLicenseTypeCommunity
+	replicatedPaid := ReplicatedLicenseTypePaid
+
 	tests := []struct {
-		Name           string
-		DefaultLicense bool
-		Level          LicenseLevel
-		Features       []Feature
+		Name                  string
+		DefaultLicense        bool
+		Level                 LicenseLevel
+		Features              []Feature
+		LicenseType           LicenseType
+		UserCount             int
+		ReplicatedLicenseType *ReplicatedLicenseType
 	}{
-		{"no license", true, LicenseLevel(0), []Feature{FeaturePrebuild}},
-		{"invalid license level", false, LicenseLevel(666), []Feature{}},
-		{"enterprise license", false, LevelEnterprise, []Feature{
+		{"Gitpod (in seats): no license", true, LicenseLevel(0), []Feature{
 			FeatureAdminDashboard,
 			FeatureSetTimeout,
 			FeatureWorkspaceSharing,
 			FeatureSnapshot,
 			FeaturePrebuild,
-		}},
+		}, LicenseTypeGitpod, 10, nil},
+		{"Gitpod (in seats): invalid license level", false, LicenseLevel(666), []Feature{}, LicenseTypeGitpod, seats, nil},
+		{"Gitpod (in seats): enterprise license", false, LevelEnterprise, []Feature{
+			FeatureAdminDashboard,
+			FeatureSetTimeout,
+			FeatureWorkspaceSharing,
+			FeatureSnapshot,
+			FeaturePrebuild,
+		}, LicenseTypeGitpod, seats, nil},
+
+		{"Gitpod (over seats): no license", true, LicenseLevel(0), []Feature{}, LicenseTypeGitpod, 11, nil},
+		{"Gitpod (over seats): invalid license level", false, LicenseLevel(666), []Feature{}, LicenseTypeGitpod, seats + 1, nil},
+		{"Gitpod (over seats): enterprise license", false, LevelEnterprise, []Feature{}, LicenseTypeGitpod, seats + 1, nil},
+
+		{"Replicated (in seats): invalid license level", false, LicenseLevel(666), []Feature{
+			FeatureAdminDashboard,
+			FeatureSetTimeout,
+			FeatureWorkspaceSharing,
+			FeatureSnapshot,
+			FeaturePrebuild,
+		}, LicenseTypeReplicated, seats, &replicatedPaid},
+		{"Replicated (in seats): enterprise license", false, LevelEnterprise, []Feature{
+			FeatureAdminDashboard,
+			FeatureSetTimeout,
+			FeatureWorkspaceSharing,
+			FeatureSnapshot,
+			FeaturePrebuild,
+		}, LicenseTypeReplicated, seats, &replicatedPaid},
+
+		{"Replicated (over seats - no fallback): invalid license level", true, LicenseLevel(666), []Feature{
+			FeatureAdminDashboard,
+			FeatureSetTimeout,
+			FeatureWorkspaceSharing,
+			FeatureSnapshot,
+			FeaturePrebuild,
+		}, LicenseTypeReplicated, seats + 1, &replicatedPaid},
+		{"Replicated (over seats - no fallback): enterprise license", true, LevelEnterprise, []Feature{
+			FeatureAdminDashboard,
+			FeatureSetTimeout,
+			FeatureWorkspaceSharing,
+			FeatureSnapshot,
+			FeaturePrebuild,
+		}, LicenseTypeReplicated, seats + 1, &replicatedPaid},
+
+		{"Replicated (over seats - fallback): invalid license level", false, LicenseLevel(666), []Feature{FeatureAdminDashboard}, LicenseTypeReplicated, seats + 1, &replicatedCommunity},
+		{"Replicated (over seats - fallback): enterprise license", false, LevelEnterprise, []Feature{FeatureAdminDashboard}, LicenseTypeReplicated, seats + 1, &replicatedCommunity},
 	}
 
 	for _, test := range tests {
@@ -125,8 +288,9 @@ func TestFeatures(t *testing.T) {
 			lic = nil
 		}
 		lt := licenseTest{
-			Name:    test.Name,
-			License: lic,
+			Name:                  test.Name,
+			License:               lic,
+			ReplicatedLicenseType: test.ReplicatedLicenseType,
 			Validate: func(t *testing.T, eval *Evaluator) {
 				unavailableFeatures := featureSet{}
 				for f := range allowanceMap[LevelEnterprise].Features {
@@ -135,17 +299,18 @@ func TestFeatures(t *testing.T) {
 				for _, f := range test.Features {
 					delete(unavailableFeatures, f)
 
-					if !eval.Enabled(f) {
+					if !eval.Enabled(f, test.UserCount) {
 						t.Errorf("license does not enable %s, but should", f)
 					}
 				}
 
 				for f := range unavailableFeatures {
-					if eval.Enabled(f) {
+					if eval.Enabled(f, test.UserCount) {
 						t.Errorf("license not enables %s, but shouldn't", f)
 					}
 				}
 			},
+			Type: test.LicenseType,
 		}
 		lt.Run(t)
 	}
@@ -258,7 +423,7 @@ func TestEvalutorKeys(t *testing.T) {
 			}
 
 			var errmsg string
-			e := NewEvaluator(lic, dom)
+			e := NewGitpodEvaluator(lic, dom)
 			if msg, valid := e.Validate(); !valid {
 				errmsg = msg
 			}

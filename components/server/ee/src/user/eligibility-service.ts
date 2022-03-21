@@ -5,15 +5,14 @@
  */
 
 import { inject, injectable } from "inversify";
-import { UserDB } from "@gitpod/gitpod-db/lib";
-import { HostContextProvider } from "../../../src/auth/host-context-provider";
+import { TeamSubscriptionDB, UserDB } from "@gitpod/gitpod-db/lib";
 import { TokenProvider } from "../../../src/user/token-provider";
-import { User, WorkspaceTimeoutDuration, WorkspaceInstance, WorkspaceContext, CommitContext, PrebuiltWorkspaceContext } from "@gitpod/gitpod-protocol";
+import { User, WorkspaceTimeoutDuration, WorkspaceInstance } from "@gitpod/gitpod-protocol";
 import { RemainingHours } from "@gitpod/gitpod-protocol/lib/accounting-protocol";
 import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { Plans, MAX_PARALLEL_WORKSPACES } from "@gitpod/gitpod-protocol/lib/plans";
 import { Accounting, SubscriptionService } from "@gitpod/gitpod-payment-endpoint/lib/accounting";
-import { millisecondsToHours} from "@gitpod/gitpod-protocol/lib/util/timeutil";
+import { millisecondsToHours } from "@gitpod/gitpod-protocol/lib/util/timeutil";
 import { AccountStatementProvider, CachedAccountStatement } from "./account-statement-provider";
 import { EMailDomainService } from "../auth/email-domain-service";
 import fetch from "node-fetch";
@@ -37,21 +36,19 @@ export interface HitParallelWorkspaceLimit {
  *
  */
 export interface GitHubEducationPack {
-    student: boolean
-    faculty: boolean
+    student: boolean;
+    faculty: boolean;
 }
 
 @injectable()
 export class EligibilityService {
-    static readonly DURATION_30_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
-
     @inject(Config) protected readonly config: Config;
     @inject(UserDB) protected readonly userDb: UserDB;
     @inject(SubscriptionService) protected readonly subscriptionService: SubscriptionService;
-    @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
     @inject(EMailDomainService) protected readonly domainService: EMailDomainService;
     @inject(TokenProvider) protected readonly tokenProvider: TokenProvider;
     @inject(AccountStatementProvider) protected readonly accountStatementProvider: AccountStatementProvider;
+    @inject(TeamSubscriptionDB) protected readonly teamSubscriptionDb: TeamSubscriptionDB;
 
     /**
      * Whether the given user is recognized as a student within Gitpod
@@ -88,28 +85,40 @@ export class EligibilityService {
     async getGitHubEducationPack(user: User): Promise<GitHubEducationPack> {
         let token: string;
         try {
-            token = (await this.tokenProvider.getTokenForHost(user, "github.com")).value
+            token = (await this.tokenProvider.getTokenForHost(user, "github.com")).value;
         } catch (err) {
             // user has no GitHub token, thus cannot have the student/faculty pack
             return { student: false, faculty: false };
         }
 
+        const logCtx = { userId: user.id };
         try {
             const rawResponse = await fetch("https://education.github.com/api/user", {
+                timeout: 5000,
                 headers: {
-                    "Authorization": `token ${token}`,
-                    "faculty-check-preview": "true"
-                }
+                    Authorization: `token ${token}`,
+                    "faculty-check-preview": "true",
+                },
             });
-            const result : GitHubEducationPack = JSON.parse(await rawResponse.text());
-            if(result.student && result.faculty) {
+            if (!rawResponse.ok) {
+                log.warn(
+                    logCtx,
+                    `fetching the GitHub Education API failed with status ${rawResponse.status}: ${rawResponse.statusText}`,
+                );
+            }
+            const result: GitHubEducationPack = JSON.parse(await rawResponse.text());
+            if (result.student && result.faculty) {
                 // That violates the API contract: `student` and `faculty` need to be mutually exclusive
-                log.warn({userId: user.id}, "result of GitHub Eduction API violates the API contract: student and faculty need to be mutually exclusive", result);
+                log.warn(
+                    logCtx,
+                    "result of GitHub Eduction API violates the API contract: student and faculty need to be mutually exclusive",
+                    result,
+                );
                 return { student: false, faculty: false };
             }
             return result;
         } catch (err) {
-            log.warn({ userId: user.id }, "error while checking student pack status", err);
+            log.warn(logCtx, "error while checking student pack status", err);
         }
         return { student: false, faculty: false };
     }
@@ -121,19 +130,23 @@ export class EligibilityService {
      * @param date now
      * @param runningInstances
      */
-    async mayStartWorkspace(user: User, date: Date, runningInstances: Promise<WorkspaceInstance[]>): Promise<MayStartWorkspaceResult> {
+    async mayStartWorkspace(
+        user: User,
+        date: Date,
+        runningInstances: Promise<WorkspaceInstance[]>,
+    ): Promise<MayStartWorkspaceResult> {
         if (!this.config.enablePayment) {
             return { enoughCredits: true };
         }
 
         const hasHitParallelWorkspaceLimit = async (): Promise<HitParallelWorkspaceLimit | undefined> => {
             const max = await this.getMaxParallelWorkspaces(user);
-            const instances = (await runningInstances).filter(i => i.status.phase !== "unknown");
-            const current = instances.length;   // >= parallelWorkspaceAllowance;
+            const instances = (await runningInstances).filter((i) => i.status.phase !== "unknown");
+            const current = instances.length; // >= parallelWorkspaceAllowance;
             if (current >= max) {
                 return {
                     current,
-                    max
+                    max,
                 };
             } else {
                 return undefined;
@@ -141,12 +154,12 @@ export class EligibilityService {
         };
         const [enoughCredits, hitParallelWorkspaceLimit] = await Promise.all([
             this.checkEnoughCreditForWorkspaceStart(user.id, date, runningInstances),
-            hasHitParallelWorkspaceLimit()
+            hasHitParallelWorkspaceLimit(),
         ]);
 
         return {
             enoughCredits: !!enoughCredits,
-            hitParallelWorkspaceLimit
+            hitParallelWorkspaceLimit,
         };
     }
 
@@ -162,23 +175,26 @@ export class EligibilityService {
         }
 
         const subscriptions = await this.subscriptionService.getNotYetCancelledSubscriptions(user, date.toISOString());
-        return subscriptions.map(s => Plans.getParallelWorkspacesById(s.planId)).reduce((p, v) => Math.max(p, v));
+        return subscriptions.map((s) => Plans.getParallelWorkspacesById(s.planId)).reduce((p, v) => Math.max(p, v));
     }
 
-    protected isPrivateRepoContext(ctx: WorkspaceContext): boolean {
-        return CommitContext.is(ctx) && ctx.repository.private === true
-            || (PrebuiltWorkspaceContext.is(ctx) && this.isPrivateRepoContext(ctx.originalContext));
-    }
-
-    protected async checkEnoughCreditForWorkspaceStart(userId: string, date: Date, runningInstances: Promise<WorkspaceInstance[]>): Promise<boolean> {
+    protected async checkEnoughCreditForWorkspaceStart(
+        userId: string,
+        date: Date,
+        runningInstances: Promise<WorkspaceInstance[]>,
+    ): Promise<boolean> {
         // As retrieving a full AccountStatement is expensive we want to cache it as much as possible.
         const cachedAccountStatement = this.accountStatementProvider.getCachedStatement();
         const lowerBound = this.getRemainingUsageHoursLowerBound(cachedAccountStatement, date.toISOString());
-        if (lowerBound && (lowerBound === 'unlimited' || lowerBound > Accounting.MINIMUM_CREDIT_FOR_OPEN_IN_HOURS)) {
+        if (lowerBound && (lowerBound === "unlimited" || lowerBound > Accounting.MINIMUM_CREDIT_FOR_OPEN_IN_HOURS)) {
             return true;
         }
 
-        const remainingUsageHours = await this.accountStatementProvider.getRemainingUsageHours(userId, date.toISOString(), runningInstances)
+        const remainingUsageHours = await this.accountStatementProvider.getRemainingUsageHours(
+            userId,
+            date.toISOString(),
+            runningInstances,
+        );
         return remainingUsageHours > Accounting.MINIMUM_CREDIT_FOR_OPEN_IN_HOURS;
     }
 
@@ -186,106 +202,20 @@ export class EligibilityService {
      * Tries to calculate the lower bound of remaining usage hours based on cached AccountStatements
      * with the goal to improve workspace startup times.
      */
-    protected getRemainingUsageHoursLowerBound(cachedStatement: CachedAccountStatement | undefined, date: string): RemainingHours | undefined {
+    protected getRemainingUsageHoursLowerBound(
+        cachedStatement: CachedAccountStatement | undefined,
+        date: string,
+    ): RemainingHours | undefined {
         if (!cachedStatement) {
             return undefined;
         }
-        if (cachedStatement.remainingHours === 'unlimited') {
-            return 'unlimited';
+        if (cachedStatement.remainingHours === "unlimited") {
+            return "unlimited";
         }
 
         const diffInMillis = new Date(cachedStatement.endDate).getTime() - new Date(date).getTime();
         const maxPossibleUsage = millisecondsToHours(diffInMillis) * MAX_PARALLEL_WORKSPACES;
         return cachedStatement.remainingHours - maxPossibleUsage;
-    }
-
-    /**
-     * Whether the given user may open a workspace on the given context.
-     * A user may open private repos always.
-     * We previously limited private repo access to subscribed users.
-     * @param user
-     * @param context
-     * @param date The date for which we want to know whether the user is allowed to set a timeout (depends on active subscription)
-     */
-    async mayOpenContext(user: User, context: WorkspaceContext, date: Date): Promise<boolean> {
-        return true;
-    }
-
-    /**
-     * A user may open private repos if they either:
-     *  - not started their free "private repo trial" yet
-     *  - is has been no longer than 30 days since they started their "private repo trial"
-     *  - has a paid subscription
-     *  - has assigned team subscription
-     * @param user
-     * @param date The date for which we want to know whether the user is allowed to set a timeout (depends on active subscription)
-     */
-    async mayOpenPrivateRepo(user: User | string, date: Date = new Date()): Promise<boolean> {
-        if (!this.config.enablePayment) {
-            // when payment is disabled users can do everything
-            return true;
-        }
-
-        user = await this.getUser(user);
-        const freeTrialTimeStart = this.getPrivateRepoTrialStart(user);
-        if (freeTrialTimeStart === undefined) {
-            // Not started their free trial yet
-            return true;
-        }
-
-        if (EligibilityService.DURATION_30_DAYS_MILLIS + freeTrialTimeStart.getTime() - date.getTime() > 0) {
-            // Has already started free trial but still is within 30 days
-            return true;
-        }
-
-        return this.subscriptionService.hasActivePaidSubscription(user.id, date);
-    }
-
-    /**
-     * Marks the users free private repo trial as started _now_ (if not already set)
-     * @param user
-     * @param now
-     */
-    protected async ensureFreePrivateRepoTrialStarted(user: User, now: string): Promise<void> {
-        // If user has not yet started his free private repo trial yet: do that
-        if (!user.featureFlags) {
-            user.featureFlags = {};
-        }
-        if (!user.featureFlags.privateRepoTrialStartDate) {
-            user.featureFlags.privateRepoTrialStartDate = now;
-            // Issue an update only for the field in question to make sure our "async update" does not race
-            // with updates to any other fields
-            await this.userDb.updateUserPartial({
-                id: user.id,
-                featureFlags: user.featureFlags
-            });
-        }
-    }
-
-    protected getPrivateRepoTrialStart(user: User): Date | undefined {
-        const freeTrialStartDate = user.featureFlags && user.featureFlags.privateRepoTrialStartDate;
-        if (!freeTrialStartDate) {
-            // Not started his free trial yet
-            return undefined;
-        }
-        return new Date(freeTrialStartDate);
-    }
-
-    /**
-     * End date for the users free private trial or `undefined` if the trial hasn't started or the user already has a paid subscription.
-     *
-     * @param user
-     * @param date The date for which we want to know how much time the user has left (depends on active subscription)
-     */
-    async getPrivateRepoTrialEndDate(user: User, date: Date = new Date()): Promise<Date | undefined> {
-        const start = this.getPrivateRepoTrialStart(user);
-        if (start === undefined) {
-            return undefined;
-        }
-        if (await this.subscriptionService.hasActivePaidSubscription(user.id, date)) {
-            return undefined;
-        }
-        return new Date(EligibilityService.DURATION_30_DAYS_MILLIS + start.getTime());
     }
 
     /**
@@ -309,9 +239,9 @@ export class EligibilityService {
             Plans.TEAM_PROFESSIONAL_USD,
             Plans.TEAM_PROFESSIONAL_STUDENT_EUR,
             Plans.TEAM_PROFESSIONAL_STUDENT_USD,
-        ].map(p => p.chargebeeId);
+        ].map((p) => p.chargebeeId);
 
-        return subscriptions.filter(s => eligblePlans.includes(s.planId!)).length > 0;
+        return subscriptions.filter((s) => eligblePlans.includes(s.planId!)).length > 0;
     }
 
     /**
@@ -337,13 +267,58 @@ export class EligibilityService {
             Plans.PROFESSIONAL_USD,
             Plans.TEAM_PROFESSIONAL_EUR,
             Plans.TEAM_PROFESSIONAL_USD,
-        ].map(p => p.chargebeeId);
+        ].map((p) => p.chargebeeId);
 
-        return subscriptions.filter(s => eligblePlans.includes(s.planId!)).length > 0;
+        return subscriptions.filter((s) => eligblePlans.includes(s.planId!)).length > 0;
+    }
+
+    /**
+     * Returns true if the user ought to land on a workspace cluster that provides more resources
+     * compared to the default case.
+     */
+    async userGetsMoreResources(user: User): Promise<boolean> {
+        if (!this.config.enablePayment) {
+            // when payment is disabled users can do everything
+            return true;
+        }
+
+        const subscriptions = await this.subscriptionService.getNotYetCancelledSubscriptions(
+            user,
+            new Date().toISOString(),
+        );
+        const eligblePlans = [
+            Plans.PROFESSIONAL_EUR,
+            Plans.PROFESSIONAL_USD,
+            Plans.TEAM_PROFESSIONAL_EUR,
+            Plans.TEAM_PROFESSIONAL_USD,
+        ].map((p) => p.chargebeeId);
+
+        const relevantSubscriptions = subscriptions.filter((s) => eligblePlans.includes(s.planId!));
+        if (relevantSubscriptions.length === 0) {
+            // user has no subscription that grants "more resources"
+            return false;
+        }
+
+        // some TeamSubscriptions are marked with 'excludeFromMoreResources' to convey that those are _not_ receiving more resources
+        const excludeFromMoreResources = await Promise.all(
+            relevantSubscriptions.map(async (s): Promise<boolean> => {
+                if (!s.teamSubscriptionSlotId) {
+                    return false;
+                }
+                const ts = await this.teamSubscriptionDb.findTeamSubscriptionBySlotId(s.teamSubscriptionSlotId);
+                return !!ts?.excludeFromMoreResources;
+            }),
+        );
+        if (excludeFromMoreResources.every((b) => b)) {
+            // if all TS the user is part of are marked this way, we deny that privilege
+            return false;
+        }
+
+        return true;
     }
 
     protected async getUser(user: User | string): Promise<User> {
-        if (typeof user === 'string') {
+        if (typeof user === "string") {
             const realUser = await this.userDb.findUserById(user);
             if (!realUser) {
                 throw new Error(`No User found for id ${user}!`);
@@ -353,5 +328,4 @@ export class EligibilityService {
             return user;
         }
     }
-
 }

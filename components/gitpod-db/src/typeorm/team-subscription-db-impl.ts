@@ -20,7 +20,7 @@ export class TeamSubscriptionDBImpl implements TeamSubscriptionDB {
 
     async transaction<T>(code: (db: TeamSubscriptionDB) => Promise<T>): Promise<T> {
         const manager = await this.getEntityManager();
-        return await manager.transaction(async manager => {
+        return await manager.transaction(async (manager) => {
             return await code(new TransactionalTeamSubscriptionDBImpl(manager));
         });
     }
@@ -41,25 +41,39 @@ export class TeamSubscriptionDBImpl implements TeamSubscriptionDB {
      * Team Subscriptions
      */
 
-    async storeTeamSubscriptionEntry(ts: TeamSubscription): Promise<TeamSubscription> {
-        return (await this.getRepo()).save(ts);
+    async storeTeamSubscriptionEntry(ts: TeamSubscription): Promise<void> {
+        const repo = await this.getRepo();
+        await repo.save(ts);
     }
 
     async findTeamSubscriptionById(id: string): Promise<TeamSubscription | undefined> {
         const repo = await this.getRepo();
-        return repo.findOneById(id);
+        return repo.findOne(id);
     }
 
-    async findTeamSubscriptionByPaymentRef(userId: string, paymentReference: string): Promise<TeamSubscription | undefined> {
+    async findTeamSubscriptionBySlotId(slotId: string): Promise<TeamSubscription | undefined> {
+        const repo = await this.getRepo();
+        const query = repo
+            .createQueryBuilder("ts")
+            .leftJoinAndMapOne("ts.id", DBTeamSubscriptionSlot, "slot", "slot.teamSubscriptionId = ts.id")
+            .where("slot.id = :slotId", { slotId });
+        return query.getOne();
+    }
+
+    async findTeamSubscriptionByPaymentRef(
+        userId: string,
+        paymentReference: string,
+    ): Promise<TeamSubscription | undefined> {
         const repo = await this.getRepo();
         return repo.findOne({ userId, paymentReference });
     }
 
     async findTeamSubscriptionsForUser(userId: string, date: string): Promise<TeamSubscription[]> {
         const repo = await this.getRepo();
-        const query = repo.createQueryBuilder('ts')
-            .where('ts.userId = :userId', { userId: userId })
-            .andWhere('ts.startDate <= :date', { date: date })
+        const query = repo
+            .createQueryBuilder("ts")
+            .where("ts.userId = :userId", { userId: userId })
+            .andWhere("ts.startDate <= :date", { date: date })
             .andWhere('ts.endDate = "" OR ts.endDate > :date', { date: date });
         return query.getMany();
     }
@@ -78,7 +92,7 @@ export class TeamSubscriptionDBImpl implements TeamSubscriptionDB {
             const v = (dbSlot as any)[k];
             if (k in dbSlot && v === undefined) {
                 // typeorm ignores undefined as 'no data set' but we want to override old values!
-                (dbSlot as any)[k] = '';
+                (dbSlot as any)[k] = "";
             }
         }
         return (await this.getSlotsRepo()).save(dbSlot);
@@ -86,7 +100,7 @@ export class TeamSubscriptionDBImpl implements TeamSubscriptionDB {
 
     async findSlotById(id: string): Promise<TeamSubscriptionSlot | undefined> {
         const repo = await this.getSlotsRepo();
-        return repo.findOneById(id);
+        return repo.findOne(id);
     }
 
     async findSlotsByTeamSubscriptionId(teamSubscriptionId: string): Promise<TeamSubscriptionSlot[]> {

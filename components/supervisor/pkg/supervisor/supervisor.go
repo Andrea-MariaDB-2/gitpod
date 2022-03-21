@@ -13,9 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -28,12 +30,14 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
 	grpcruntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
 	"github.com/prometheus/procfs"
 	"github.com/soheilhy/cmux"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
+	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
@@ -42,15 +46,15 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/pprof"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	"github.com/gitpod-io/gitpod/content-service/pkg/executor"
+	"github.com/gitpod-io/gitpod/content-service/pkg/git"
 	"github.com/gitpod-io/gitpod/content-service/pkg/initializer"
 	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
 	"github.com/gitpod-io/gitpod/supervisor/api"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/activation"
+	"github.com/gitpod-io/gitpod/supervisor/pkg/config"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/dropwriter"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/ports"
 	"github.com/gitpod-io/gitpod/supervisor/pkg/terminal"
-
-	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
 )
 
 const (
@@ -58,11 +62,13 @@ const (
 	gitpodUserName  = "gitpod"
 	gitpodGID       = 33333
 	gitpodGroupName = "gitpod"
+	desktopIDEPort  = 24000
 )
 
 var (
 	additionalServices []RegisterableService
 	apiEndpointOpts    []grpc.ServerOption
+	Version            = ""
 )
 
 // RegisterAdditionalService registers additional services for the API endpoint
@@ -71,7 +77,7 @@ func RegisterAdditionalService(services ...RegisterableService) {
 	additionalServices = append(additionalServices, services...)
 }
 
-// AddAPIEndpointOpts adds additional grpc server options for the API endpoint
+// AddAPIEndpointOpts adds additional grpc server options for the API endpoint.
 func AddAPIEndpointOpts(opts ...grpc.ServerOption) {
 	apiEndpointOpts = append(apiEndpointOpts, opts...)
 }
@@ -80,10 +86,10 @@ type runOptions struct {
 	Args []string
 }
 
-// RunOption customizes the run behaviour
+// RunOption customizes the run behaviour.
 type RunOption func(*runOptions)
 
-// WithArgs sets the arguments passed to Run
+// WithArgs sets the arguments passed to Run.
 func WithArgs(args []string) RunOption {
 	return func(r *runOptions) {
 		r.Args = args
@@ -96,10 +102,10 @@ const (
 )
 
 const (
-	// KindGitpod marks tokens that provide access to the Gitpod server API
+	// KindGitpod marks tokens that provide access to the Gitpod server API.
 	KindGitpod = "gitpod"
 
-	// KindGit marks any kind of Git access token
+	// KindGit marks any kind of Git access token.
 	KindGit = "git"
 )
 
@@ -110,7 +116,24 @@ const (
 	ShutdownReasonExecutionError ShutdownReason = 1
 )
 
-// Run serves as main entrypoint to the supervisor
+type IDEKind int64
+
+const (
+	WebIDE IDEKind = iota
+	DesktopIDE
+)
+
+func (s IDEKind) String() string {
+	switch s {
+	case WebIDE:
+		return "IDE"
+	case DesktopIDE:
+		return "Desktop IDE"
+	}
+	return "unknown"
+}
+
+// Run serves as main entrypoint to the supervisor.
 func Run(options ...RunOption) {
 	exitCode := 0
 	defer handleExit(&exitCode)
@@ -131,12 +154,16 @@ func Run(options ...RunOption) {
 		return
 	}
 
+	// BEWARE: we can only call buildChildProcEnv once, because it might download env vars from a one-time-secret
+	//         URL, which would fail if we tried another time.
+	childProcEnvvars := buildChildProcEnv(cfg, nil)
+
 	err = AddGitpodUserIfNotExists()
 	if err != nil {
 		log.WithError(err).Fatal("cannot ensure Gitpod user exists")
 	}
 	symlinkBinaries(cfg)
-	configureGit(cfg)
+	configureGit(cfg, childProcEnvvars)
 
 	tokenService := NewInMemoryTokenService()
 	tkns, err := cfg.GetTokens(true)
@@ -166,23 +193,34 @@ func Run(options ...RunOption) {
 		log.WithError(err).Warn("cannot tunnel internal ports")
 	}
 
+	var slirp ports.SlirpClient
+	if _, err := os.Stat("/.supervisor/slirp4netns.sock/slirp4netns.sock"); err == nil {
+		slirp = ports.Slirp4Netns("/.supervisor/slirp4netns.sock/slirp4netns.sock")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+
+	internalPorts := []uint32{uint32(cfg.IDEPort), uint32(cfg.APIEndpointPort), uint32(cfg.SSHPort)}
+	if cfg.DesktopIDE != nil {
+		internalPorts = append(internalPorts, desktopIDEPort)
+	}
+
 	var (
-		shutdown            = make(chan ShutdownReason, 1)
-		ideReady            = &ideReadyState{cond: sync.NewCond(&sync.Mutex{})}
-		cstate              = NewInMemoryContentState(cfg.RepoRoot)
-		gitpodService       = createGitpodService(cfg, tokenService)
-		gitpodConfigService = gitpod.NewConfigService(cfg.RepoRoot+"/.gitpod.yml", cstate.ContentReady(), log.Log)
-		portMgmt            = ports.NewManager(
+		shutdown                           = make(chan ShutdownReason, 1)
+		ideReady                           = &ideReadyState{cond: sync.NewCond(&sync.Mutex{})}
+		desktopIdeReady     *ideReadyState = nil
+		cstate                             = NewInMemoryContentState(cfg.RepoRoot)
+		gitpodService                      = createGitpodService(cfg, tokenService)
+		gitpodConfigService                = config.NewConfigService(cfg.RepoRoot+"/.gitpod.yml", cstate.ContentReady(), log.Log)
+		portMgmt                           = ports.NewManager(
 			createExposedPortsImpl(cfg, gitpodService),
 			&ports.PollingServedPortsObserver{
 				RefreshInterval: 2 * time.Second,
 			},
 			ports.NewConfigService(cfg.WorkspaceID, gitpodConfigService, gitpodService),
 			tunneledPortsService,
-			uint32(cfg.IDEPort),
-			uint32(cfg.APIEndpointPort),
-			uint32(cfg.SSHPort),
+			slirp,
+			internalPorts...,
 		)
 		termMux             = terminal.NewMux()
 		termMuxSrv          = terminal.NewMuxTerminalService(termMux)
@@ -190,7 +228,13 @@ func Run(options ...RunOption) {
 		analytics           = analytics.NewFromEnvironment()
 		notificationService = NewNotificationService()
 	)
+	if cfg.DesktopIDE != nil {
+		desktopIdeReady = &ideReadyState{cond: sync.NewCond(&sync.Mutex{})}
+	}
+	go trackReadiness(ctx, gitpodService, cfg, cstate, ideReady, desktopIdeReady)
 	tokenService.provider[KindGit] = []tokenProvider{NewGitTokenProvider(gitpodService, cfg.WorkspaceConfig, notificationService)}
+
+	go gitpodConfigService.Watch(ctx)
 
 	defer analytics.Close()
 	go analyseConfigChanges(ctx, cfg, analytics, gitpodConfigService)
@@ -208,7 +252,7 @@ func Run(options ...RunOption) {
 			return ""
 		}
 	}
-	termMuxSrv.Env = buildChildProcEnv(cfg, nil)
+	termMuxSrv.Env = childProcEnvvars
 	termMuxSrv.DefaultCreds = &syscall.Credential{
 		Uid: gitpodUID,
 		Gid: gitpodGID,
@@ -216,10 +260,11 @@ func Run(options ...RunOption) {
 
 	apiServices := []RegisterableService{
 		&statusService{
-			ContentState: cstate,
-			Ports:        portMgmt,
-			Tasks:        taskManager,
-			ideReady:     ideReady,
+			ContentState:    cstate,
+			Ports:           portMgmt,
+			Tasks:           taskManager,
+			ideReady:        ideReady,
+			desktopIdeReady: desktopIdeReady,
 		},
 		termMuxSrv,
 		RegistrableTokenService{Service: tokenService},
@@ -230,19 +275,19 @@ func Run(options ...RunOption) {
 	}
 	apiServices = append(apiServices, additionalServices...)
 
-	// The reaper can be turned into a terminating reaper by writing true to this channel.
-	// When in terminating mode, the reaper will send SIGTERM to each child that gets reparented
-	// to us and is still running. We use this mechanism to send SIGTERM to a shell child processes
-	// that get reparented once their parent shell terminates during shutdown.
-	terminatingReaper := make(chan bool, 1)
-	// We keep the reaper until the bitter end because:
-	//   - it doesn't need graceful shutdown
-	//   - we want to do as much work as possible (SIGTERM'ing reparented processes during shutdown).
-	go reaper(terminatingReaper)
+	if !cfg.isHeadless() {
+		// We need to checkout dotfiles first, because they may be changing the path which affects the IDE.
+		// TODO(cw): provide better feedback if the IDE start fails because of the dotfiles (provide any feedback at all).
+		installDotfiles(ctx, cfg, tokenService, childProcEnvvars)
+	}
 
 	var ideWG sync.WaitGroup
 	ideWG.Add(1)
-	go startAndWatchIDE(ctx, cfg, &ideWG, ideReady)
+	go startAndWatchIDE(ctx, cfg, &cfg.IDE, childProcEnvvars, &ideWG, ideReady, WebIDE)
+	if cfg.DesktopIDE != nil {
+		ideWG.Add(1)
+		go startAndWatchIDE(ctx, cfg, cfg.DesktopIDE, childProcEnvvars, &ideWG, desktopIdeReady, DesktopIDE)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -250,7 +295,7 @@ func Run(options ...RunOption) {
 	wg.Add(1)
 	go startAPIEndpoint(ctx, cfg, &wg, apiServices, tunneledPortsService, apiEndpointOpts...)
 	wg.Add(1)
-	go startSSHServer(ctx, cfg, &wg)
+	go startSSHServer(ctx, cfg, &wg, childProcEnvvars)
 	wg.Add(1)
 	tasksSuccessChan := make(chan taskSuccess, 1)
 	go taskManager.Run(ctx, &wg, tasksSuccessChan)
@@ -276,6 +321,27 @@ func Run(options ...RunOption) {
 		}()
 	}
 
+	if !cfg.isHeadless() {
+		go func() {
+			<-cstate.ContentReady()
+
+			start := time.Now()
+			defer func() {
+				log.Debugf("unshallow of local repository took %v", time.Since(start))
+			}()
+
+			cmd := runAsGitpodUser(exec.Command("git", "fetch", "--unshallow", "--tags"))
+			cmd.Env = childProcEnvvars
+			cmd.Dir = cfg.RepoRoot
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err := cmd.Run()
+			if err != nil {
+				log.WithError(err).Error("git fetch error")
+			}
+		}()
+	}
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	select {
@@ -285,7 +351,6 @@ func Run(options ...RunOption) {
 	}
 
 	log.Info("received SIGTERM (or shutdown) - tearing down")
-	terminatingReaper <- true
 	cancel()
 	err = termMux.Close()
 	if err != nil {
@@ -297,6 +362,179 @@ func Run(options ...RunOption) {
 	terminateChildProcesses()
 
 	wg.Wait()
+}
+
+func installDotfiles(ctx context.Context, cfg *Config, tokenService *InMemoryTokenService, childProcEnvvars []string) {
+	repo := cfg.DotfileRepo
+	if repo == "" {
+		return
+	}
+
+	const dotfilePath = "/home/gitpod/.dotfiles"
+	if _, err := os.Stat(dotfilePath); err == nil {
+		// dotfile path exists already - nothing to do here
+		return
+	}
+
+	prep := func(cfg *Config, out io.Writer, name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(name, args...)
+		cmd.Dir = "/home/gitpod"
+		cmd.Env = childProcEnvvars
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			// All supervisor children run as gitpod user. The environment variables we produce are also
+			// gitpod user specific.
+			Credential: &syscall.Credential{
+				Uid: gitpodUID,
+				Gid: gitpodGID,
+			},
+		}
+		cmd.Stdout = out
+		cmd.Stderr = out
+		return cmd
+	}
+
+	err := func() (err error) {
+		out, err := os.OpenFile("/home/gitpod/.dotfiles.log", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+
+		defer func() {
+			if err != nil {
+				out.WriteString(fmt.Sprintf("# dotfile init failed: %s\n", err.Error()))
+			}
+		}()
+
+		done := make(chan error, 1)
+		go func() {
+			repoUrl, err := url.Parse(repo)
+			if err != nil {
+				done <- err
+				close(done)
+				return
+			}
+			authProvider := func() (username string, password string, err error) {
+				resp, err := tokenService.GetToken(ctx, &api.GetTokenRequest{
+					Host: repoUrl.Host,
+					Kind: KindGit,
+				})
+				if err != nil {
+					return
+				}
+				username = resp.User
+				password = resp.Token
+				return
+			}
+			client := &git.Client{
+				AuthProvider: authProvider,
+				AuthMethod:   git.BasicAuth,
+				Location:     dotfilePath,
+				RemoteURI:    repo,
+			}
+			done <- client.Clone(ctx)
+			close(done)
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+		case <-time.After(120 * time.Second):
+			return xerrors.Errorf("dotfiles repo clone did not finish within two minutes")
+		}
+
+		filepath.Walk(dotfilePath, func(name string, info os.FileInfo, err error) error {
+			if err == nil {
+				err = os.Chown(name, gitpodUID, gitpodGID)
+			}
+			return err
+		})
+
+		// at this point we have the dotfile repo cloned, let's try and install it
+		var candidates = []string{
+			"install.sh",
+			"install",
+			"bootstrap.sh",
+			"bootstrap",
+			"script/bootstrap",
+			"setup.sh",
+			"setup",
+			"script/setup",
+		}
+		for _, c := range candidates {
+			fn := filepath.Join(dotfilePath, c)
+			stat, err := os.Stat(fn)
+			if err != nil {
+				_, _ = out.WriteString(fmt.Sprintf("# installation script candidate %s is not available\n", fn))
+				continue
+			}
+			if stat.IsDir() {
+				_, _ = out.WriteString(fmt.Sprintf("# installation script candidate %s is a directory\n", fn))
+				continue
+			}
+			if stat.Mode()&0111 == 0 {
+				_, _ = out.WriteString(fmt.Sprintf("# installation script candidate %s is not executable\n", fn))
+				continue
+			}
+
+			_, _ = out.WriteString(fmt.Sprintf("# executing installation script candidate %s\n", fn))
+
+			// looks like we've found a candidate, let's run it
+			cmd := prep(cfg, out, "/bin/sh", "-c", "exec "+fn)
+			err = cmd.Start()
+			if err != nil {
+				return err
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- cmd.Wait()
+				close(done)
+			}()
+
+			select {
+			case err = <-done:
+				return err
+			case <-time.After(120 * time.Second):
+				cmd.Process.Kill()
+				return xerrors.Errorf("installation process %s tool longer than 120 seconds", fn)
+			}
+		}
+
+		// no installation script candidate was found, let's try and symlink this stuff
+		err = filepath.Walk(dotfilePath, func(path string, info fs.FileInfo, err error) error {
+			if strings.Contains(path, "/.git") {
+				// don't symlink the .git directory or any of its content
+				return nil
+			}
+
+			homeFN := filepath.Join("/home/gitpod", strings.TrimPrefix(path, dotfilePath))
+			if _, err := os.Stat(homeFN); err == nil {
+				// homeFN exists already - do nothing
+				return nil
+			}
+
+			if info.IsDir() {
+				err = os.MkdirAll(homeFN, info.Mode().Perm())
+				if err != nil {
+					return err
+				}
+				return nil
+			}
+
+			// write some feedback to the terminal
+			out.WriteString(fmt.Sprintf("# echo linking %s -> %s\n", path, homeFN))
+
+			return os.Symlink(path, homeFN)
+		})
+
+		return nil
+	}()
+	if err != nil {
+		// installing the dotfiles failed for some reason - we must tell the user
+		// TODO(cw): tell the user
+		log.WithError(err).Warn("installing dotfiles failed")
+	}
 }
 
 func createGitpodService(cfg *Config, tknsrv api.TokenServiceServer) *gitpod.APIoverJSONRPC {
@@ -323,6 +561,11 @@ func createGitpodService(cfg *Config, tknsrv api.TokenServiceServer) *gitpod.API
 	gitpodService, err := gitpod.ConnectToServer(endpoint, gitpod.ConnectToServerOpts{
 		Token: tknres.Token,
 		Log:   log.Log,
+		ExtraHeaders: map[string]string{
+			"User-Agent":              "gitpod/supervisor",
+			"X-Workspace-Instance-Id": cfg.WorkspaceInstanceID,
+			"X-Client-Version":        Version,
+		},
 	})
 	if err != nil {
 		log.WithError(err).Error("cannot connect to Gitpod API")
@@ -357,14 +600,20 @@ func symlinkBinaries(cfg *Config) {
 			from = filepath.Join(base, k)
 			to   = filepath.Join("/usr/bin", v)
 		)
+
+		// remove possibly existing symlink target
+		if err = os.Remove(to); err != nil && !os.IsNotExist(err) {
+			log.WithError(err).WithField("to", to).Warn("cannot remove possibly existing symlink target")
+		}
+
 		err = os.Symlink(from, to)
-		if err != nil && !os.IsExist(err) {
+		if err != nil {
 			log.WithError(err).WithField("from", from).WithField("to", to).Warn("cannot create symlink")
 		}
 	}
 }
 
-func configureGit(cfg *Config) {
+func configureGit(cfg *Config, childProcEnvvars []string) {
 	settings := [][]string{
 		{"push.default", "simple"},
 		{"alias.lg", "log --color --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit"},
@@ -380,6 +629,7 @@ func configureGit(cfg *Config) {
 	for _, s := range settings {
 		cmd := exec.Command("git", append([]string{"config", "--global"}, s...)...)
 		cmd = runAsGitpodUser(cmd)
+		cmd.Env = childProcEnvvars
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		err := cmd.Run()
@@ -402,7 +652,7 @@ func hasMetadataAccess() bool {
 	req.Header.Add("Metadata-Flavor", "Google")
 
 	resp, err := client.Do(req)
-	// We did not see an error. That's a problem becuase that means that users can reach the metadata endpoint.
+	// We did not see an error. That's a problem because that means that users can reach the metadata endpoint.
 	if err == nil {
 		resp.Body.Close()
 		return true
@@ -412,84 +662,24 @@ func hasMetadataAccess() bool {
 	return false
 }
 
-func reaper(terminatingReaper <-chan bool) {
-	defer log.Debug("reaper shutdown")
+type ideStatus int
 
-	notifications := make(chan struct{}, 128)
-	go func() {
-		sigs := make(chan os.Signal, 3)
-		signal.Notify(sigs, syscall.SIGCHLD)
-		for {
-			<-sigs
-			select {
-			case notifications <- struct{}{}:
-			default:
-				// Notification channel is full, so we drop the notification.
-				// Because we're reaping with PID -1, we'll catch the child process for
-				// which we've missed the notification anyways.
-			}
-		}
-	}()
+const (
+	statusNeverRan ideStatus = iota
+	statusShouldRun
+	statusShouldShutdown
+)
 
-	var terminating bool
-	for {
-		select {
-		case <-notifications:
-		case terminating = <-terminatingReaper:
-			continue
-		}
-
-		// wait on the process, hence remove it from the process table
-		pid, err := unix.Wait4(-1, nil, 0, nil)
-		// if we've been interrupted, try again until we're done
-		for err == syscall.EINTR {
-			pid, err = unix.Wait4(-1, nil, 0, nil)
-		}
-		if err == unix.ECHILD {
-			// The calling process does not have any unwaited-for children.
-			// Not really an error for us
-			err = nil
-		}
-		if err != nil {
-			log.WithField("pid", pid).WithError(err).Debug("cannot call waitpid() for re-parented child")
-		}
-
-		if !terminating {
-			continue
-		}
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			log.WithField("pid", pid).WithError(err).Debug("cannot find re-parented process")
-			continue
-		}
-		err = proc.Signal(syscall.SIGTERM)
-		if err != nil {
-			if !strings.Contains(err.Error(), "os: process already finished") {
-				log.WithField("pid", pid).WithError(err).Debug("cannot send SIGTERM to re-parented process")
-			}
-
-			continue
-		}
-		log.WithField("pid", pid).Debug("SIGTERM'ed reparented child process")
-	}
-}
-
-func startAndWatchIDE(ctx context.Context, cfg *Config, wg *sync.WaitGroup, ideReady *ideReadyState) {
+func startAndWatchIDE(ctx context.Context, cfg *Config, ideConfig *IDEConfig, childProcEnvvars []string, wg *sync.WaitGroup, ideReady *ideReadyState, ide IDEKind) {
 	defer wg.Done()
-	defer log.Debug("startAndWatchIDE shutdown")
+	defer log.WithField("ide", ide.String()).Debug("startAndWatchIDE shutdown")
 
 	if cfg.isHeadless() {
-		ideReady.Set(true)
+		ideReady.Set(true, nil)
 		return
 	}
 
-	type status int
-	const (
-		statusNeverRan status = iota
-		statusShouldRun
-		statusShouldShutdown
-	)
-	s := statusNeverRan
+	ideStatus := statusNeverRan
 
 	var (
 		cmd        *exec.Cmd
@@ -497,88 +687,107 @@ func startAndWatchIDE(ctx context.Context, cfg *Config, wg *sync.WaitGroup, ideR
 	)
 supervisorLoop:
 	for {
-		if s == statusShouldShutdown {
+		if ideStatus == statusShouldShutdown {
 			break
 		}
 
 		ideStopped = make(chan struct{}, 1)
-		go func() {
-			cmd = prepareIDELaunch(cfg)
-
-			// prepareIDELaunch sets Pdeathsig, which on on Linux, will kill the
-			// child process when the thread dies, not when the process dies.
-			// runtime.LockOSThread ensures that as long as this function is
-			// executing that OS thread will still be around.
-			//
-			// see https://github.com/golang/go/issues/27505#issuecomment-713706104
-			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
-
-			err := cmd.Start()
-			if err != nil {
-				if s == statusNeverRan {
-					log.WithError(err).Fatal("IDE failed to start")
-				}
-
-				return
-			}
-			s = statusShouldRun
-
-			go func() {
-				runIDEReadinessProbe(cfg)
-				ideReady.Set(true)
-			}()
-
-			err = cmd.Wait()
-			if err != nil && !(strings.Contains(err.Error(), "signal: interrupt") || strings.Contains(err.Error(), "wait: no child processes")) {
-				log.WithError(err).Warn("IDE was stopped")
-
-				ideWasReady := ideReady.Get()
-				if !ideWasReady {
-					log.WithError(err).Fatal("IDE failed to start")
-					return
-				}
-			}
-
-			ideReady.Set(false)
-			close(ideStopped)
-		}()
+		cmd = prepareIDELaunch(cfg, ideConfig, childProcEnvvars)
+		launchIDE(cfg, ideConfig, cmd, ideStopped, ideReady, &ideStatus, ide)
 
 		select {
 		case <-ideStopped:
+			// kill all processes in same pgid
+			_ = syscall.Kill(-1*cmd.Process.Pid, syscall.SIGKILL)
 			// IDE was stopped - let's just restart it after a small delay (in case the IDE doesn't start at all) in the next round
-			if s == statusShouldShutdown {
+			if ideStatus == statusShouldShutdown {
 				break supervisorLoop
 			}
 			time.Sleep(1 * time.Second)
 		case <-ctx.Done():
 			// we've been asked to shut down
-			s = statusShouldShutdown
-			if cmd != nil && cmd.Process != nil {
-				cmd.Process.Signal(os.Interrupt)
+			ideStatus = statusShouldShutdown
+			if cmd == nil || cmd.Process == nil {
+				log.WithField("ide", ide.String()).Error("cmd or cmd.Process is nil, cannot send Interrupt signal")
+			} else {
+				_ = cmd.Process.Signal(os.Interrupt)
 			}
 			break supervisorLoop
 		}
 	}
 
-	log.WithField("budget", timeBudgetIDEShutdown.String()).Info("IDE supervisor loop ended - waiting for IDE to come down")
+	log.WithField("ide", ide.String()).WithField("budget", timeBudgetIDEShutdown.String()).Info("IDE supervisor loop ended - waiting for IDE to come down")
 	select {
 	case <-ideStopped:
+		log.WithField("ide", ide.String()).WithField("budget", timeBudgetIDEShutdown.String()).Info("IDE has been stopped in time")
 		return
 	case <-time.After(timeBudgetIDEShutdown):
-		log.WithField("timeBudgetIDEShutdown", timeBudgetIDEShutdown.String()).Error("IDE did not stop in time - sending SIGKILL")
-		cmd.Process.Signal(syscall.SIGKILL)
+		log.WithField("ide", ide.String()).WithField("timeBudgetIDEShutdown", timeBudgetIDEShutdown.String()).Error("IDE did not stop in time - sending SIGKILL")
+		if cmd == nil || cmd.Process == nil {
+			log.WithField("ide", ide.String()).Error("cmd or cmd.Process is nil, cannot send SIGKILL")
+		} else {
+			_ = cmd.Process.Signal(syscall.SIGKILL)
+		}
 	}
 }
 
-func prepareIDELaunch(cfg *Config) *exec.Cmd {
-	var args []string
-	args = append(args, cfg.WorkspaceRoot)
-	args = append(args, "--port", strconv.Itoa(cfg.IDEPort))
-	args = append(args, "--hostname", "0.0.0.0")
-	log.WithField("args", args).WithField("entrypoint", cfg.Entrypoint).Info("launching IDE")
+func launchIDE(cfg *Config, ideConfig *IDEConfig, cmd *exec.Cmd, ideStopped chan struct{}, ideReady *ideReadyState, s *ideStatus, ide IDEKind) {
+	go func() {
+		// prepareIDELaunch sets Pdeathsig, which on on Linux, will kill the
+		// child process when the thread dies, not when the process dies.
+		// runtime.LockOSThread ensures that as long as this function is
+		// executing that OS thread will still be around.
+		//
+		// see https://github.com/golang/go/issues/27505#issuecomment-713706104
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
-	cmd := exec.Command(cfg.Entrypoint, args...)
+		err := cmd.Start()
+		if err != nil {
+			if s == func() *ideStatus { i := statusNeverRan; return &i }() {
+				log.WithField("ide", ide.String()).WithError(err).Fatal("IDE failed to start")
+			}
+
+			return
+		}
+		s = func() *ideStatus { i := statusShouldRun; return &i }()
+
+		go func() {
+			IDEStatus := runIDEReadinessProbe(cfg, ideConfig, ide)
+			ideReady.Set(true, IDEStatus)
+		}()
+
+		err = cmd.Wait()
+		if err != nil {
+			log.WithField("ide", ide.String()).WithError(err).Warn("IDE was stopped")
+
+			ideWasReady, _ := ideReady.Get()
+			if !ideWasReady {
+				log.WithField("ide", ide.String()).WithError(err).Fatal("IDE failed to start")
+				return
+			}
+		}
+
+		ideReady.Set(false, nil)
+		close(ideStopped)
+	}()
+}
+
+func prepareIDELaunch(cfg *Config, ideConfig *IDEConfig, childProcEnvvars []string) *exec.Cmd {
+	args := ideConfig.EntrypointArgs
+
+	// Add default args for IDE (not desktop IDE) to be backwards compatible
+	if ideConfig.Entrypoint == "/ide/startup.sh" && len(args) == 0 {
+		args = append(args, "--port", "{IDEPORT}")
+	}
+
+	for i := range args {
+		args[i] = strings.ReplaceAll(args[i], "{IDEPORT}", strconv.Itoa(cfg.IDEPort))
+		args[i] = strings.ReplaceAll(args[i], "{DESKTOPIDEPORT}", strconv.Itoa(desktopIDEPort))
+	}
+	log.WithField("args", args).WithField("entrypoint", ideConfig.Entrypoint).Info("preparing IDE launch")
+
+	cmd := exec.Command(ideConfig.Entrypoint, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// We need the child process to run in its own process group, s.t. we can suspend and resume
 		// IDE and its children.
@@ -592,13 +801,13 @@ func prepareIDELaunch(cfg *Config) *exec.Cmd {
 			Gid: gitpodGID,
 		},
 	}
-	cmd.Env = buildChildProcEnv(cfg, nil)
+	cmd.Env = childProcEnvvars
 
 	// Here we must resist the temptation to "neaten up" the IDE output for headless builds.
 	// This would break the JSON parsing of the headless builds.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if lrr := cfg.LogRateLimit(); lrr > 0 {
+	if lrr := cfg.IDELogRateLimit(ideConfig); lrr > 0 {
 		limit := int64(lrr)
 		cmd.Stdout = dropwriter.Writer(cmd.Stdout, dropwriter.NewBucket(limit*1024*3, limit*1024))
 		cmd.Stderr = dropwriter.Writer(cmd.Stderr, dropwriter.NewBucket(limit*1024*3, limit*1024))
@@ -610,6 +819,8 @@ func prepareIDELaunch(cfg *Config) *exec.Cmd {
 
 // buildChildProcEnv computes the environment variables passed to a child process, based on the total list
 // of envvars. If envvars is nil, os.Environ() is used.
+//
+// Beware: if config contains an OTS URL the results may differ on subsequent calls.
 func buildChildProcEnv(cfg *Config, envvars []string) []string {
 	if envvars == nil {
 		envvars = os.Environ()
@@ -631,6 +842,20 @@ func buildChildProcEnv(cfg *Config, envvars []string) []string {
 		envs[nme] = val
 	}
 	envs["SUPERVISOR_ADDR"] = fmt.Sprintf("localhost:%d", cfg.APIEndpointPort)
+
+	if cfg.EnvvarOTS != "" {
+		es, err := downloadEnvvarOTS(cfg.EnvvarOTS)
+		if err != nil {
+			log.WithError(err).Warn("unable to download environment variables from OTS")
+		}
+		for k, v := range es {
+			if isBlacklistedEnvvar(k) {
+				continue
+			}
+
+			envs[k] = v
+		}
+	}
 
 	// We're forcing basic environment variables here, because supervisor acts like a login process at this point.
 	// The gitpod user might not have existed when supervisor was started, hence the HOME coming
@@ -667,16 +892,62 @@ func buildChildProcEnv(cfg *Config, envvars []string) []string {
 	return env
 }
 
-func runIDEReadinessProbe(cfg *Config) {
-	defer log.Info("IDE is ready")
+func downloadEnvvarOTS(url string) (res map[string]string, err error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
 
-	switch cfg.ReadinessProbe.Type {
+	defer resp.Body.Close()
+
+	var dl []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&dl)
+	if err != nil {
+		return nil, err
+	}
+
+	res = make(map[string]string)
+	for _, e := range dl {
+		res[e.Name] = e.Value
+	}
+	return res, nil
+}
+
+func runIDEReadinessProbe(cfg *Config, ideConfig *IDEConfig, ide IDEKind) (desktopIDEStatus *DesktopIDEStatus) {
+	defer log.WithField("ide", ide.String()).Info("IDE is ready")
+
+	defaultIfEmpty := func(value, defaultValue string) string {
+		if len(value) == 0 {
+			return defaultValue
+		}
+		return value
+	}
+
+	defaultIfZero := func(value, defaultValue int) int {
+		if value == 0 {
+			return defaultValue
+		}
+		return value
+	}
+
+	defaultProbePort := cfg.IDEPort
+	if ide == DesktopIDE {
+		defaultProbePort = desktopIDEPort
+	}
+	switch ideConfig.ReadinessProbe.Type {
 	case ReadinessProcessProbe:
 		return
 
 	case ReadinessHTTPProbe:
 		var (
-			url    = fmt.Sprintf("http://localhost:%d/%s", cfg.IDEPort, strings.TrimPrefix(cfg.ReadinessProbe.HTTPProbe.Path, "/"))
+			schema = defaultIfEmpty(ideConfig.ReadinessProbe.HTTPProbe.Schema, "http")
+			host   = defaultIfEmpty(ideConfig.ReadinessProbe.HTTPProbe.Host, "localhost")
+			port   = defaultIfZero(ideConfig.ReadinessProbe.HTTPProbe.Port, defaultProbePort)
+			url    = fmt.Sprintf("%s://%s:%d/%s", schema, host, port, strings.TrimPrefix(ideConfig.ReadinessProbe.HTTPProbe.Path, "/"))
 			client = http.Client{Timeout: 1 * time.Second}
 			tick   = time.NewTicker(500 * time.Millisecond)
 		)
@@ -691,16 +962,32 @@ func runIDEReadinessProbe(cfg *Config) {
 			if err != nil {
 				continue
 			}
-			resp.Body.Close()
+			defer resp.Body.Close()
 
 			if resp.StatusCode == http.StatusOK {
-				log.WithField("status", resp.StatusCode).Infof("IDE readiness took %.3f seconds", time.Since(t0).Seconds())
+				log.WithField("ide", ide.String()).WithField("status", resp.StatusCode).Infof("IDE readiness took %.3f seconds", time.Since(t0).Seconds())
+
+				if ide == DesktopIDE {
+					bodyBytes, err := ioutil.ReadAll(resp.Body)
+					log.WithField("ide", ide.String()).Infof("IDE status probe body: %s", string(bodyBytes))
+					if err != nil {
+						log.WithField("ide", ide.String()).WithError(err).Infof("Error reading response body from IDE status probe.")
+						break
+					}
+					err = json.Unmarshal(bodyBytes, &desktopIDEStatus)
+					if err != nil {
+						log.WithField("ide", ide.String()).WithError(err).WithField("body", bodyBytes).Debugf("Error parsing JSON body from IDE status probe.")
+						break
+					}
+					log.WithField("ide", ide.String()).Infof("Desktop IDE status: %s", desktopIDEStatus)
+				}
 				break
 			}
 
-			log.WithField("status", resp.StatusCode).Info("IDE readiness probe came back with non-200 status code")
+			log.WithField("ide", ide.String()).WithField("status", resp.StatusCode).Info("IDE readiness probe came back with non-200 status code")
 		}
 	}
+	return
 }
 
 func isBlacklistedEnvvar(name string) bool {
@@ -821,7 +1108,7 @@ func tunnelOverWebSocket(tunneled *ports.TunneledPortsService, conn *gitpod.Webs
 		return
 	}
 	go func() {
-		conn.Wait()
+		_ = conn.Wait()
 		sshConn.Close()
 	}()
 	go ssh.DiscardRequests(reqs)
@@ -849,14 +1136,14 @@ func tunnelOverSSH(ctx context.Context, tunneled *ports.TunneledPortsService, ne
 	err := proto.Unmarshal(newCh.ExtraData(), tunnelReq)
 	if err != nil {
 		log.WithError(err).Error("tunnel: invalid ssh chan request")
-		newCh.Reject(ssh.Prohibited, err.Error())
+		_ = newCh.Reject(ssh.Prohibited, err.Error())
 		return
 	}
 
 	tunnel, err := tunneled.EstablishTunnel(ctx, tunnelReq.ClientId, tunnelReq.Port, tunnelReq.TargetPort)
 	if err != nil {
 		log.WithError(err).Error("tunnel: failed to establish")
-		newCh.Reject(ssh.Prohibited, err.Error())
+		_ = newCh.Reject(ssh.Prohibited, err.Error())
 		return
 	}
 	log.Debug("tunnel: accepted new connection")
@@ -890,7 +1177,7 @@ func stopWhenTasksAreDone(ctx context.Context, wg *sync.WaitGroup, shutdown chan
 	if success.Failed() {
 		// we signal task failure via kubernetes termination log
 		msg := []byte("headless task failed: " + string(success))
-		err := ioutil.WriteFile("/dev/termination-log", msg, 0644)
+		err := ioutil.WriteFile("/dev/termination-log", msg, 0o644)
 		if err != nil {
 			log.WithError(err).Error("err while writing termination log")
 		}
@@ -898,80 +1185,25 @@ func stopWhenTasksAreDone(ctx context.Context, wg *sync.WaitGroup, shutdown chan
 	shutdown <- ShutdownReasonSuccess
 }
 
-func startSSHServer(ctx context.Context, cfg *Config, wg *sync.WaitGroup) {
+func startSSHServer(ctx context.Context, cfg *Config, wg *sync.WaitGroup, childProcEnvvars []string) {
 	defer wg.Done()
 
-	bin, err := os.Executable()
-	if err != nil {
-		log.WithError(err).Error("cannot find executable path")
-		return
-	}
-	dropbear := filepath.Join(filepath.Dir(bin), "dropbear", "dropbear")
-	if _, err := os.Stat(dropbear); err != nil {
-		log.WithError(err).WithField("path", dropbear).Error("cannot locate dropebar binary")
-		return
-	}
-	dropbearkey := filepath.Join(filepath.Dir(bin), "dropbear", "dropbearkey")
-	if _, err := os.Stat(dropbearkey); err != nil {
-		log.WithError(err).WithField("path", dropbearkey).Error("cannot locate dropebarkey")
+	if cfg.isHeadless() {
 		return
 	}
 
-	hostkeyFN, err := ioutil.TempFile("", "hostkey")
-	if err != nil {
-		log.WithError(err).Error("cannot create hostkey file")
-		return
-	}
-	hostkeyFN.Close()
-	os.Remove(hostkeyFN.Name())
-
-	keycmd := exec.Command(dropbearkey, "-t", "rsa", "-f", hostkeyFN.Name())
-	// We need to force HOME because the Gitpod user might not have existed at the start of the container
-	// which makes the container runtime set an invalid HOME value.
-	keycmd.Env = func() []string {
-		env := os.Environ()
-		res := make([]string, 0, len(env))
-		for _, e := range env {
-			if strings.HasPrefix(e, "HOME=") {
-				e = "HOME=/root"
-			}
-			res = append(res, e)
-		}
-		return res
-	}()
-	out, err := keycmd.CombinedOutput()
-	if err != nil {
-		log.WithError(err).WithField("out", string(out)).Error("cannot create hostkey file")
-		return
-	}
-	_ = os.Chown(hostkeyFN.Name(), gitpodUID, gitpodGID)
-
-	cmd := exec.Command(dropbear, "-F", "-E", "-w", "-s", "-p", fmt.Sprintf(":%d", cfg.SSHPort), "-r", hostkeyFN.Name())
-	cmd = runAsGitpodUser(cmd)
-	cmd.Env = buildChildProcEnv(cfg, nil)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Start()
-	if err != nil {
-		log.WithError(err).Error("cannot start SSH server")
-		return
-	}
-
-	done := make(chan error, 1)
 	go func() {
-		done <- cmd.Wait()
-	}()
-	select {
-	case <-ctx.Done():
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		return
-	case err = <-done:
+		ssh, err := newSSHServer(ctx, cfg, childProcEnvvars)
 		if err != nil {
-			log.WithError(err).Error("SSH server stopped")
+			log.WithError(err).Error("err creating SSH server")
+			return
 		}
-	}
+
+		err = ssh.listenAndServe()
+		if err != nil {
+			log.WithError(err).Error("err starting SSH server")
+		}
+	}()
 }
 
 func startContentInit(ctx context.Context, cfg *Config, wg *sync.WaitGroup, cst ContentState) {
@@ -984,7 +1216,7 @@ func startContentInit(ctx context.Context, cfg *Config, wg *sync.WaitGroup, cst 
 			return
 		}
 
-		ferr := os.WriteFile("/dev/termination-log", []byte(err.Error()), 0644)
+		ferr := os.WriteFile("/dev/termination-log", []byte(err.Error()), 0o644)
 		if ferr != nil {
 			log.WithError(err).Error("cannot write termination log")
 		}
@@ -1095,7 +1327,6 @@ func processesWithParent(ppid int) (map[int]int, error) {
 
 	children := make(map[int]int)
 	for _, proc := range procs {
-
 		stat, err := proc.Stat()
 		if err != nil {
 			continue
@@ -1145,7 +1376,7 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 			cmd.ExtraFiles = []*os.File{socketFD}
 			alias, err := term.Start(cmd, terminal.TermOptions{
 				Annotations: map[string]string{
-					"supervisor": "true",
+					"gitpod.supervisor": "true",
 				},
 				LogToStdout: true,
 			})
@@ -1160,7 +1391,7 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 			go func(ptyCtx context.Context) {
 				select {
 				case <-ctx.Done():
-					pty.Command.Process.Signal(syscall.SIGTERM)
+					_ = pty.Command.Process.Signal(syscall.SIGTERM)
 				case <-ptyCtx.Done():
 				}
 			}(ptyCtx)
@@ -1174,8 +1405,8 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 	}
 }
 
-func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer, cfgobs gitpod.ConfigInterface) {
-	cfgc, errc := cfgobs.Observe(ctx)
+func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer, cfgobs config.ConfigInterface) {
+	cfgc := cfgobs.Observe(ctx)
 	var (
 		cfg     *gitpod.GitpodConfig
 		t       = time.NewTicker(10 * time.Second)
@@ -1198,8 +1429,8 @@ func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer
 
 	for {
 		select {
-		case c := <-cfgc:
-			if c == nil {
+		case c, ok := <-cfgc:
+			if !ok {
 				return
 			}
 			if cfg == nil {
@@ -1211,10 +1442,20 @@ func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer
 				Name string
 				G    func(*gitpod.GitpodConfig) interface{}
 			}{
-				{"ports", func(gc *gitpod.GitpodConfig) interface{} { return gc.Ports }},
-				{"tasks", func(gc *gitpod.GitpodConfig) interface{} { return gc.Tasks }},
+				{"ports", func(gc *gitpod.GitpodConfig) interface{} {
+					if gc == nil {
+						return nil
+					}
+					return gc.Ports
+				}},
+				{"tasks", func(gc *gitpod.GitpodConfig) interface{} {
+					if gc == nil {
+						return nil
+					}
+					return gc.Tasks
+				}},
 				{"prebuild", func(gc *gitpod.GitpodConfig) interface{} {
-					if gc.Github == nil {
+					if gc == nil || gc.Github == nil {
 						return nil
 					}
 					return gc.Github.Prebuilds
@@ -1222,7 +1463,7 @@ func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer
 			}
 			for _, ch := range pch {
 				prev, _ := computeHash(ch.G(cfg))
-				curr, _ := computeHash(ch.G(c))
+				curr, _ := computeHash(ch.G(cfg))
 				if prev != curr {
 					changes = append(changes, ch.Name)
 				}
@@ -1240,10 +1481,51 @@ func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer
 				},
 			})
 			changes = nil
-		case <-errc:
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+func trackReadiness(ctx context.Context, gitpodService *gitpod.APIoverJSONRPC, cfg *Config, cstate *InMemoryContentState, ideReady *ideReadyState, desktopIdeReady *ideReadyState) {
+	type SupervisorReadiness struct {
+		Kind                string `json:"kind,omitempty"`
+		WorkspaceId         string `json:"workspaceId,omitempty"`
+		WorkspaceInstanceId string `json:"instanceId,omitempty"`
+		Timestamp           int64  `json:"timestamp,omitempty"`
+	}
+	trackFn := func(ctx context.Context, gitpodService *gitpod.APIoverJSONRPC, cfg *Config, kind string) {
+		err := gitpodService.TrackEvent(ctx, &gitpod.RemoteTrackMessage{
+			Event: "supervisor_readiness",
+			Properties: SupervisorReadiness{
+				Kind:                kind,
+				WorkspaceId:         cfg.WorkspaceID,
+				WorkspaceInstanceId: cfg.WorkspaceInstanceID,
+				Timestamp:           time.Now().UnixMilli(),
+			},
+		})
+		if err != nil {
+			log.WithError(err).Error("error tracking supervisor_readiness")
+		}
+	}
+	const (
+		readinessKindContent    = "content"
+		readinessKindIDE        = "ide"
+		readinessKindDesktopIDE = "ide-desktop"
+	)
+	go func() {
+		<-cstate.ContentReady()
+		trackFn(ctx, gitpodService, cfg, readinessKindContent)
+	}()
+	go func() {
+		<-ideReady.Wait()
+		trackFn(ctx, gitpodService, cfg, readinessKindIDE)
+	}()
+	if cfg.DesktopIDE != nil {
+		go func() {
+			<-desktopIdeReady.Wait()
+			trackFn(ctx, gitpodService, cfg, readinessKindDesktopIDE)
+		}()
 	}
 }
 

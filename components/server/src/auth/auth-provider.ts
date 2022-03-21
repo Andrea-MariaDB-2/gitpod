@@ -4,10 +4,10 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-
-import * as express from 'express';
+import * as express from "express";
 import { AuthProviderInfo, User, OAuth2Config, AuthProviderEntry } from "@gitpod/gitpod-protocol";
-import { saveSession } from '../express-util';
+import { saveSession } from "../express-util";
+import { Session } from "../express";
 
 import { UserEnvVarValue } from "@gitpod/gitpod-protocol";
 
@@ -19,7 +19,7 @@ export interface AuthProviderParams extends AuthProviderEntry {
     readonly oauth: OAuth2Config & {
         // extending:
         readonly configFn?: string;
-    }
+    };
 
     // for special auth providers only
     readonly params?: {
@@ -27,7 +27,7 @@ export interface AuthProviderParams extends AuthProviderEntry {
         readonly authUrl: string;
         readonly callBackUrl: string;
         readonly githubToken: string;
-    }
+    };
 
     // properties to control behavior
     readonly hiddenOnDashboard?: boolean;
@@ -44,7 +44,9 @@ export function parseAuthProviderParamsFromEnv(json: object): AuthProviderParams
     }
     return [];
 }
-export function normalizeAuthProviderParams(params: Omit<AuthProviderParams, "ownerId" | "builtin" | "status" | "verified">[]): AuthProviderParams[] {
+export function normalizeAuthProviderParams(
+    params: Omit<AuthProviderParams, "ownerId" | "builtin" | "status" | "verified">[],
+): AuthProviderParams[] {
     const result: AuthProviderParams[] = [];
     for (const p of params) {
         result.push({
@@ -53,7 +55,7 @@ export function normalizeAuthProviderParams(params: Omit<AuthProviderParams, "ow
             builtin: true,
             status: "verified",
             verified: true,
-        })
+        });
     }
     return result;
 }
@@ -73,7 +75,7 @@ export interface AuthUser {
     readonly avatarUrl?: string;
 }
 
-export const AuthProvider = Symbol('AuthProvider');
+export const AuthProvider = Symbol("AuthProvider");
 export interface AuthProvider {
     readonly authProviderId: string;
     readonly params: AuthProviderParams;
@@ -90,19 +92,18 @@ export interface AuthFlow {
     readonly overrideScopes?: boolean;
 }
 export namespace AuthFlow {
-    const storageKey = "authFlow";
-    export function get(session: Express.Session | undefined): AuthFlow | undefined {
+    export function get(session: Session | undefined): AuthFlow | undefined {
         if (session) {
-            return session[storageKey] as AuthFlow | undefined;
+            return session.authFlow;
         }
     }
-    export async function attach(session: Express.Session, authFlow: AuthFlow): Promise<void> {
-        session[storageKey] = authFlow;
+    export async function attach(session: Session, authFlow: AuthFlow): Promise<void> {
+        session.authFlow = authFlow;
         return saveSession(session);
     }
-    export async function clear(session: Express.Session | undefined) {
+    export async function clear(session: Session | undefined) {
         if (session) {
-            session[storageKey] = undefined;
+            session.authFlow = undefined;
             return saveSession(session);
         }
     }

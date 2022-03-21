@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -103,7 +104,7 @@ var ring0Cmd = &cobra.Command{
 		cmd := exec.Command("/proc/self/exe", "ring1")
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Pdeathsig:  syscall.SIGKILL,
-			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | unix.CLONE_NEWCGROUP,
 		}
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -248,6 +249,10 @@ var ring1Cmd = &cobra.Command{
 			fsshift = api.FSShiftMethod(v)
 		}
 
+		var (
+			slirp4netnsSocket string
+		)
+
 		type mnte struct {
 			Target string
 			Source string
@@ -256,7 +261,6 @@ var ring1Cmd = &cobra.Command{
 		}
 
 		var mnts []mnte
-
 		switch fsshift {
 		case api.FSShiftMethod_FUSE:
 			mnts = append(mnts,
@@ -284,6 +288,12 @@ var ring1Cmd = &cobra.Command{
 		}
 		mnts = append(mnts, mnte{Target: "/tmp", Source: "tmpfs", FSType: "tmpfs"})
 
+		// If this is a cgroupv2 machine, we'll want to mount the cgroup2 FS ourselves
+		if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil {
+			mnts = append(mnts, mnte{Target: "/sys/fs/cgroup", Source: "tmpfs", FSType: "tmpfs"})
+			mnts = append(mnts, mnte{Target: "/sys/fs/cgroup", Source: "cgroup", FSType: "cgroup2"})
+		}
+
 		if adds := os.Getenv("GITPOD_WORKSPACEKIT_BIND_MOUNTS"); adds != "" {
 			var additionalMounts []string
 			err = json.Unmarshal([]byte(adds), &additionalMounts)
@@ -302,6 +312,15 @@ var ring1Cmd = &cobra.Command{
 				mnte{Target: "/workspace", Flags: unix.MS_BIND | unix.MS_REC},
 			)
 		}
+
+		f, err := ioutil.TempDir("", "wskit-slirp4netns")
+		if err != nil {
+			log.WithError(err).Error("cannot create slirp4netns socket tempdir")
+			return
+		}
+
+		slirp4netnsSocket = filepath.Join(f, "slirp4netns.sock")
+		mnts = append(mnts, mnte{Target: "/.supervisor/slirp4netns.sock", Source: f, Flags: unix.MS_BIND | unix.MS_REC})
 
 		for _, m := range mnts {
 			dst := filepath.Join(ring2Root, m.Target)
@@ -322,9 +341,24 @@ var ring1Cmd = &cobra.Command{
 			}).Debug("mounting new rootfs")
 			err = unix.Mount(m.Source, dst, m.FSType, m.Flags, "")
 			if err != nil {
-				log.WithError(err).WithField("dest", dst).Error("cannot establish mount")
+				log.WithError(err).WithField("dest", dst).WithField("fsType", m.FSType).Error("cannot establish mount")
 				return
 			}
+		}
+
+		// We deliberately do not bind mount `/etc/resolv.conf` and `/etc/hosts`, but instead place a copy
+		// so that users in the workspace can modify the file.
+		copyPaths := []string{"/etc/resolv.conf", "/etc/hosts"}
+		for _, fn := range copyPaths {
+			err = copyRing2Root(ring2Root, fn)
+			if err != nil {
+				log.WithError(err).Warn("cannot copy " + fn)
+			}
+		}
+
+		err = makeHostnameLocal(ring2Root)
+		if err != nil {
+			log.WithError(err).Warn("cannot make /etc/hosts hostname local")
 		}
 
 		env := make([]string, 0, len(os.Environ()))
@@ -335,6 +369,8 @@ var ring1Cmd = &cobra.Command{
 			env = append(env, e)
 		}
 
+		env = append(env, "WORKSPACEKIT_WRAP_NETNS=true")
+
 		socketFN := filepath.Join(os.TempDir(), fmt.Sprintf("workspacekit-ring1-%d.unix", time.Now().UnixNano()))
 		skt, err := net.Listen("unix", socketFN)
 		if err != nil {
@@ -343,10 +379,14 @@ var ring1Cmd = &cobra.Command{
 		}
 		defer skt.Close()
 
+		var (
+			cloneFlags uintptr = syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET
+		)
+
 		cmd := exec.Command("/proc/self/exe", "ring2", socketFN)
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Pdeathsig:  syscall.SIGKILL,
-			Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
+			Cloneflags: cloneFlags,
 		}
 		cmd.Dir = ring2Root
 		cmd.Stdin = os.Stdin
@@ -363,7 +403,7 @@ var ring1Cmd = &cobra.Command{
 		procLoc := filepath.Join(ring2Root, "proc")
 		err = os.MkdirAll(procLoc, 0755)
 		if err != nil {
-			log.WithError(err).Error("cannot mount proc")
+			log.WithError(err).Error("cannot create directory for mounting proc")
 			return
 		}
 
@@ -376,12 +416,18 @@ var ring1Cmd = &cobra.Command{
 			Target: procLoc,
 			Pid:    int64(cmd.Process.Pid),
 		})
-		client.Close()
-
 		if err != nil {
+			client.Close()
 			log.WithError(err).Error("cannot mount proc")
 			return
 		}
+		_, err = client.EvacuateCGroup(ctx, &daemonapi.EvacuateCGroupRequest{})
+		if err != nil {
+			client.Close()
+			log.WithError(err).Error("cannot evacuate cgroup")
+			return
+		}
+		client.Close()
 
 		// We have to wait for ring2 to come back to us and connect to the socket we've passed along.
 		// There's a chance that ring2 crashes or misbehaves, so we don't want to wait forever, hence
@@ -428,6 +474,26 @@ var ring1Cmd = &cobra.Command{
 			log.WithError(err).Error("ring2 did not connect successfully")
 			return
 		}
+
+		slirpCmd := exec.Command(filepath.Join(filepath.Dir(ring2Opts.SupervisorPath), "slirp4netns"),
+			"--configure",
+			"--mtu=65520",
+			"--disable-host-loopback",
+			"--api-socket", slirp4netnsSocket,
+			strconv.Itoa(cmd.Process.Pid),
+			"tap0",
+		)
+		slirpCmd.SysProcAttr = &syscall.SysProcAttr{
+			Pdeathsig: syscall.SIGKILL,
+		}
+
+		err = slirpCmd.Start()
+		if err != nil {
+			log.WithError(err).Error("cannot start slirp4netns")
+			return
+		}
+		//nolint:errcheck
+		defer slirpCmd.Process.Kill()
 
 		log.Info("signaling to child process")
 		_, err = msgutil.MarshalToWriter(ring2Conn, ringSyncMsg{
@@ -479,6 +545,18 @@ var ring1Cmd = &cobra.Command{
 			}()
 		}
 
+		if enclave := os.Getenv("WORKSPACEKIT_RING2_ENCLAVE"); enclave != "" {
+			ecmd := exec.Command("/proc/self/exe", append([]string{"nsenter", "--target", strconv.Itoa(cmd.Process.Pid), "--mount", "--net"}, strings.Fields(enclave)...)...)
+			ecmd.Stdout = os.Stdout
+			ecmd.Stderr = os.Stderr
+
+			err := ecmd.Start()
+			if err != nil {
+				log.WithError(err).WithField("cmd", enclave).Error("cannot run enclave")
+				return
+			}
+		}
+
 		go func() {
 			err := lift.ServeLift(ctx, lift.DefaultSocketPath)
 			if err != nil {
@@ -503,9 +581,11 @@ var (
 		"/workspace",
 		"/sys",
 		"/dev",
-		"/etc/hosts",
 		"/etc/hostname",
-		"/etc/resolv.conf",
+	}
+	rejectMountPaths = map[string]struct{}{
+		"/etc/resolv.conf": {},
+		"/etc/hosts":       {},
 	}
 )
 
@@ -546,10 +626,15 @@ func findBindMountCandidates(procMounts io.Reader, readlink func(path string) (d
 			reject bool
 		)
 		switch fs {
-		case "cgroup", "devpts", "mqueue", "shm", "proc", "sysfs":
+		case "cgroup", "devpts", "mqueue", "shm", "proc", "sysfs", "cgroup2":
 			reject = true
 		}
 		if reject {
+			continue
+		}
+
+		// reject known paths
+		if _, ok := rejectMountPaths[path]; ok {
 			continue
 		}
 
@@ -567,29 +652,84 @@ func findBindMountCandidates(procMounts io.Reader, readlink func(path string) (d
 	return mounts, scanner.Err()
 }
 
+// copyRing2Root copies <fn> to <ring2root>/<fn>
+func copyRing2Root(ring2root string, fn string) error {
+	stat, err := os.Stat(fn)
+	if err != nil {
+		return err
+	}
+
+	org, err := os.Open(fn)
+	if err != nil {
+		return err
+	}
+	defer org.Close()
+
+	dst, err := os.OpenFile(filepath.Join(ring2root, fn), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, stat.Mode())
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, org)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func makeHostnameLocal(ring2root string) error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(ring2root, "/etc/hosts")
+	stat, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	bStr := string(b)
+	lines := strings.Split(bStr, "\n")
+	for i, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		if fields[1] == hostname {
+			lines[i] = "127.0.0.1 " + hostname
+		}
+	}
+	return ioutil.WriteFile(path, []byte(strings.Join(lines, "\n")), stat.Mode())
+}
+
 func receiveSeccmpFd(conn *net.UnixConn) (libseccomp.ScmpFd, error) {
 	buf := make([]byte, unix.CmsgSpace(4))
 
 	err := conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot setdeadline: %v", err)
 	}
 
 	f, err := conn.File()
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot open socket: %v", err)
 	}
 	defer f.Close()
 	connfd := int(f.Fd())
 
 	_, _, _, _, err = unix.Recvmsg(connfd, nil, buf, 0)
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot recvmsg from fd '%d': %v", connfd, err)
 	}
 
 	msgs, err := unix.ParseSocketControlMessage(buf)
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot parse socket control message: %v", err)
 	}
 	if len(msgs) != 1 {
 		return 0, xerrors.Errorf("expected a single socket control message")
@@ -597,7 +737,7 @@ func receiveSeccmpFd(conn *net.UnixConn) (libseccomp.ScmpFd, error) {
 
 	fds, err := unix.ParseUnixRights(&msgs[0])
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot parse unix rights: %v", err)
 	}
 	if len(fds) == 0 {
 		return 0, xerrors.Errorf("expected a single socket FD")
@@ -674,7 +814,7 @@ var ring2Cmd = &cobra.Command{
 			return
 		}
 
-		err = unix.Exec(ring2Opts.SupervisorPath, []string{"supervisor", "run"}, os.Environ())
+		err = unix.Exec(ring2Opts.SupervisorPath, []string{"supervisor", "init"}, os.Environ())
 		if err != nil {
 			if eerr, ok := err.(*exec.ExitError); ok {
 				exitCode = eerr.ExitCode()
@@ -696,20 +836,6 @@ func pivotRoot(rootfs string, fsshift api.FSShiftMethod) error {
 	// /proc/self/cwd being the old root. Since we can play around with the cwd
 	// with pivot_root this allows us to pivot without creating directories in
 	// the rootfs. Shout-outs to the LXC developers for giving us this idea.
-
-	if fsshift == api.FSShiftMethod_FUSE {
-		err := unix.Chroot(rootfs)
-		if err != nil {
-			return xerrors.Errorf("cannot chroot: %v", err)
-		}
-
-		err = unix.Chdir("/")
-		if err != nil {
-			return xerrors.Errorf("cannot chdir to new root :%v", err)
-		}
-
-		return nil
-	}
 
 	oldroot, err := unix.Open("/", unix.O_DIRECTORY|unix.O_RDONLY, 0)
 	if err != nil {

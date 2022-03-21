@@ -22,12 +22,11 @@ import (
 	grpc_status "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/gitpod-io/gitpod/common-go/kubernetes"
 	wsk8s "github.com/gitpod-io/gitpod/common-go/kubernetes"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
@@ -287,6 +286,22 @@ func actOnPodEvent(ctx context.Context, m actingManager, status *api.WorkspaceSt
 		}
 
 		return nil
+	} else if status.Conditions.StoppedByRequest == api.WorkspaceConditionBool_TRUE {
+		gracePeriod := stopWorkspaceNormallyGracePeriod
+		if gp, ok := pod.Annotations[stoppedByRequestAnnotation]; ok {
+			dt, err := time.ParseDuration(gp)
+			if err == nil {
+				gracePeriod = dt
+			} else {
+				log.WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).WithError(err).Warn("invalid duration on stoppedByRequestAnnotation")
+			}
+		}
+
+		// we're asked to stop the workspace but aren't doing so yet
+		err := m.stopWorkspace(ctx, workspaceID, gracePeriod)
+		if err != nil && !isKubernetesObjNotFoundError(err) {
+			return xerrors.Errorf("cannot stop workspace: %w", err)
+		}
 	}
 
 	if status.Phase == api.WorkspacePhase_CREATING {
@@ -404,11 +419,6 @@ func (m *Monitor) doHousekeeping(ctx context.Context) {
 	if err != nil {
 		m.OnError(err)
 	}
-
-	err = m.deleteDanglingServices(ctx)
-	if err != nil {
-		m.OnError(err)
-	}
 }
 
 // writeEventTraceLog writes an event trace log if one is configured. This function is written in
@@ -434,6 +444,11 @@ func (m *Monitor) writeEventTraceLog(status *api.WorkspaceStatus, wso *workspace
 		}
 		for _, c := range twso.Pod.Spec.Containers {
 			for i, env := range c.Env {
+				isPersonalIdentifiableVar := strings.HasPrefix(env.Name, "GITPOD_GIT")
+				if isPersonalIdentifiableVar {
+					c.Env[i].Value = "[redacted]"
+					continue
+				}
 				isGitpodVar := strings.HasPrefix(env.Name, "GITPOD_") || strings.HasPrefix(env.Name, "SUPERVISOR_") || strings.HasPrefix(env.Name, "BOB_") || strings.HasPrefix(env.Name, "THEIA_")
 				if isGitpodVar {
 					continue
@@ -585,9 +600,9 @@ func (m *Monitor) probeWorkspaceReady(ctx context.Context, pod *corev1.Pod) (res
 	if !ok {
 		return nil, xerrors.Errorf("pod %s has no %s annotation", pod.Name, workspaceIDAnnotation)
 	}
-	wsurl, ok := pod.Annotations[workspaceURLAnnotation]
+	wsurl, ok := pod.Annotations[kubernetes.WorkspaceURLAnnotation]
 	if !ok {
-		return nil, xerrors.Errorf("pod %s has no %s annotation", pod.Name, workspaceURLAnnotation)
+		return nil, xerrors.Errorf("pod %s has no %s annotation", pod.Name, kubernetes.WorkspaceURLAnnotation)
 	}
 	workspaceURL, err := url.Parse(wsurl)
 	if err != nil {
@@ -609,7 +624,7 @@ func (m *Monitor) probeWorkspaceReady(ctx context.Context, pod *corev1.Pod) (res
 		return nil, nil
 	}
 
-	ctx, cancelProbe := context.WithCancel(ctx)
+	ctx, cancelProbe := context.WithTimeout(ctx, 30*time.Minute)
 	m.probeMap[pod.Name] = cancelProbe
 	m.probeMapLock.Unlock()
 
@@ -633,6 +648,8 @@ func (m *Monitor) probeWorkspaceReady(ctx context.Context, pod *corev1.Pod) (res
 	m.probeMapLock.Lock()
 	delete(m.probeMap, pod.Name)
 	m.probeMapLock.Unlock()
+
+	cancelProbe()
 
 	return &probeResult, nil
 }
@@ -778,7 +795,7 @@ func shouldDisableRemoteStorage(pod *corev1.Pod) bool {
 		tpe = api.WorkspaceType_REGULAR
 	}
 	switch tpe {
-	case api.WorkspaceType_GHOST, api.WorkspaceType_IMAGEBUILD:
+	case api.WorkspaceType_IMAGEBUILD:
 		return true
 	default:
 		return false
@@ -823,7 +840,7 @@ func (m *Monitor) finalizeWorkspaceContent(ctx context.Context, wso *workspaceOb
 	}
 
 	doBackup := wso.WasEverReady() && !wso.IsWorkspaceHeadless()
-	doBackupLogs := !wsk8s.IsGhostWorkspace(wso.Pod)
+	doBackupLogs := tpe == api.WorkspaceType_PREBUILD
 	doSnapshot := tpe == api.WorkspaceType_PREBUILD
 	doFinalize := func() (worked bool, gitStatus *csapi.GitStatus, err error) {
 		m.finalizerMapLock.Lock()
@@ -959,64 +976,7 @@ func (m *Monitor) finalizeWorkspaceContent(ctx context.Context, wso *workspaceOb
 	}
 }
 
-// deleteDanglingServices removes services for which there is no corresponding workspace pod anymore
-func (m *Monitor) deleteDanglingServices(ctx context.Context) error {
-	var services corev1.ServiceList
-	err := m.manager.Clientset.List(ctx, &services, workspaceObjectListOptions(m.manager.Config.Namespace))
-	if err != nil {
-		return xerrors.Errorf("deleteDanglingServices: %w", err)
-	}
-
-	var zero int64 = 0
-	propagationPolicy := metav1.DeletePropagationForeground
-
-	for _, service := range services.Items {
-		var endpoints corev1.Endpoints
-		err := m.manager.Clientset.Get(ctx, types.NamespacedName{Namespace: service.Namespace, Name: service.Name}, &endpoints)
-		if err != nil {
-			return xerrors.Errorf("deleteDanglingServices: %w", err)
-		}
-
-		hasReadyEndpoint := false
-		for _, s := range endpoints.Subsets {
-			hasReadyEndpoint = len(s.Addresses) > 0
-		}
-		if hasReadyEndpoint {
-			continue
-		}
-
-		workspaceID, ok := endpoints.Labels[wsk8s.WorkspaceIDLabel]
-		if !ok {
-			m.OnError(xerrors.Errorf("service endpoint %s does not have %s label", service.Name, wsk8s.WorkspaceIDLabel))
-			continue
-		}
-
-		_, err = m.manager.findWorkspacePod(ctx, workspaceID)
-		if !isKubernetesObjNotFoundError(err) {
-			continue
-		}
-
-		if m.manager.Config.DryRun {
-			log.WithFields(log.OWI("", "", workspaceID)).WithField("name", service.Name).Info("should have deleted dangling service but this is a dry run")
-			continue
-		}
-
-		// this relies on the Kubernetes convention that endpoints have the same name as their services
-		err = m.manager.Clientset.Delete(ctx, &service, &client.DeleteOptions{
-			GracePeriodSeconds: &zero,
-			PropagationPolicy:  &propagationPolicy,
-		})
-		if err != nil && !isKubernetesObjNotFoundError(err) {
-			m.OnError(xerrors.Errorf("deleteDanglingServices: %w", err))
-			continue
-		}
-		log.WithFields(log.OWI("", "", workspaceID)).WithField("name", service.Name).Info("deleted dangling service")
-	}
-
-	return nil
-}
-
-// markTimedoutWorkspaces finds workspaces which haven't been active recently and marks them as timed out
+// markTimedoutWorkspaces finds workspaces which can be timeout due to inactivity or max lifetime allowed
 func (m *Monitor) markTimedoutWorkspaces(ctx context.Context) (err error) {
 	span, ctx := tracing.FromContext(ctx, "markTimedoutWorkspaces")
 	defer tracing.FinishSpan(span, &err)

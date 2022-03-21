@@ -10,9 +10,11 @@ import { AuthProviderParams } from "./auth-provider";
 import { Config } from "../config";
 import { AuthProviderService } from "./auth-provider-service";
 import { HostContextProvider, HostContextProviderFactory } from "./host-context-provider";
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { HostContainerMapping } from "./host-container-mapping";
 import { RepositoryService } from "../repohost/repo-service";
+import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
+import { repeat } from "@gitpod/gitpod-protocol/lib/util/repeat";
 
 @injectable()
 export class HostContextProviderImpl implements HostContextProvider {
@@ -40,21 +42,22 @@ export class HostContextProviderImpl implements HostContextProvider {
         this.createFixedHosts();
 
         try {
-            await this.updateDynamicHosts();
+            await this.updateDynamicHosts({});
         } catch (error) {
             log.error(`Failed to update dynamic hosts.`, error);
         }
 
         // schedule periodic update of dynamic hosts
-        const scheduler = () => setTimeout(async () => {
+        repeat(async () => {
+            const span = TraceContext.startSpan("updateDynamicHosts");
             try {
-                await this.updateDynamicHosts();
+                await this.updateDynamicHosts({ span });
             } catch (error) {
                 log.error(`Failed to update dynamic hosts.`, error);
+            } finally {
+                span.finish();
             }
-            scheduler();
         }, 1999);
-        scheduler();
         this.initialized = true;
     }
 
@@ -68,11 +71,14 @@ export class HostContextProviderImpl implements HostContextProvider {
         }
     }
 
-    protected async updateDynamicHosts() {
-        const all = await this.authProviderService.getAllAuthProviders();
+    protected async updateDynamicHosts(ctx: TraceContext) {
+        const knownOAuthRevisions = Array.from(this.dynamicHosts.entries())
+            .map(([_, hostContext]) => hostContext.authProvider.params.oauthRevision)
+            .filter((rev) => !!rev) as string[];
+        const newAndUpdatedAuthProviders = await this.authProviderService.getAllAuthProviders(knownOAuthRevisions);
+        ctx.span?.setTag("updateDynamicHosts.newAndUpdatedAuthProviders", newAndUpdatedAuthProviders.length);
 
-        const currentHosts = new Set(all.map(p => p.host.toLowerCase()));
-        for (const config of all) {
+        for (const config of newAndUpdatedAuthProviders) {
             const { host } = config;
 
             const existingContext = this.dynamicHosts.get(host);
@@ -82,15 +88,18 @@ export class HostContextProviderImpl implements HostContextProvider {
                     log.warn("Ignoring host update for dynamic Auth Provider: " + host, { config, existingConfig });
                     continue;
                 }
-                if (JSON.stringify(existingConfig.oauth) === JSON.stringify(config.oauth)
-                    && existingConfig.status === config.status) {
-                    continue;
+                if (existingConfig.status === config.status) {
+                    if (!!config.oauthRevision && existingConfig.oauthRevision === config.oauthRevision) {
+                        continue;
+                    }
+                    if (JSON.stringify(existingConfig.oauth) === JSON.stringify(config.oauth)) {
+                        continue;
+                    }
                 }
                 log.debug("Updating existing dynamic Auth Provider: " + host, { config, existingConfig });
             } else {
                 log.debug("Creating new dynamic Auth Provider: " + host, { config });
             }
-
 
             const container = this.factory.createHostContext(config);
             if (container) {
@@ -101,7 +110,9 @@ export class HostContextProviderImpl implements HostContextProvider {
         }
 
         // remove obsolete entries
-        const tobeRemoved = [...this.dynamicHosts.keys()].filter(h => !currentHosts.has(h));
+        const currentHosts = new Set(await this.authProviderService.getAllAuthProviderHosts());
+        ctx.span?.setTag("updateDynamicHosts.currentHostProviders", currentHosts.size);
+        const tobeRemoved = [...this.dynamicHosts.keys()].filter((h) => !currentHosts.has(h));
         for (const host of tobeRemoved) {
             const hostContext = this.dynamicHosts.get(host);
             log.debug("Disposing dynamic Auth Provider: " + host, { host, hostContext });
@@ -111,14 +122,18 @@ export class HostContextProviderImpl implements HostContextProvider {
     }
 
     getAll(): HostContext[] {
-        this.ensureInitialized();
+        this.ensureInitialized().catch((err) => {
+            /** ignore */
+        });
         const fixed = Array.from(this.fixedHosts.values());
         const dynamic = Array.from(this.dynamicHosts.values());
         return [...fixed, ...dynamic];
     }
 
     get(hostname: string): HostContext | undefined {
-        this.ensureInitialized();
+        this.ensureInitialized().catch((err) => {
+            /** ignore */
+        });
         hostname = hostname.toLowerCase();
         const hostContext = this.fixedHosts.get(hostname) || this.dynamicHosts.get(hostname);
         if (!hostContext) {
@@ -127,7 +142,14 @@ export class HostContextProviderImpl implements HostContextProvider {
         return hostContext;
     }
 
-    static createHostContext(parentContainer: interfaces.Container, authProviderConfig: AuthProviderParams): HostContext | undefined {
+    findByAuthProviderId(authProviderId: string): HostContext | undefined {
+        return this.getAll().find((h) => h.authProvider.authProviderId === authProviderId);
+    }
+
+    static createHostContext(
+        parentContainer: interfaces.Container,
+        authProviderConfig: AuthProviderParams,
+    ): HostContext | undefined {
         const container = parentContainer.createChild();
         container.bind(AuthProviderParams).toConstantValue(authProviderConfig);
         container.bind(HostContext).toSelf().inSingletonScope();
@@ -139,7 +161,7 @@ export class HostContextProviderImpl implements HostContextProvider {
             return undefined;
         }
 
-        containerModules.forEach(m => container.load(m));
+        containerModules.forEach((m) => container.load(m));
         return container.get<HostContext>(HostContext);
     }
 }

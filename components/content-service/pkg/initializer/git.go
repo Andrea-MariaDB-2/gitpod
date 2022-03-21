@@ -17,6 +17,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
+	"github.com/gitpod-io/gitpod/common-go/process"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	"github.com/gitpod-io/gitpod/content-service/pkg/archive"
@@ -103,7 +104,7 @@ func (ws *GitInitializer) Run(ctx context.Context, mappings []archive.IDMapping)
 		args := []string{"-R", "-L", "gitpod", ws.Location}
 		cmd := exec.Command("chown", args...)
 		res, cerr := cmd.CombinedOutput()
-		if cerr != nil && !(cerr.Error() == "wait: no child processes" || cerr.Error() == "waitid: no child processes") {
+		if cerr != nil && !process.IsNotChildProcess(cerr) {
 			err = git.OpFailedError{
 				Args:       args,
 				ExecErr:    cerr,
@@ -140,7 +141,8 @@ func (ws *GitInitializer) realizeCloneTarget(ctx context.Context) (err error) {
 	if ws.TargetMode == RemoteBranch {
 		// create local branch based on specific remote branch
 		if err := ws.Git(ctx, "checkout", "-B", ws.CloneTarget, "origin/"+ws.CloneTarget); err != nil {
-			return err
+			log.WithField("remoteURI", ws.RemoteURI).WithField("branch", ws.CloneTarget).Debug("Remote branch doesn't exist.")
+			return nil
 		}
 	} else if ws.TargetMode == LocalBranch {
 		// checkout local branch based on remote HEAD
@@ -148,6 +150,13 @@ func (ws *GitInitializer) realizeCloneTarget(ctx context.Context) (err error) {
 			return err
 		}
 	} else if ws.TargetMode == RemoteCommit {
+		// We did a shallow clone before, hence need to fetch the commit we are about to check out.
+		// Because we don't want to make the "git fetch" mechanism in supervisor more complicated,
+		// we'll just fetch the 20 commits right away.
+		if err := ws.Git(ctx, "fetch", "origin", ws.CloneTarget, "--depth=20"); err != nil {
+			return err
+		}
+
 		// checkout specific commit
 		if err := ws.Git(ctx, "checkout", ws.CloneTarget); err != nil {
 			return err

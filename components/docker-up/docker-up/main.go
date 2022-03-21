@@ -9,9 +9,11 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rootless-containers/rootlesskit/pkg/msgutil"
 	"github.com/rootless-containers/rootlesskit/pkg/sigproxy"
 	sigproxysignal "github.com/rootless-containers/rootlesskit/pkg/sigproxy/signal"
 	"github.com/sirupsen/logrus"
@@ -34,21 +35,28 @@ import (
 
 var log *logrus.Entry
 
+const DaemonArgs = "DOCKERD_ARGS"
+
 var opts struct {
 	RuncFacade           bool
 	BinDir               string
 	AutoInstall          bool
 	UserAccessibleSocket bool
 	Verbose              bool
+	DontWrapNetNS        bool
 }
 
 //go:embed docker.tgz
 //go:embed docker-compose
-//go:embed slirp4netns
+//go:embed runc
 var binaries embed.FS
+
+// ensure apt update is run only once
+var aptUpdated = false
 
 const (
 	dockerSocketFN = "/var/run/docker.sock"
+	gitpodUserId   = 33333
 )
 
 func main() {
@@ -59,9 +67,10 @@ func main() {
 
 	pflag.BoolVarP(&opts.Verbose, "verbose", "v", false, "enables verbose logging")
 	pflag.BoolVar(&opts.RuncFacade, "runc-facade", true, "enables the runc-facade to handle rootless idiosyncrasies")
-	pflag.StringVar(&opts.BinDir, "bin-dir", filepath.Dir(self), "directory where runc-facade and slirp-docker-proxy are found")
+	pflag.StringVar(&opts.BinDir, "bin-dir", filepath.Dir(self), "directory where runc-facade is found")
 	pflag.BoolVar(&opts.AutoInstall, "auto-install", true, "auto-install prerequisites (docker, slirp4netns)")
 	pflag.BoolVar(&opts.UserAccessibleSocket, "user-accessible-socket", true, "chmod the Docker socket to make it user accessible")
+	pflag.BoolVar(&opts.DontWrapNetNS, "dont-wrap-netns", os.Getenv("WORKSPACEKIT_WRAP_NETNS") == "true", "wrap the Docker daemon in a network namespace")
 	pflag.Parse()
 
 	logger := logrus.New()
@@ -69,25 +78,19 @@ func main() {
 		logger.SetLevel(logrus.DebugLevel)
 	}
 
-	var cmd string
-	if args := pflag.Args(); len(args) > 0 {
-		cmd = args[0]
-	}
+	log = logrus.NewEntry(logger)
 
 	listenFD := os.Getenv("LISTEN_FDS") != ""
 	if _, err := os.Stat(dockerSocketFN); !listenFD && (err == nil || !os.IsNotExist(err)) {
 		logger.Fatalf("Docker socket already exists at %s.\nIn a Gitpod workspace Docker will start automatically when used.\nIf all else fails, please remove %s and try again.", dockerSocketFN, dockerSocketFN)
 	}
 
-	switch cmd {
-	case "child":
-		log = logger.WithField("service", "runWithinNetns")
-		err = runWithinNetns()
-	default:
-		log = logger.WithField("service", "runOutsideNetns")
-		err = runOutsideNetns()
+	err = ensurePrerequisites()
+	if err != nil {
+		log.WithError(err).Fatal("failed")
 	}
 
+	err = runWithinNetns()
 	if err != nil {
 		log.WithError(err).Fatal("failed")
 	}
@@ -96,26 +99,10 @@ func main() {
 func runWithinNetns() (err error) {
 	listenFDs, _ := strconv.Atoi(os.Getenv("LISTEN_FDS"))
 
-	// magic file descriptor 3+listenFDs was passed in from the parent using ExtraFiles
-	fd := os.NewFile(uintptr(3+listenFDs), "")
-	defer fd.Close()
-
-	log.Debug("waiting for parent")
-	var msg message
-	_, err = msgutil.UnmarshalFromReader(fd, &msg)
-	if err != nil {
-		return err
-	}
-	if msg.Stage != 1 {
-		return xerrors.Errorf("expected stage 1 message, got %+q", msg)
-	}
-	log.Debug("parent is ready")
-
 	args := []string{
 		"--experimental",
 		"--rootless",
 		"--data-root=/workspace/.docker-root",
-		"--userland-proxy", "--userland-proxy-path=" + filepath.Join(opts.BinDir, "slirp-docker-proxy"),
 	}
 	if opts.Verbose {
 		args = append(args,
@@ -128,6 +115,12 @@ func runWithinNetns() (err error) {
 			"--default-runtime", "gitpod",
 		)
 	}
+
+	userArgs, err := userArgs()
+	if err != nil {
+		return xerrors.Errorf("cannot add user supplied docker args: %w", err)
+	}
+	args = append(args, userArgs...)
 
 	if listenFDs > 0 {
 		os.Setenv("LISTEN_PID", strconv.Itoa(os.Getpid()))
@@ -184,98 +177,109 @@ func runWithinNetns() (err error) {
 	return nil
 }
 
-func runOutsideNetns() error {
-	err := ensurePrerequisites()
-	if err != nil {
-		return err
+type ConvertUserArg func(arg, value string) ([]string, error)
+
+var allowedDockerArgs = map[string]ConvertUserArg{
+	"remap-user": convertRemapUser,
+}
+
+func userArgs() ([]string, error) {
+	userArgs, exists := os.LookupEnv(DaemonArgs)
+	args := []string{}
+	if !exists {
+		return args, nil
 	}
 
-	pipeR, pipeW, err := os.Pipe()
-	if err != nil {
-		return err
+	var providedDockerArgs map[string]string
+	if err := json.Unmarshal([]byte(userArgs), &providedDockerArgs); err != nil {
+		return nil, xerrors.Errorf("unable to deserialize docker args: %w", err)
 	}
-	defer pipeW.Close()
 
-	slirpAPI, err := os.CreateTemp("", "slirp4netns-api")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(slirpAPI.Name())
-
-	cmd := exec.Command("/proc/self/exe", append(os.Args[1:], "child")...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig:    syscall.SIGKILL,
-		Unshareflags: syscall.CLONE_NEWNET,
-	}
-	if fds, err := strconv.Atoi(os.Getenv("LISTEN_FDS")); err == nil {
-		for i := 0; i < fds; i++ {
-			fmt.Printf("passing fd %d\n", i)
-			cmd.ExtraFiles = append(cmd.ExtraFiles, os.NewFile(uintptr(3+i), ""))
+	for userArg, userValue := range providedDockerArgs {
+		converter, exists := allowedDockerArgs[userArg]
+		if !exists {
+			continue
 		}
+
+		if converter != nil {
+			cargs, err := converter(userArg, userValue)
+			if err != nil {
+				return nil, xerrors.Errorf("could not convert %v - %v: %w", userArg, userValue, err)
+			}
+			args = append(args, cargs...)
+
+		} else {
+			args = append(args, "--"+userArg, userValue)
+		}
+	}
+
+	return args, nil
+}
+
+func convertRemapUser(arg, value string) ([]string, error) {
+	id, err := strconv.Atoi(value)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, f := range []string{"/etc/subuid", "/etc/subgid"} {
+		err := adaptSubid(f, id)
+		if err != nil {
+			return nil, xerrors.Errorf("could not adapt subid files: %w", err)
+		}
+	}
+
+	return []string{"--userns-remap", "gitpod"}, nil
+}
+
+func adaptSubid(oldfile string, id int) error {
+	uid, err := os.Open(oldfile)
+	if err != nil {
+		return err
+	}
+
+	newfile, err := os.Create(oldfile + ".new")
+	if err != nil {
+		return err
+	}
+
+	mappingFmt := func(username string, id int, size int) string { return fmt.Sprintf("%s:%d:%d\n", username, id, size) }
+
+	if id != 0 {
+		newfile.WriteString(mappingFmt("gitpod", 1, id))
+		newfile.WriteString(mappingFmt("gitpod", gitpodUserId, 1))
 	} else {
-		log.WithError(err).WithField("LISTEN_FDS", os.Getenv("listen_fds")).Warn("no LISTEN_FDS")
+		newfile.WriteString(mappingFmt("gitpod", gitpodUserId, 1))
+		newfile.WriteString(mappingFmt("gitpod", 1, gitpodUserId-1))
+		newfile.WriteString(mappingFmt("gitpod", gitpodUserId+1, 32200)) // map rest of user ids in the user namespace
 	}
-	cmd.ExtraFiles = append(cmd.ExtraFiles, pipeR)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"DOCKERUP_SLIRP4NETNS_SOCKET="+slirpAPI.Name(),
-	)
 
-	err = cmd.Start()
-	if err != nil {
-		return err
+	uidScanner := bufio.NewScanner(uid)
+	for uidScanner.Scan() {
+		l := uidScanner.Text()
+		if !strings.HasPrefix(l, "gitpod") {
+			newfile.WriteString(l + "\n")
+		}
 	}
-	sigc := sigproxy.ForwardAllSignals(context.Background(), cmd.Process.Pid)
-	defer sigproxysignal.StopCatch(sigc)
 
-	slirpCmd := exec.Command("slirp4netns",
-		"--configure",
-		"--mtu=65520",
-		"--disable-host-loopback",
-		"--api-socket", slirpAPI.Name(),
-		strconv.Itoa(cmd.Process.Pid),
-		"tap0",
-	)
-	slirpCmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-	}
-	slirpCmd.Stdin = os.Stdin
-	slirpCmd.Stdout = os.Stdout
-	slirpCmd.Stderr = os.Stderr
-
-	err = slirpCmd.Start()
-	if err != nil {
-		return err
-	}
-	//nolint:errcheck
-	defer slirpCmd.Process.Kill()
-
-	_, err = msgutil.MarshalToWriter(pipeW, message{Stage: 1})
-	if err != nil {
-		return err
-	}
-	log.Debug("signalled child (stage 1)")
-
-	err = cmd.Wait()
-	if err != nil {
+	if err = os.Rename(newfile.Name(), oldfile); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func ensurePrerequisites() error {
-	commands := map[string]func() error{
-		"dockerd":        installDocker,
-		"docker-compose": installDockerCompose,
-		"iptables":       installIptables,
-		"slirp4netns":    installSlirp4netns,
-	}
+var prerequisites = map[string]func() error{
+	"dockerd":        installDocker,
+	"docker-compose": installDockerCompose,
+	"iptables":       installIptables,
+	"uidmap":         installUidMap,
+	"runcV1.1.0":     installRunc,
+}
 
+func ensurePrerequisites() error {
 	var pkgs []func() error
-	for cmd, pkg := range commands {
+	for cmd, pkg := range prerequisites {
 		if pth, _ := exec.LookPath(cmd); pth == "" {
 			log.WithField("command", cmd).Warn("missing prerequisite")
 			pkgs = append(pkgs, pkg)
@@ -298,10 +302,6 @@ func ensurePrerequisites() error {
 	}
 
 	return nil
-}
-
-type message struct {
-	Stage int `json:"stage"`
 }
 
 func installDocker() error {
@@ -363,20 +363,12 @@ func installDockerCompose() error {
 }
 
 func installIptables() error {
-	pth, _ := exec.LookPath("apt-get")
-	if pth != "" {
-		cmd := exec.Command("/bin/sh", "-c", "apt-get update && apt-get install -y iptables xz-utils")
-		cmd.Stdin = os.Stdin
-		cmd.Stderr = os.Stderr
-		cmd.Stdout = os.Stdout
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Pdeathsig: syscall.SIGKILL,
-		}
-
-		return cmd.Run()
+	err := installPackages("iptables", "xz-utils")
+	if err != nil {
+		return xerrors.Errorf("could not install iptables: %w", err)
 	}
 
-	pth, _ = exec.LookPath("apk")
+	pth, _ := exec.LookPath("apk")
 	if pth != "" {
 		cmd := exec.Command("/bin/sh", "-c", "apk add --no-cache iptables xz")
 		cmd.Stdin = os.Stdin
@@ -394,8 +386,132 @@ func installIptables() error {
 	return nil
 }
 
-func installSlirp4netns() error {
-	return installBinary("slirp4netns", "/usr/bin/slirp4netns")
+func installUidMap() error {
+	_, exists := os.LookupEnv(DaemonArgs)
+	if !exists {
+		return nil
+	}
+
+	needInstall := false
+	if _, err := exec.LookPath("newuidmap"); err != nil {
+		needInstall = true
+	}
+
+	if _, err := exec.LookPath("newgidmap"); err != nil {
+		needInstall = true
+	}
+
+	if !needInstall {
+		return nil
+	}
+
+	err := installPackages("uidmap")
+	if err != nil {
+		return xerrors.Errorf("could not install uidmap: %w", err)
+	}
+
+	return nil
+}
+
+func installRunc() error {
+	runc, _ := exec.LookPath("runc")
+	if runc != "" {
+		// if the required version or a more recent one is already
+		// installed do nothing
+		if !needInstallRunc() {
+			return nil
+		}
+	} else {
+		runc = "/bin/runc"
+	}
+
+	err := installBinary("runc", runc)
+	if err != nil {
+		return xerrors.Errorf("could not install runc: %w", err)
+	}
+
+	return nil
+}
+
+func needInstallRunc() bool {
+	cmd := exec.Command("runc", "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return true
+	}
+
+	major, minor, err := detectRuncVersion(string(output))
+	if err != nil {
+		return true
+	}
+
+	return major < 1 || major == 1 && minor < 1
+}
+
+func detectRuncVersion(output string) (major, minor int, err error) {
+	versionInfo := strings.Split(output, "\n")
+	for _, l := range versionInfo {
+		if !strings.HasPrefix(l, "runc version") {
+			continue
+		}
+
+		l = strings.TrimPrefix(l, "runc version")
+		l = strings.TrimSpace(l)
+
+		n := strings.Split(l, ".")
+		if len(n) < 2 {
+			return 0, 0, xerrors.Errorf("could not parse %s", l)
+		}
+
+		major, err = strconv.Atoi(n[0])
+		if err != nil {
+			return 0, 0, xerrors.Errorf("could not parse major %s: %w", n[0])
+		}
+
+		minor, err = strconv.Atoi(n[1])
+		if err != nil {
+			return 0, 0, xerrors.Errorf("could not parse minor %s: %w", n[1])
+		}
+
+		return major, minor, nil
+	}
+
+	return 0, 0, xerrors.Errorf("could not detect runc version")
+}
+
+func installPackages(packages ...string) error {
+	apt, _ := exec.LookPath("apt-get")
+	if apt != "" {
+		cmd := exec.Command("/bin/sh", "-c")
+
+		var installCommand string
+		if !aptUpdated {
+			installCommand = "apt-get update && "
+		}
+
+		installCommand = installCommand + "apt-get install -y"
+		for _, p := range packages {
+			installCommand = installCommand + " " + p
+		}
+
+		cmd.Args = append(cmd.Args, installCommand)
+		cmd.Stdin = os.Stdin
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Pdeathsig: syscall.SIGKILL,
+		}
+
+		err := cmd.Run()
+		if err != nil {
+			return err
+		}
+
+		aptUpdated = true
+		return nil
+	} else {
+		return xerrors.Errorf("apt-get is not available")
+	}
 }
 
 func installBinary(name, dst string) error {

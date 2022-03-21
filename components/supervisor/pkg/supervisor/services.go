@@ -5,15 +5,18 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,27 +27,35 @@ import (
 	"github.com/gitpod-io/gitpod/supervisor/pkg/ports"
 )
 
-// RegisterableService can register a service
+// RegisterableService can register a service.
 type RegisterableService interface{}
 
-// RegisterableGRPCService can register gRPC services
+// RegisterableGRPCService can register gRPC services.
 type RegisterableGRPCService interface {
 	// RegisterGRPC registers a gRPC service
 	RegisterGRPC(*grpc.Server)
 }
 
-// RegisterableRESTService can register REST services
+// RegisterableRESTService can register REST services.
 type RegisterableRESTService interface {
 	// RegisterREST registers a REST service
 	RegisterREST(mux *runtime.ServeMux, grpcEndpoint string) error
 }
 
+type DesktopIDEStatus struct {
+	Link     string `json:"link"`
+	Label    string `json:"label"`
+	ClientID string `json:"clientID,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+}
+
 type ideReadyState struct {
 	ready bool
+	info  *DesktopIDEStatus
 	cond  *sync.Cond
 }
 
-// Wait returns a channel that emits when IDE is ready
+// Wait returns a channel that emits when IDE is ready.
 func (service *ideReadyState) Wait() <-chan struct{} {
 	ready := make(chan struct{})
 	go func() {
@@ -58,30 +69,33 @@ func (service *ideReadyState) Wait() <-chan struct{} {
 	return ready
 }
 
-// Get checks whether IDE is ready
-func (service *ideReadyState) Get() bool {
+// Get checks whether IDE is ready.
+func (service *ideReadyState) Get() (bool, *DesktopIDEStatus) {
 	service.cond.L.Lock()
 	ready := service.ready
+	info := service.info
 	service.cond.L.Unlock()
-	return ready
+	return ready, info
 }
 
-// Set updates IDE ready state
-func (service *ideReadyState) Set(ready bool) {
+// Set updates IDE ready state.
+func (service *ideReadyState) Set(ready bool, info *DesktopIDEStatus) {
 	service.cond.L.Lock()
 	defer service.cond.L.Unlock()
 	if service.ready == ready {
 		return
 	}
 	service.ready = ready
+	service.info = info
 	service.cond.Broadcast()
 }
 
 type statusService struct {
-	ContentState ContentState
-	Ports        *ports.Manager
-	Tasks        *tasksManager
-	ideReady     *ideReadyState
+	ContentState    ContentState
+	Ports           *ports.Manager
+	Tasks           *tasksManager
+	ideReady        *ideReadyState
+	desktopIdeReady *ideReadyState
 
 	api.UnimplementedStatusServiceServer
 }
@@ -102,7 +116,9 @@ func (s *statusService) IDEStatus(ctx context.Context, req *api.IDEStatusRequest
 	if req.Wait {
 		select {
 		case <-s.ideReady.Wait():
-			return &api.IDEStatusResponse{Ok: true}, nil
+			{
+				// do nothing
+			}
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return nil, status.Error(codes.Canceled, "execution canceled")
@@ -110,13 +126,39 @@ func (s *statusService) IDEStatus(ctx context.Context, req *api.IDEStatusRequest
 
 			return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
 		}
+
+		if s.desktopIdeReady != nil {
+			select {
+			case <-s.desktopIdeReady.Wait():
+				{
+					// do nothing
+				}
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, status.Error(codes.Canceled, "execution canceled")
+				}
+
+				return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
+			}
+		}
 	}
 
-	ok := s.ideReady.Get()
-	return &api.IDEStatusResponse{Ok: ok}, nil
+	ok, _ := s.ideReady.Get()
+	desktopStatus := &api.IDEStatusResponse_DesktopStatus{}
+	if s.desktopIdeReady != nil {
+		okR, i := s.desktopIdeReady.Get()
+		if i != nil {
+			desktopStatus.Link = i.Link
+			desktopStatus.Label = i.Label
+			desktopStatus.ClientID = i.ClientID
+			desktopStatus.Kind = i.Kind
+		}
+		ok = ok && okR
+	}
+	return &api.IDEStatusResponse{Ok: ok, Desktop: desktopStatus}, nil
 }
 
-// ContentStatus provides feedback regarding the workspace content readiness
+// ContentStatus provides feedback regarding the workspace content readiness.
 func (s *statusService) ContentStatus(ctx context.Context, req *api.ContentStatusRequest) (*api.ContentStatusResponse, error) {
 	srcmap := map[csapi.WorkspaceInitSource]api.ContentSource{
 		csapi.WorkspaceInitFromOther:    api.ContentSource_from_other,
@@ -228,24 +270,24 @@ func (s *statusService) TasksStatus(req *api.TasksStatusRequest, srv api.StatusS
 	}
 }
 
-// RegistrableTokenService can register the token service
+// RegistrableTokenService can register the token service.
 type RegistrableTokenService struct {
 	Service api.TokenServiceServer
 
 	api.UnimplementedTokenServiceServer
 }
 
-// RegisterGRPC registers a gRPC service
+// RegisterGRPC registers a gRPC service.
 func (s RegistrableTokenService) RegisterGRPC(srv *grpc.Server) {
 	api.RegisterTokenServiceServer(srv, s.Service)
 }
 
-// RegisterREST registers a REST service
+// RegisterREST registers a REST service.
 func (s RegistrableTokenService) RegisterREST(mux *runtime.ServeMux, grpcEndpoint string) error {
 	return api.RegisterTokenServiceHandlerFromEndpoint(context.Background(), mux, grpcEndpoint, []grpc.DialOption{grpc.WithInsecure()})
 }
 
-// NewInMemoryTokenService produces a new InMemoryTokenService
+// NewInMemoryTokenService produces a new InMemoryTokenService.
 func NewInMemoryTokenService() *InMemoryTokenService {
 	return &InMemoryTokenService{
 		token:    make(map[string][]*Token),
@@ -253,7 +295,7 @@ func NewInMemoryTokenService() *InMemoryTokenService {
 	}
 }
 
-// Token can be used to access the host limited to the granted scopes
+// Token can be used to access the host limited to the granted scopes.
 type Token struct {
 	User       string
 	Token      string
@@ -263,7 +305,7 @@ type Token struct {
 	Reuse      api.TokenReuse
 }
 
-// Match checks whether token can be reused to access for the given args
+// Match checks whether token can be reused to access for the given args.
 func (tkn *Token) Match(host string, scopes []string) bool {
 	if tkn.Host != host {
 		return false
@@ -287,7 +329,7 @@ func (tkn *Token) Match(host string, scopes []string) bool {
 	return true
 }
 
-// HasScopes checks whether token can be used to access for the given scopes
+// HasScopes checks whether token can be used to access for the given scopes.
 func (tkn *Token) HasScopes(scopes []string) bool {
 	if len(scopes) == 0 {
 		return true
@@ -305,7 +347,7 @@ type tokenProvider interface {
 	GetToken(ctx context.Context, req *api.GetTokenRequest) (tkn *Token, err error)
 }
 
-// InMemoryTokenService provides an in-memory caching token service
+// InMemoryTokenService provides an in-memory caching token service.
 type InMemoryTokenService struct {
 	token    map[string][]*Token
 	provider map[string][]tokenProvider
@@ -314,7 +356,7 @@ type InMemoryTokenService struct {
 	api.UnimplementedTokenServiceServer
 }
 
-// GetToken returns a token for a host
+// GetToken returns a token for a host.
 func (s *InMemoryTokenService) GetToken(ctx context.Context, req *api.GetTokenRequest) (*api.GetTokenResponse, error) {
 	// filter empty scopes, when no scopes are requested, i.e. empty list [] we return an arbitrary/max scoped token, see Token.HasScopes
 	var scopes []string
@@ -423,7 +465,7 @@ func mapScopes(s []string) map[string]struct{} {
 	return scopes
 }
 
-// SetToken sets a token for a host
+// SetToken sets a token for a host.
 func (s *InMemoryTokenService) SetToken(ctx context.Context, req *api.SetTokenRequest) (*api.SetTokenResponse, error) {
 	tkn, err := convertReceivedToken(req)
 	if err != nil {
@@ -434,7 +476,7 @@ func (s *InMemoryTokenService) SetToken(ctx context.Context, req *api.SetTokenRe
 	return &api.SetTokenResponse{}, nil
 }
 
-// ClearToken clears previously cached tokens
+// ClearToken clears previously cached tokens.
 func (s *InMemoryTokenService) ClearToken(ctx context.Context, req *api.ClearTokenRequest) (*api.ClearTokenResponse, error) {
 	if req.GetAll() {
 		s.mu.Lock()
@@ -472,7 +514,7 @@ func (s *InMemoryTokenService) ClearToken(ctx context.Context, req *api.ClearTok
 	return nil, status.Error(codes.Unknown, "unknown operation")
 }
 
-// ProvideToken registers a token provider
+// ProvideToken registers a token provider.
 func (s *InMemoryTokenService) ProvideToken(srv api.TokenService_ProvideTokenServer) error {
 	req, err := srv.Recv()
 	if err != nil {
@@ -577,7 +619,7 @@ func (rt *remoteTokenProvider) GetToken(ctx context.Context, req *api.GetTokenRe
 	return
 }
 
-// InfoService implements the api.InfoService
+// InfoService implements the api.InfoService.
 type InfoService struct {
 	cfg          *Config
 	ContentState ContentState
@@ -585,17 +627,17 @@ type InfoService struct {
 	api.UnimplementedInfoServiceServer
 }
 
-// RegisterGRPC registers the gRPC info service
+// RegisterGRPC registers the gRPC info service.
 func (is *InfoService) RegisterGRPC(srv *grpc.Server) {
 	api.RegisterInfoServiceServer(srv, is)
 }
 
-// RegisterREST registers the REST info service
+// RegisterREST registers the REST info service.
 func (is *InfoService) RegisterREST(mux *runtime.ServeMux, grpcEndpoint string) error {
 	return api.RegisterInfoServiceHandlerFromEndpoint(context.Background(), mux, grpcEndpoint, []grpc.DialOption{grpc.WithInsecure()})
 }
 
-// WorkspaceInfo provides information about the workspace
+// WorkspaceInfo provides information about the workspace.
 func (is *InfoService) WorkspaceInfo(context.Context, *api.WorkspaceInfoRequest) (*api.WorkspaceInfoResponse, error) {
 	resp := &api.WorkspaceInfoResponse{
 		CheckoutLocation:     is.cfg.RepoRoot,
@@ -648,32 +690,96 @@ func (is *InfoService) WorkspaceInfo(context.Context, *api.WorkspaceInfoRequest)
 	return resp, nil
 }
 
-// ControlService implements the supervisor control service
+// ControlService implements the supervisor control service.
 type ControlService struct {
 	portsManager *ports.Manager
+
+	privateKey string
+	publicKey  string
 
 	api.UnimplementedControlServiceServer
 }
 
-// RegisterGRPC registers the gRPC info service
+// RegisterGRPC registers the gRPC info service.
 func (c *ControlService) RegisterGRPC(srv *grpc.Server) {
 	api.RegisterControlServiceServer(srv, c)
 }
 
-// ExposePort exposes a port
+// ExposePort exposes a port.
 func (c *ControlService) ExposePort(ctx context.Context, req *api.ExposePortRequest) (*api.ExposePortResponse, error) {
-	err := c.portsManager.Expose(ctx, req.Port, req.TargetPort)
+	err := c.portsManager.Expose(ctx, req.Port)
 	return &api.ExposePortResponse{}, err
 }
 
-// ContentState signals the workspace content state
+// CreateSSHKeyPair create a ssh key pair for the workspace.
+func (ss *ControlService) CreateSSHKeyPair(context.Context, *api.CreateSSHKeyPairRequest) (response *api.CreateSSHKeyPairResponse, err error) {
+	home, _ := os.UserHomeDir()
+	if ss.privateKey != "" && ss.publicKey != "" {
+		checkKey := func() error {
+			data, err := os.ReadFile(filepath.Join(home, ".ssh/authorized_keys"))
+			if err != nil {
+				return xerrors.Errorf("cannot read file ~/.ssh/authorized_keys: %w", err)
+			}
+			if !bytes.Contains(data, []byte(ss.publicKey)) {
+				return xerrors.Errorf("not found special publickey")
+			}
+			return nil
+		}
+		err := checkKey()
+		if err == nil {
+			return &api.CreateSSHKeyPairResponse{
+				PrivateKey: ss.privateKey,
+			}, nil
+		}
+		log.WithError(err).Error("check authorized_keys failed, will recreate")
+	}
+	dir, err := os.MkdirTemp(os.TempDir(), "ssh-key-*")
+	if err != nil {
+		return nil, xerrors.Errorf("cannot create tmpfile: %w", err)
+	}
+	err = prepareSSHKey(context.Background(), filepath.Join(dir, "ssh"))
+	if err != nil {
+		return nil, xerrors.Errorf("cannot create ssh key pair: %w", err)
+	}
+	bPublic, err := os.ReadFile(filepath.Join(dir, "ssh.pub"))
+	if err != nil {
+		return nil, xerrors.Errorf("cannot read publickey: %w", err)
+	}
+	bPrivate, err := os.ReadFile(filepath.Join(dir, "ssh"))
+	if err != nil {
+		return nil, xerrors.Errorf("cannot read privatekey: %w", err)
+	}
+	err = os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot create dir ~/.ssh/: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(home, ".ssh/authorized_keys"), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot open file ~/.ssh/authorized_keys: %w", err)
+	}
+	_, err = f.Write(bPublic)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot write file ~.ssh/authorized_keys: %w", err)
+	}
+	err = os.Chown(filepath.Join(home, ".ssh/authorized_keys"), gitpodUID, gitpodGID)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot chown SSH authorized_keys file: %w", err)
+	}
+	ss.privateKey = string(bPrivate)
+	ss.publicKey = string(bPublic)
+	return &api.CreateSSHKeyPairResponse{
+		PrivateKey: ss.privateKey,
+	}, err
+}
+
+// ContentState signals the workspace content state.
 type ContentState interface {
 	MarkContentReady(src csapi.WorkspaceInitSource)
 	ContentReady() <-chan struct{}
 	ContentSource() (src csapi.WorkspaceInitSource, ok bool)
 }
 
-// NewInMemoryContentState creates a new InMemoryContentState
+// NewInMemoryContentState creates a new InMemoryContentState.
 func NewInMemoryContentState(checkoutLocation string) *InMemoryContentState {
 	return &InMemoryContentState{
 		checkoutLocation: checkoutLocation,
@@ -681,7 +787,7 @@ func NewInMemoryContentState(checkoutLocation string) *InMemoryContentState {
 	}
 }
 
-// InMemoryContentState implements the ContentState interface in-memory
+// InMemoryContentState implements the ContentState interface in-memory.
 type InMemoryContentState struct {
 	checkoutLocation string
 
@@ -696,7 +802,7 @@ func (state *InMemoryContentState) MarkContentReady(src csapi.WorkspaceInitSourc
 	close(state.contentReadyChan)
 }
 
-// ContentReady returns a chan that closes when the content becomes available
+// ContentReady returns a chan that closes when the content becomes available.
 func (state *InMemoryContentState) ContentReady() <-chan struct{} {
 	return state.contentReadyChan
 }
@@ -748,7 +854,7 @@ func (s *portService) CloseTunnel(ctx context.Context, req *api.CloseTunnelReque
 	return &api.CloseTunnelResponse{}, nil
 }
 
-// EstablishTunnel actually establishes the tunnel
+// EstablishTunnel actually establishes the tunnel.
 func (s *portService) EstablishTunnel(stream api.PortService_EstablishTunnelServer) error {
 	req, err := stream.Recv()
 	if err != nil {
@@ -812,13 +918,13 @@ func (s *portService) EstablishTunnel(stream api.PortService_EstablishTunnelServ
 	return status.Error(codes.Internal, returnedError.Error())
 }
 
-// AutoTunnel controls enablement of auto tunneling
+// AutoTunnel controls enablement of auto tunneling.
 func (s *portService) AutoTunnel(ctx context.Context, req *api.AutoTunnelRequest) (*api.AutoTunnelResponse, error) {
 	s.portsManager.AutoTunnel(ctx, req.Enabled)
 	return &api.AutoTunnelResponse{}, nil
 }
 
-// RetryAutoExpose retries auto exposing the give port
+// RetryAutoExpose retries auto exposing the give port.
 func (s *portService) RetryAutoExpose(ctx context.Context, req *api.RetryAutoExposeRequest) (*api.RetryAutoExposeResponse, error) {
 	s.portsManager.RetryAutoExpose(ctx, req.Port)
 	return &api.RetryAutoExposeResponse{}, nil

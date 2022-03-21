@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "target": "es5",
+    "target": "es6",
     "lib": [
       "dom",
       "dom.iterable",
@@ -20,7 +20,8 @@
     "isolatedModules": true,
     "downlevelIteration": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "useUnknownInCatchVariables": false
   },
   "include": [
     "src",

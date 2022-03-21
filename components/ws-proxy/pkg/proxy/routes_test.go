@@ -6,6 +6,11 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +23,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/util"
@@ -33,15 +39,16 @@ const (
 var (
 	workspaces = []WorkspaceInfo{
 		{
-			IDEImage: "gitpod-io/ide:latest",
+			IDEImage:        "gitpod-io/ide:latest",
+			SupervisorImage: "gitpod-io/supervisor:latest",
 			Auth: &api.WorkspaceAuthentication{
 				Admission:  api.AdmissionLevel_ADMIT_OWNER_ONLY,
 				OwnerToken: "owner-token",
 			},
 			IDEPublicPort: "23000",
 			InstanceID:    "1943c611-a014-4f4d-bf5d-14ccf0123c60",
-			Ports: []PortInfo{
-				{PortSpec: api.PortSpec{Port: 28080, Target: 38080, Url: "https://28080-amaranth-smelt-9ba20cc1.test-domain.com/", Visibility: api.PortVisibility_PORT_VISIBILITY_PUBLIC}},
+			Ports: []*api.PortSpec{
+				{Port: 28080, Url: "https://28080-amaranth-smelt-9ba20cc1.test-domain.com/", Visibility: api.PortVisibility_PORT_VISIBILITY_PUBLIC},
 			},
 			URL:         "https://amaranth-smelt-9ba20cc1.test-domain.com/",
 			WorkspaceID: "amaranth-smelt-9ba20cc1",
@@ -72,11 +79,8 @@ var (
 			Scheme: "http",
 		},
 		WorkspacePodConfig: &WorkspacePodConfig{
-			ServiceTemplate:     "http://localhost:{{ .port }}",
-			PortServiceTemplate: "http://localhost:{{ .port }}",
-			TheiaPort:           workspacePort,
-			SupervisorPort:      supervisorPort,
-			SupervisorImage:     "gitpod-io/supervisor:latest",
+			TheiaPort:      workspacePort,
+			SupervisorPort: supervisorPort,
 		},
 		BuiltinPages: BuiltinPagesConfig{
 			Location: "../../public",
@@ -88,6 +92,7 @@ type Target struct {
 	Status  int
 	Handler func(w http.ResponseWriter, r *http.Request, requestCount uint8)
 }
+
 type testTarget struct {
 	Target       *Target
 	RequestCount uint8
@@ -96,12 +101,14 @@ type testTarget struct {
 }
 
 func (tt *testTarget) Close() {
-	tt.listener.Close()
-	tt.server.Shutdown(context.Background())
+	_ = tt.listener.Close()
+	_ = tt.server.Shutdown(context.Background())
 }
 
-// startTestTarget starts a new HTTP server that serves as some test target during the unit tests
+// startTestTarget starts a new HTTP server that serves as some test target during the unit tests.
 func startTestTarget(t *testing.T, host, name string) *testTarget {
+	t.Helper()
+
 	l, err := net.Listen("tcp", host)
 	if err != nil {
 		t.Fatalf("cannot start fake IDE host: %q", err)
@@ -147,7 +154,7 @@ func startTestTarget(t *testing.T, host, name string) *testTarget {
 		}
 		w.WriteHeader(http.StatusOK)
 	})}
-	go srv.Serve(l)
+	go func() { _ = srv.Serve(l) }()
 	tt.server = srv
 
 	return tt
@@ -202,7 +209,6 @@ func TestRoutes(t *testing.T) {
 		Desc        string
 		Config      *Config
 		Request     *http.Request
-		Workspaces  []WorkspaceInfo
 		Router      RouterFactory
 		Targets     *Targets
 		IgnoreBody  bool
@@ -414,10 +420,10 @@ func TestRoutes(t *testing.T) {
 				Status: http.StatusFound,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://test-domain.com/start/#blabla-smelt-9ba20cc1"},
+					"Location":     {"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: ("<a href=\"https://test-domain.com/start/#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
+				Body: ("<a href=\"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
 			},
 		},
 		{
@@ -429,10 +435,10 @@ func TestRoutes(t *testing.T) {
 				Status: http.StatusFound,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://test-domain.com/start/#blabla-smelt-9ba20cc1"},
+					"Location":     {"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: ("<a href=\"https://test-domain.com/start/#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
+				Body: ("<a href=\"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
 			},
 		},
 		{
@@ -477,7 +483,7 @@ func TestRoutes(t *testing.T) {
 				Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
 					if requestCount == 0 {
 						w.WriteHeader(http.StatusServiceUnavailable)
-						io.WriteString(w, "timeout")
+						_, _ = io.WriteString(w, "timeout")
 						return
 					}
 					w.WriteHeader(http.StatusOK)
@@ -646,6 +652,10 @@ func TestRoutes(t *testing.T) {
 			cfg := config
 			if test.Config != nil {
 				cfg = *test.Config
+				err := cfg.Validate()
+				if err != nil {
+					t.Fatalf("invalid configuration: %q", err)
+				}
 			}
 			router := HostBasedRouter(hostBasedHeader, wsHostSuffix, wsHostNameRegex)
 			if test.Router != nil {
@@ -653,12 +663,12 @@ func TestRoutes(t *testing.T) {
 			}
 
 			ingress := HostBasedIngressConfig{
-				HttpAddress:  "8080",
-				HttpsAddress: "9090",
+				HTTPAddress:  "8080",
+				HTTPSAddress: "9090",
 				Header:       "",
 			}
 
-			proxy := NewWorkspaceProxy(ingress, cfg, router, &fakeWsInfoProvider{infos: workspaces})
+			proxy := NewWorkspaceProxy(ingress, cfg, router, &fakeWsInfoProvider{infos: workspaces}, nil)
 			handler, err := proxy.Handler()
 			if err != nil {
 				t.Fatalf("cannot create proxy handler: %q", err)
@@ -695,8 +705,8 @@ type fakeWsInfoProvider struct {
 	infos []WorkspaceInfo
 }
 
-// GetWsInfoByID returns the workspace for the given ID
-func (p *fakeWsInfoProvider) WorkspaceInfo(ctx context.Context, workspaceID string) *WorkspaceInfo {
+// GetWsInfoByID returns the workspace for the given ID.
+func (p *fakeWsInfoProvider) WorkspaceInfo(workspaceID string) *WorkspaceInfo {
 	for _, nfo := range p.infos {
 		if nfo.WorkspaceID == workspaceID {
 			return &nfo
@@ -706,7 +716,7 @@ func (p *fakeWsInfoProvider) WorkspaceInfo(ctx context.Context, workspaceID stri
 	return nil
 }
 
-// WorkspaceCoords returns the workspace coords for a public port
+// WorkspaceCoords returns the workspace coords for a public port.
 func (p *fakeWsInfoProvider) WorkspaceCoords(wsProxyPort string) *WorkspaceCoords {
 	for _, info := range p.infos {
 		if info.IDEPublicPort == wsProxyPort {
@@ -717,7 +727,7 @@ func (p *fakeWsInfoProvider) WorkspaceCoords(wsProxyPort string) *WorkspaceCoord
 		}
 
 		for _, portInfo := range info.Ports {
-			if portInfo.PublicPort == wsProxyPort {
+			if fmt.Sprint(portInfo.Port) == wsProxyPort {
 				return &WorkspaceCoords{
 					ID:   info.WorkspaceID,
 					Port: strconv.Itoa(int(portInfo.Port)),
@@ -727,6 +737,98 @@ func (p *fakeWsInfoProvider) WorkspaceCoords(wsProxyPort string) *WorkspaceCoord
 	}
 
 	return nil
+}
+
+func TestSSHGatewayRouter(t *testing.T) {
+	generatePrivateKey := func() ssh.Signer {
+		prik, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return nil
+		}
+		b := pem.EncodeToMemory(&pem.Block{
+			Bytes: x509.MarshalPKCS1PrivateKey(prik),
+			Type:  "RSA PRIVATE KEY",
+		})
+		signal, err := ssh.ParsePrivateKey(b)
+		if err != nil {
+			return nil
+		}
+		return signal
+	}
+
+	tests := []struct {
+		Name     string
+		Input    []ssh.Signer
+		Expected int
+	}{
+		{"one hostkey", []ssh.Signer{generatePrivateKey()}, 1},
+		{"multi hostkey", []ssh.Signer{generatePrivateKey(), generatePrivateKey()}, 2},
+	}
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			router := HostBasedRouter(hostBasedHeader, wsHostSuffix, wsHostNameRegex)
+			ingress := HostBasedIngressConfig{
+				HTTPAddress:  "8080",
+				HTTPSAddress: "9090",
+				Header:       "",
+			}
+
+			proxy := NewWorkspaceProxy(ingress, config, router, &fakeWsInfoProvider{infos: workspaces}, test.Input)
+			handler, err := proxy.Handler()
+			if err != nil {
+				t.Fatalf("cannot create proxy handler: %q", err)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"_ssh/host_keys", nil),
+				addHostHeader,
+			))
+			resp := rec.Result()
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status code should be 200, but got %d", resp.StatusCode)
+			}
+			var hostkeys []map[string]interface{}
+			fmt.Println(string(body))
+			err = json.Unmarshal(body, &hostkeys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Log(hostkeys, len(hostkeys), test.Expected)
+
+			if len(hostkeys) != test.Expected {
+				t.Fatalf("hostkey length is not expected")
+			}
+		})
+	}
+}
+
+func TestNoSSHGatewayRouter(t *testing.T) {
+	t.Run("TestNoSSHGatewayRouter", func(t *testing.T) {
+		router := HostBasedRouter(hostBasedHeader, wsHostSuffix, wsHostNameRegex)
+		ingress := HostBasedIngressConfig{
+			HTTPAddress:  "8080",
+			HTTPSAddress: "9090",
+			Header:       "",
+		}
+
+		proxy := NewWorkspaceProxy(ingress, config, router, &fakeWsInfoProvider{infos: workspaces}, nil)
+		handler, err := proxy.Handler()
+		if err != nil {
+			t.Fatalf("cannot create proxy handler: %q", err)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"_ssh/host_keys", nil),
+			addHostHeader,
+		))
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("status code should be 401, but got %d", resp.StatusCode)
+		}
+	})
+
 }
 
 func TestRemoveSensitiveCookies(t *testing.T) {
@@ -777,7 +879,6 @@ func TestSensitiveCookieHandler(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
-
 			req := httptest.NewRequest("GET", "http://"+domain, nil)
 			if test.Input != "" {
 				req.Header.Set("cookie", test.Input)

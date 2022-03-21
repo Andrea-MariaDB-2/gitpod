@@ -107,8 +107,6 @@ type Configuration struct {
 	RegistryFacadeHost string `json:"registryFacadeHost"`
 	// Cluster host under which workspaces are served, e.g. ws-eu11.gitpod.io
 	WorkspaceClusterHost string `json:"workspaceClusterHost"`
-	// EnforceWorkspaceNodeAffinity makes ws-manager add node affinity to all workspace pods
-	EnforceWorkspaceNodeAffinity bool `json:"enforceWorkspaceNodeAffinity"`
 }
 
 // AllContainerConfiguration contains the configuration for all container in a workspace pod
@@ -124,6 +122,8 @@ type WorkspaceTimeoutConfiguration struct {
 	Initialization util.Duration `json:"initialization"`
 	// RegularWorkspace is the time a regular workspace can be without activity before it's shutdown
 	RegularWorkspace util.Duration `json:"regularWorkspace"`
+	// MaxLifetime is the maximum lifetime of a regular workspace
+	MaxLifetime util.Duration `json:"maxLifetime"`
 	// HeadlessWorkspace is the maximum runtime a headless workspace can have (including startup)
 	HeadlessWorkspace util.Duration `json:"headlessWorkspace"`
 	// AfterClose is the time a workspace lives after it has been marked closed
@@ -158,8 +158,6 @@ type WorkspacePodTemplateConfiguration struct {
 	PrebuildPath string `json:"prebuildPath,omitempty"`
 	// ProbePath is a path to an additional workspace pod template YAML file for probe workspaces
 	ProbePath string `json:"probePath,omitempty"`
-	// GhostPath is a path to an additional workspace pod template YAML file for ghost workspaces
-	GhostPath string `json:"ghostPath,omitempty"`
 	// ImagebuildPath is a path to an additional workspace pod template YAML file for imagebuild workspaces
 	ImagebuildPath string `json:"imagebuildPath,omitempty"`
 }
@@ -190,6 +188,7 @@ func (c *Configuration) Validate() error {
 		validation.Field(&c.Timeouts.HeadlessWorkspace, validation.Required),
 		validation.Field(&c.Timeouts.Initialization, validation.Required),
 		validation.Field(&c.Timeouts.RegularWorkspace, validation.Required),
+		validation.Field(&c.Timeouts.MaxLifetime, validation.Required),
 		validation.Field(&c.Timeouts.TotalStartup, validation.Required),
 		validation.Field(&c.Timeouts.ContentFinalization, validation.Required),
 		validation.Field(&c.Timeouts.Stopping, validation.Required),
@@ -205,7 +204,6 @@ func (c *Configuration) Validate() error {
 		validation.Field(&c.WorkspacePodTemplate.DefaultPath, validPodTemplate),
 		validation.Field(&c.WorkspacePodTemplate.PrebuildPath, validPodTemplate),
 		validation.Field(&c.WorkspacePodTemplate.ProbePath, validPodTemplate),
-		validation.Field(&c.WorkspacePodTemplate.GhostPath, validPodTemplate),
 		validation.Field(&c.WorkspacePodTemplate.RegularPath, validPodTemplate),
 	)
 	if err != nil {
@@ -283,10 +281,10 @@ var validResourceConfig = validation.By(func(o interface{}) error {
 			return xerrors.Errorf("cannot parse Memory quantity: %w", err)
 		}
 	}
-	if rc.Storage != "" {
-		_, err := resource.ParseQuantity(rc.Storage)
+	if rc.EphemeralStorage != "" {
+		_, err := resource.ParseQuantity(rc.EphemeralStorage)
 		if err != nil {
-			return xerrors.Errorf("cannot parse Storage quantity: %w", err)
+			return xerrors.Errorf("cannot parse EphemeralStorage quantity: %w", err)
 		}
 	}
 	return nil
@@ -297,7 +295,7 @@ func (r *ResourceConfiguration) ResourceList() (corev1.ResourceList, error) {
 	res := map[corev1.ResourceName]string{
 		corev1.ResourceCPU:              r.CPU,
 		corev1.ResourceMemory:           r.Memory,
-		corev1.ResourceEphemeralStorage: r.Storage,
+		corev1.ResourceEphemeralStorage: r.EphemeralStorage,
 	}
 
 	var l = make(corev1.ResourceList)
@@ -399,7 +397,7 @@ func RenderWorkspacePortURL(urltpl string, ctx PortURLContext) (string, error) {
 
 // ResourceConfiguration configures resources of a pod/container
 type ResourceConfiguration struct {
-	CPU     string `json:"cpu"`
-	Memory  string `json:"memory"`
-	Storage string `json:"storage"`
+	CPU              string `json:"cpu"`
+	Memory           string `json:"memory"`
+	EphemeralStorage string `json:"ephemeral-storage"`
 }

@@ -136,7 +136,7 @@ func LaunchWorkspaceDirectly(ctx context.Context, api *ComponentAPI, opts ...Lau
 		if err != nil {
 			return nil, xerrors.Errorf("cannot find server IDE config: %q", err)
 		}
-		ideImage = cfg.IDEImageAliases.Code
+		ideImage = cfg.IDEOptions.Options.Code.Image
 		if ideImage == "" {
 			return nil, xerrors.Errorf("cannot start workspaces without an IDE image (required by registry-facade resolver)")
 		}
@@ -144,15 +144,18 @@ func LaunchWorkspaceDirectly(ctx context.Context, api *ComponentAPI, opts ...Lau
 
 	req := &wsmanapi.StartWorkspaceRequest{
 		Id:            instanceID.String(),
-		ServicePrefix: workspaceID,
+		ServicePrefix: instanceID.String(),
 		Metadata: &wsmanapi.WorkspaceMetadata{
 			Owner:  gitpodBuiltinUserID,
 			MetaId: workspaceID,
 		},
 		Type: wsmanapi.WorkspaceType_REGULAR,
 		Spec: &wsmanapi.StartWorkspaceSpec{
-			WorkspaceImage:    workspaceImage,
-			IdeImage:          ideImage,
+			WorkspaceImage:     workspaceImage,
+			DeprecatedIdeImage: ideImage,
+			IdeImage: &wsmanapi.IDEImage{
+				WebRef: ideImage,
+			},
 			CheckoutLocation:  "/",
 			WorkspaceLocation: "/",
 			Timeout:           "30m",
@@ -236,6 +239,10 @@ func LaunchWorkspaceFromContextURL(ctx context.Context, contextURL string, usern
 	if nfo.LatestInstance == nil {
 		return nil, nil, xerrors.Errorf("CreateWorkspace did not start the workspace")
 	}
+
+	// GetWorkspace might receive an instance before we seen the first event
+	// from ws-manager, in which case IdeURL is not set
+	nfo.LatestInstance.IdeURL = resp.WorkspaceURL
 
 	stopWs := func(waitForStop bool) {
 		sctx, scancel := context.WithTimeout(ctx, perCallTimeout)

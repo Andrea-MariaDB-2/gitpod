@@ -23,12 +23,16 @@ require (
 )
 
 require (
+	github.com/prometheus/procfs v0.7.3
+	github.com/sourcegraph/jsonrpc2 v0.0.0-20200429184054-15c2290dcb37
+)
+
+require (
 	github.com/alecthomas/gometalinter v2.0.11+incompatible // indirect
 	github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf // indirect
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e // indirect
 	github.com/client9/misspell v0.3.4 // indirect
 	github.com/felixge/httpsnoop v1.0.1 // indirect
-	github.com/fsnotify/fsnotify v1.4.9 // indirect
 	github.com/golang/lint v0.0.0-20181026193005-c67002cb31c3 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/gordonklaus/ineffassign v0.0.0-20180909121442-1003c8bd00dc // indirect
@@ -40,7 +44,6 @@ require (
 	github.com/mattn/go-colorable v0.0.9 // indirect
 	github.com/mattn/go-isatty v0.0.4 // indirect
 	github.com/pelletier/go-toml v1.2.0 // indirect
-	github.com/sourcegraph/jsonrpc2 v0.0.0-20200429184054-15c2290dcb37 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/tsenart/deadcode v0.0.0-20160724212837-210d2dc333e9 // indirect
 	golang.org/x/lint v0.0.0-20210508222113-6edffad5e616 // indirect

@@ -2,7 +2,7 @@ packages:
   - name: app
     type: yarn
     srcs:
-      - "src/**"
+      - "**/*.ts"
       - package.json
       - mocha.opts
     deps:
@@ -21,6 +21,8 @@ packages:
     argdeps:
       - imageRepoBase
     config:
+      buildArgs:
+        VERSION: ${version}
       dockerfile: leeway.Dockerfile
       metadata:
         helm-component: dbSync
@@ -43,7 +45,7 @@ packages:
       tsconfig: tsconfig.json
       commands:
         test: ["yarn", "db-test"]
-        build: ["npx", "tsc"]
+        build: ["yarn", "build"]
 scripts:
   - name: telepresence
     script: |-

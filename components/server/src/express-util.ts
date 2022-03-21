@@ -4,57 +4,18 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { WsRequestHandler } from './express/ws-handler';
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { URL } from 'url';
-import * as express from 'express';
-import * as crypto from 'crypto';
-import { GitpodHostUrl } from '@gitpod/gitpod-protocol/lib/util/gitpod-host-url';
-
-export const pingPong: WsRequestHandler = (ws, req, next) => {
-    let pingSentTimer: any;
-    const timer = setInterval(() => {
-        if (ws.readyState !== ws.OPEN) {
-            return;
-        }
-        // wait 10 secs for a pong
-        pingSentTimer = setTimeout(() => {
-            // Happens very often, we do not want to spam the logs here
-            ws.terminate();
-        }, 10000);
-        ws.ping();
-    }, 30000)
-    ws.on('pong', () => {
-        if (pingSentTimer) {
-            clearTimeout(pingSentTimer);
-        }
-    });
-    ws.on('ping', (data) => {
-        // answer browser-side ping to conform RFC6455 (https://tools.ietf.org/html/rfc6455#section-5.5.2)
-        ws.pong(data);
-    });
-    ws.on('close', () => {
-        clearInterval(timer);
-    })
-    next();
-}
-
-export const handleError: WsRequestHandler = (ws, req, next) => {
-    ws.on('error', (err: any) => {
-        if (err.code !== 'ECONNRESET') {
-            log.error('Websocket error', err, { ws, req });
-        }
-        ws.terminate();
-    });
-    next();
-}
+import { URL } from "url";
+import * as express from "express";
+import * as crypto from "crypto";
+import { GitpodHostUrl } from "@gitpod/gitpod-protocol/lib/util/gitpod-host-url";
+import * as session from "express-session";
 
 export const query = (...tuples: [string, string][]) => {
     if (tuples.length === 0) {
         return "";
     }
-    return "?" + tuples.map(t => `${t[0]}=${encodeURIComponent(t[1])}`).join("&");
-}
+    return "?" + tuples.map((t) => `${t[0]}=${encodeURIComponent(t[1])}`).join("&");
+};
 
 // We do not precise UUID parsing here, we just want to distinguish three cases:
 //  - the base domain
@@ -62,7 +23,7 @@ export const query = (...tuples: [string, string][]) => {
 //  - a workspace port domain
 // We control all of those values and the base domain, so we don't need to much effort
 export const isAllowedWebsocketDomain = (originHeader: any, gitpodHostName: string): boolean => {
-    if (!originHeader || typeof (originHeader) !== "string") {
+    if (!originHeader || typeof originHeader !== "string") {
         return false;
     }
 
@@ -74,15 +35,14 @@ export const isAllowedWebsocketDomain = (originHeader: any, gitpodHostName: stri
             return true;
         }
         if (looksLikeWorkspaceHostname(originUrl, gitpodHostName)) {
-            return true
+            return true;
         } else {
             return false;
         }
     } catch (err) {
         return false;
     }
-
-}
+};
 
 const looksLikeWorkspaceHostname = (originHostname: URL, gitpodHostName: string): boolean => {
     // Is prefix a valid (looking) workspace ID?
@@ -101,8 +61,7 @@ const looksLikeWorkspaceHostname = (originHostname: URL, gitpodHostName: string)
     return false;
 };
 
-export function saveSession(reqOrSession: express.Request | Express.Session): Promise<void> {
-    const session = reqOrSession.session ? reqOrSession.session : reqOrSession;
+export function saveSession(session: session.Session): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         session.save((err: any) => {
             if (err) {
@@ -113,8 +72,7 @@ export function saveSession(reqOrSession: express.Request | Express.Session): Pr
         });
     });
 }
-export function destroySession(reqOrSession: express.Request | Express.Session): Promise<void> {
-    const session = reqOrSession.session ? reqOrSession.session : reqOrSession;
+export function destroySession(session: session.Session): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         session.destroy((error: any) => {
             if (error) {
@@ -135,8 +93,8 @@ export function destroySession(reqOrSession: express.Request | Express.Session):
  */
 export function getRequestingClientInfo(req: express.Request) {
     const ip = req.ips[0] || req.ip; // on PROD this should be a client IP address
-    const ua = req.get('user-agent');
-    const fingerprint = crypto.createHash('sha256').update(`${ip}–${ua}`).digest('hex');
+    const ua = req.get("user-agent");
+    const fingerprint = crypto.createHash("sha256").update(`${ip}–${ua}`).digest("hex");
     return { ua, fingerprint };
 }
 
@@ -147,11 +105,12 @@ export function getRequestingClientInfo(req: express.Request) {
  * @param handler
  * @returns
  */
-export function asyncHandler(handler: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<void>): express.Handler {
+export function asyncHandler(
+    handler: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<void>,
+): express.Handler {
     return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-        handler(req, res, next)
-            .catch(err => next(err));
-    }
+        handler(req, res, next).catch((err) => next(err));
+    };
 }
 
 /**
@@ -182,7 +141,7 @@ export function bottomErrorHandler(log: (...args: any[]) => void): express.Error
         let status = 500;
         if (err instanceof Error) {
             msg = err.toString() + "\nStack: " + err.stack;
-            status = typeof (err as any).status === 'number' ? (err as any).status : 500;
+            status = typeof (err as any).status === "number" ? (err as any).status : 500;
         } else {
             msg = err.toString();
         }
@@ -190,14 +149,24 @@ export function bottomErrorHandler(log: (...args: any[]) => void): express.Error
             originalUrl: req.originalUrl,
             headers: req.headers,
             cookies: req.cookies,
-            session: req.session
+            session: req.session,
         });
         if (!isAnsweredRequest(req, response)) {
             response.status(status).send({ error: msg });
         }
-    }
+    };
 }
 
 export function isAnsweredRequest(req: express.Request, res: express.Response) {
     return res.headersSent || req.originalUrl.endsWith(".websocket");
 }
+
+export const takeFirst = (h: string | string[] | undefined): string | undefined => {
+    if (Array.isArray(h)) {
+        if (h.length < 1) {
+            return undefined;
+        }
+        return h[0];
+    }
+    return h;
+};

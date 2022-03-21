@@ -23,12 +23,14 @@ func TestServerAccess(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
-			api := integration.NewComponentAPI(ctx, cfg.Namespace(), cfg.Client())
+			api := integration.NewComponentAPI(ctx, cfg.Namespace(), kubeconfig, cfg.Client())
 			t.Cleanup(func() {
 				api.Done(t)
 			})
 
-			server, err := api.GitpodServer()
+			username := integration.EnsureUserExists(t, username, api)
+
+			server, err := api.GitpodServer(integration.WithGitpodUser(username))
 			if err != nil {
 				t.Fatalf("cannot get GitpodServer: %q", err)
 			}
@@ -46,18 +48,20 @@ func TestServerAccess(t *testing.T) {
 }
 
 func TestStartWorkspace(t *testing.T) {
+	integration.SkipWithoutUsername(t, username)
+
 	f := features.New("CreateWorkspace").
 		WithLabel("component", "server").
 		Assess("it can run workspace tasks", func(_ context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
-			api := integration.NewComponentAPI(ctx, cfg.Namespace(), cfg.Client())
+			api := integration.NewComponentAPI(ctx, cfg.Namespace(), kubeconfig, cfg.Client())
 			t.Cleanup(func() {
 				api.Done(t)
 			})
 
-			server, err := api.GitpodServer()
+			server, err := api.GitpodServer(integration.WithGitpodUser(username))
 			if err != nil {
 				t.Fatalf("cannot get GitpodServer: %q", err)
 			}

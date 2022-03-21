@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/gitpod-io/gitpod/common-go/kubernetes"
 	wsk8s "github.com/gitpod-io/gitpod/common-go/kubernetes"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	regapi "github.com/gitpod-io/gitpod/registry-facade/api"
@@ -52,8 +53,6 @@ func (m *Manager) createWorkspacePod(startContext *startWorkspaceContext) (*core
 		typeSpecificTpl, err = config.GetWorkspacePodTemplate(m.Config.WorkspacePodTemplate.PrebuildPath)
 	case api.WorkspaceType_PROBE:
 		typeSpecificTpl, err = config.GetWorkspacePodTemplate(m.Config.WorkspacePodTemplate.ProbePath)
-	case api.WorkspaceType_GHOST:
-		typeSpecificTpl, err = config.GetWorkspacePodTemplate(m.Config.WorkspacePodTemplate.GhostPath)
 	case api.WorkspaceType_IMAGEBUILD:
 		typeSpecificTpl, err = config.GetWorkspacePodTemplate(m.Config.WorkspacePodTemplate.ImagebuildPath)
 	}
@@ -236,9 +235,23 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 		labels[k] = v
 	}
 
+	ideRef := startContext.Request.Spec.DeprecatedIdeImage
+	var desktopIdeRef string
+	if startContext.Request.Spec.IdeImage != nil && len(startContext.Request.Spec.IdeImage.WebRef) > 0 {
+		ideRef = startContext.Request.Spec.IdeImage.WebRef
+		desktopIdeRef = startContext.Request.Spec.IdeImage.DesktopRef
+	}
+
+	var supervisorRef string
+	if startContext.Request.Spec.IdeImage != nil && len(startContext.Request.Spec.IdeImage.SupervisorRef) > 0 {
+		supervisorRef = startContext.Request.Spec.IdeImage.SupervisorRef
+	}
+
 	spec := regapi.ImageSpec{
-		BaseRef: startContext.Request.Spec.WorkspaceImage,
-		IdeRef:  startContext.Request.Spec.IdeImage,
+		BaseRef:       startContext.Request.Spec.WorkspaceImage,
+		IdeRef:        ideRef,
+		DesktopIdeRef: desktopIdeRef,
+		SupervisorRef: supervisorRef,
 	}
 	imageSpec, err := spec.ToBase64()
 	if err != nil {
@@ -263,28 +276,35 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 		prefix = "prebuild"
 	case api.WorkspaceType_PROBE:
 		prefix = "probe"
-	case api.WorkspaceType_GHOST:
-		prefix = "ghost"
 	case api.WorkspaceType_IMAGEBUILD:
 		prefix = "imagebuild"
+		// mount self-signed gitpod CA certificate to ensure
+		// we can push images to the in-cluster registry
+		workspaceContainer.VolumeMounts = append(workspaceContainer.VolumeMounts,
+			corev1.VolumeMount{
+				Name:      "gitpod-ca-certificate",
+				MountPath: "/usr/local/share/ca-certificates/gitpod-ca.crt",
+				SubPath:   "ca.crt",
+				ReadOnly:  true,
+			},
+		)
 	default:
 		prefix = "ws"
 	}
 
 	annotations := map[string]string{
-		"prometheus.io/scrape":               "true",
-		"prometheus.io/path":                 "/metrics",
-		"prometheus.io/port":                 strconv.Itoa(int(startContext.IDEPort)),
-		workspaceIDAnnotation:                req.Id,
-		servicePrefixAnnotation:              getServicePrefix(req),
-		workspaceURLAnnotation:               startContext.WorkspaceURL,
-		workspaceInitializerAnnotation:       initializerConfig,
-		workspaceNeverReadyAnnotation:        "true",
-		workspaceAdmissionAnnotation:         admissionLevel,
-		workspaceImageSpecAnnotation:         imageSpec,
-		ownerTokenAnnotation:                 startContext.OwnerToken,
-		wsk8s.TraceIDAnnotation:              startContext.TraceID,
-		wsk8s.RequiredNodeServicesAnnotation: "ws-daemon,registry-facade",
+		"prometheus.io/scrape":                  "true",
+		"prometheus.io/path":                    "/metrics",
+		"prometheus.io/port":                    strconv.Itoa(int(startContext.IDEPort)),
+		workspaceIDAnnotation:                   req.Id,
+		servicePrefixAnnotation:                 getServicePrefix(req),
+		kubernetes.WorkspaceURLAnnotation:       startContext.WorkspaceURL,
+		workspaceInitializerAnnotation:          initializerConfig,
+		workspaceNeverReadyAnnotation:           "true",
+		kubernetes.WorkspaceAdmissionAnnotation: admissionLevel,
+		kubernetes.WorkspaceImageSpecAnnotation: imageSpec,
+		kubernetes.OwnerTokenAnnotation:         startContext.OwnerToken,
+		wsk8s.TraceIDAnnotation:                 startContext.TraceID,
 		// TODO(cw): post Kubernetes 1.19 use GA form for settings those profiles
 		"container.apparmor.security.beta.kubernetes.io/workspace": "unconfined",
 		// We're using a custom seccomp profile for user namespaces to allow clone, mount and chroot.
@@ -324,24 +344,30 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 	if startContext.Headless {
 		workloadType = "headless"
 	}
-	var affinity *corev1.Affinity
-	if m.Config.EnforceWorkspaceNodeAffinity {
-		affinity = &corev1.Affinity{
-			NodeAffinity: &corev1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-					NodeSelectorTerms: []corev1.NodeSelectorTerm{
-						{
-							MatchExpressions: []corev1.NodeSelectorRequirement{
-								{
-									Key:      "gitpod.io/workloads/workspace/" + workloadType,
-									Operator: corev1.NodeSelectorOpExists,
-								},
+
+	affinity := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      "gitpod.io/workload_workspace_" + workloadType,
+								Operator: corev1.NodeSelectorOpExists,
+							},
+							{
+								Key:      "gitpod.io/ws-daemon_ready_ns_" + m.Config.Namespace,
+								Operator: corev1.NodeSelectorOpExists,
+							},
+							{
+								Key:      "gitpod.io/registry-facade_ready_ns_" + m.Config.Namespace,
+								Operator: corev1.NodeSelectorOpExists,
 							},
 						},
 					},
 				},
 			},
-		}
+		},
 	}
 
 	pod := corev1.Pod{
@@ -350,8 +376,10 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 			Namespace:   m.Config.Namespace,
 			Labels:      labels,
 			Annotations: annotations,
+			Finalizers:  []string{"gitpod.io/finalizer"},
 		},
 		Spec: corev1.PodSpec{
+			Hostname:                     req.Metadata.MetaId,
 			AutomountServiceAccountToken: &boolFalse,
 			ServiceAccountName:           "workspace",
 			SchedulerName:                m.Config.SchedulerName,
@@ -426,6 +454,20 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 		}
 	}
 
+	if req.Type == api.WorkspaceType_IMAGEBUILD {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: "gitpod-ca-certificate",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "builtin-registry-facade-cert",
+					Items: []corev1.KeyToPath{
+						{Key: "ca.crt", Path: "ca.crt"},
+					},
+				},
+			},
+		})
+	}
+
 	return &pod, nil
 }
 
@@ -473,7 +515,7 @@ func (m *Manager) createWorkspaceContainer(startContext *startWorkspaceContext) 
 	var (
 		command        = []string{"/.supervisor/workspacekit", "ring0"}
 		readinessProbe = &corev1.Probe{
-			Handler: corev1.Handler{
+			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/_supervisor/v1/status/content/wait/true",
 					Port:   intstr.FromInt((int)(startContext.SupervisorPort)),
@@ -487,14 +529,9 @@ func (m *Manager) createWorkspaceContainer(startContext *startWorkspaceContext) 
 			PeriodSeconds:       1,
 			SuccessThreshold:    1,
 			TimeoutSeconds:      1,
-			InitialDelaySeconds: 4,
+			InitialDelaySeconds: 3,
 		}
 	)
-
-	if startContext.Request.Type == api.WorkspaceType_GHOST {
-		command = []string{"/.supervisor/supervisor", "ghost"}
-		readinessProbe = nil
-	}
 
 	image := fmt.Sprintf("%s/%s/%s", m.Config.RegistryFacadeHost, regapi.ProviderPrefixRemote, startContext.Request.Id)
 
@@ -562,15 +599,32 @@ func (m *Manager) createWorkspaceEnvironment(startContext *startWorkspaceContext
 	// User-defined env vars (i.e. those coming from the request)
 	if spec.Envvars != nil {
 		for _, e := range spec.Envvars {
-			if e.Name == "GITPOD_WORKSPACE_CONTEXT" || e.Name == "GITPOD_WORKSPACE_CONTEXT_URL" || e.Name == "GITPOD_TASKS" || e.Name == "GITPOD_RESOLVED_EXTENSIONS" || e.Name == "GITPOD_EXTERNAL_EXTENSIONS" || e.Name == "GITPOD_IDE_ALIAS" {
-				result = append(result, corev1.EnvVar{Name: e.Name, Value: e.Value})
-				continue
-			} else if strings.HasPrefix(e.Name, "GITPOD_") {
-				// we don't allow env vars starting with GITPOD_ and those that we do allow we've listed above
-				continue
+			switch e.Name {
+			case "GITPOD_WORKSPACE_CONTEXT",
+				"GITPOD_WORKSPACE_CONTEXT_URL",
+				"GITPOD_TASKS",
+				"GITPOD_RESOLVED_EXTENSIONS",
+				"GITPOD_EXTERNAL_EXTENSIONS",
+				"GITPOD_IDE_ALIAS":
+				// these variables are allowed - don't skip them
+			default:
+				if strings.HasPrefix(e.Name, "GITPOD_") {
+					// we don't allow env vars starting with GITPOD_ and those that we do allow we've listed above
+					continue
+				}
 			}
 
-			result = append(result, corev1.EnvVar{Name: e.Name, Value: e.Value})
+			env := corev1.EnvVar{Name: e.Name, Value: e.Value}
+			if len(e.Value) == 0 && e.Secret != nil {
+				env.ValueFrom = &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: e.Secret.SecretName},
+						Key:                  e.Secret.Key,
+					},
+				}
+			}
+
+			result = append(result, env)
 		}
 	}
 
@@ -591,7 +645,7 @@ func (m *Manager) createWorkspaceEnvironment(startContext *startWorkspaceContext
 	// remove empty env vars
 	cleanResult := make([]corev1.EnvVar, 0)
 	for _, v := range result {
-		if v.Name == "" || v.Value == "" {
+		if v.Name == "" || (v.Value == "" && v.ValueFrom == nil) {
 			continue
 		}
 
@@ -653,58 +707,6 @@ func (m *Manager) createDefaultSecurityContext() (*corev1.SecurityContext, error
 	}
 
 	return res, nil
-}
-
-func (m *Manager) createPortsService(workspaceID string, metaID string, servicePrefix string, ports []*api.PortSpec) (*corev1.Service, error) {
-	annotations := make(map[string]string)
-
-	// create service ports
-	servicePorts := make([]corev1.ServicePort, len(ports))
-	for i, p := range ports {
-		servicePorts[i] = corev1.ServicePort{
-			Port:     int32(p.Port),
-			Protocol: corev1.ProtocolTCP,
-			Name:     portSpecToName(p),
-		}
-		if p.Target != 0 {
-			servicePorts[i].TargetPort = intstr.FromInt(int(p.Target))
-		}
-
-		url, err := config.RenderWorkspacePortURL(m.Config.WorkspacePortURLTemplate, config.PortURLContext{
-			Host:          m.Config.GitpodHostURL,
-			ID:            metaID,
-			IngressPort:   fmt.Sprint(p.Port),
-			Prefix:        servicePrefix,
-			WorkspacePort: fmt.Sprint(p.Port),
-		})
-		if err != nil {
-			return nil, xerrors.Errorf("cannot render public URL for %d: %w", p.Port, err)
-		}
-		annotations[fmt.Sprintf("gitpod/port-url-%d", p.Port)] = url
-	}
-
-	serviceName := getPortsServiceName(servicePrefix)
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: m.Config.Namespace,
-			Labels: map[string]string{
-				"workspaceID":          workspaceID,
-				wsk8s.MetaIDLabel:      metaID,
-				markerLabel:            "true",
-				wsk8s.ServiceTypeLabel: "ports",
-			},
-			Annotations: annotations,
-		},
-		Spec: corev1.ServiceSpec{
-			Type:  corev1.ServiceTypeClusterIP,
-			Ports: servicePorts,
-			Selector: map[string]string{
-				"workspaceID": workspaceID,
-				markerLabel:   "true",
-			},
-		},
-	}, nil
 }
 
 func (m *Manager) newStartWorkspaceContext(ctx context.Context, req *api.StartWorkspaceRequest) (res *startWorkspaceContext, err error) {

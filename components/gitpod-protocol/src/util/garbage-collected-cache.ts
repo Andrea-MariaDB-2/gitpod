@@ -4,6 +4,7 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
+import { repeat } from "./repeat";
 
 interface CacheEntry<T> {
     key: string;
@@ -14,9 +15,7 @@ interface CacheEntry<T> {
 export class GarbageCollectedCache<T> {
     protected readonly store = new Map<string, CacheEntry<T>>();
 
-    constructor(
-        protected readonly defaultMaxAgeSeconds: number,
-        protected readonly gcIntervalSeconds: number) {
+    constructor(protected readonly defaultMaxAgeSeconds: number, protected readonly gcIntervalSeconds: number) {
         this.regularlyCollectGarbage();
     }
 
@@ -41,8 +40,12 @@ export class GarbageCollectedCache<T> {
         return entry.value;
     }
 
+    public delete(key: string) {
+        this.store.delete(key);
+    }
+
     protected regularlyCollectGarbage() {
-        setInterval(() => this.collectGarbage(), this.gcIntervalSeconds * 1000);
+        repeat(() => this.collectGarbage(), this.gcIntervalSeconds * 1000);
     }
 
     protected collectGarbage() {
@@ -55,6 +58,6 @@ export class GarbageCollectedCache<T> {
     }
 
     protected calcExpiryDate(maxAgeSeconds?: number): number {
-        return Date.now() + ((maxAgeSeconds || this.defaultMaxAgeSeconds) * 1000);
+        return Date.now() + (maxAgeSeconds || this.defaultMaxAgeSeconds) * 1000;
     }
 }

@@ -12,13 +12,17 @@ COPY components-supervisor-frontend--app/node_modules/@gitpod/supervisor-fronten
 WORKDIR "/.supervisor"
 COPY components-supervisor--app/supervisor \
      supervisor-config.json \
-     components-workspacekit--app/workspacekit \
-     components-workspacekit--fuse-overlayfs/fuse-overlayfs \
      components-gitpod-cli--app/gitpod-cli \
      ./
-WORKDIR "/.supervisor/dropbear"
-COPY components-supervisor--dropbear/dropbear \
-     components-supervisor--dropbear/dropbearkey \
-     ./
+
+WORKDIR "/.supervisor/ssh"
+COPY components-supervisor-openssh--app/usr/sbin/sshd .
+COPY components-supervisor-openssh--app/usr/bin/ssh-keygen .
+
+ARG __GIT_COMMIT
+ARG VERSION
+
+ENV GITPOD_BUILD_GIT_COMMIT=${__GIT_COMMIT}
+ENV GITPOD_BUILD_VERSION=${VERSION}
 
 ENTRYPOINT ["/.supervisor/supervisor"]

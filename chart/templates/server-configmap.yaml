@@ -40,7 +40,6 @@ data:
         "enableLocalApp": {{ $comp.enableLocalApp }},
         "authProviderConfigs": {{ .Values.authProviders | toJson }},
         "disableDynamicAuthProviderLogin": {{ $comp.disableDynamicAuthProviderLogin }},
-        "brandingConfig": {{ .Values.branding | toJson }},
         "maxEnvvarPerUserCount": {{ $comp.maxEnvvarPerUserCount }},
         "maxConcurrentPrebuildsPerRef": {{ $comp.maxConcurrentPrebuildsPerRef }},
         "incrementalPrebuilds": {{ $comp.incrementalPrebuilds | toJson }},
@@ -68,5 +67,6 @@ data:
         {{- end }}
         "enablePayment": {{ $comp.enablePayment }},
         "insecureNoDomain": {{ $comp.insecureNoDomain }},
-        "chargebeeProviderOptionsFile": {{ $comp.chargebeeProviderOptionsFile | quote }}
+        "chargebeeProviderOptionsFile": {{ $comp.chargebeeProviderOptionsFile | quote }},
+        "prebuildLimiter": {{ $comp.prebuildLimiter | toJson }}
     }

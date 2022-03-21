@@ -4,13 +4,17 @@ packages:
     srcs:
       - "startup.sh"
       - "supervisor-ide-config.json"
-      - "bin/*"
+    deps:
+      - components/ide/code/codehelper:app
     argdeps:
       - imageRepoBase
+      - codeCommit
     config:
       dockerfile: leeway.Dockerfile
       metadata:
         helm-component: workspace.codeImage
+      buildArgs:
+        CODE_COMMIT: ${codeCommit}
       image:
         - ${imageRepoBase}/ide/code:${version}
         - ${imageRepoBase}/ide/code:commit-${__git_commit}

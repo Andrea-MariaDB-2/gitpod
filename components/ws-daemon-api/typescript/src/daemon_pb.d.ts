@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2022 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
  * See License-AGPL.txt in the project root for license information.
  */
@@ -136,6 +136,8 @@ export namespace WaitForInitResponse {
 export class TakeSnapshotRequest extends jspb.Message {
     getId(): string;
     setId(value: string): TakeSnapshotRequest;
+    getReturnImmediately(): boolean;
+    setReturnImmediately(value: boolean): TakeSnapshotRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): TakeSnapshotRequest.AsObject;
@@ -150,6 +152,7 @@ export class TakeSnapshotRequest extends jspb.Message {
 export namespace TakeSnapshotRequest {
     export type AsObject = {
         id: string,
+        returnImmediately: boolean,
     }
 }
 

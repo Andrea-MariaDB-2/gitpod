@@ -5,46 +5,43 @@
  */
 
 import { inject, injectable } from "inversify";
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 
 import { GitpodTableDescriptionProvider, TableDescription } from "./tables";
 import { TypeORM } from "./typeorm/typeorm";
+import { repeat } from "@gitpod/gitpod-protocol/lib/util/repeat";
 
 @injectable()
 export class PeriodicDbDeleter {
-
     @inject(GitpodTableDescriptionProvider) protected readonly tableProvider: GitpodTableDescriptionProvider;
     @inject(TypeORM) protected readonly typeORM: TypeORM;
 
     start() {
-        log.error("[PeriodicDbDeleter] Start ...")
-        this.sync().catch(err => log.error("[PeriodicDbDeleter] sync failed", err));
+        log.error("[PeriodicDbDeleter] Start ...");
+        this.sync().catch((err) => log.error("[PeriodicDbDeleter] sync failed", err));
     }
 
     protected async sync() {
-        await this.doSync();
-        await new Promise(resolve => setTimeout(resolve, 1001));
-        this.sync().catch(err => log.error("[PeriodicDbDeleter] sync failed", err));
-    }
-    protected async doSync() {
-        const sortedTables = this.tableProvider.getSortedTables();
-        const toBeDeleted: { table: string, deletions: string[] }[] = [];
-        for (const table of sortedTables) {
-            toBeDeleted.push(await this.collectRowsToBeDeleted(table));
-        }
-        // when collecting the deletions do so in the inverse order as during update (delete dependency targes first)
-        for (const { deletions } of toBeDeleted.reverse()) {
-            for (const deletion of deletions) {
-                try {
-                    await this.query(deletion);
-                } catch (error) {
-                    log.error(`[PeriodicDbDeleter] sync error`, error);
+        const doSync = async () => {
+            const sortedTables = this.tableProvider.getSortedTables();
+            const toBeDeleted: { table: string; deletions: string[] }[] = [];
+            for (const table of sortedTables) {
+                toBeDeleted.push(await this.collectRowsToBeDeleted(table));
+            }
+            // when collecting the deletions do so in the inverse order as during update (delete dependency targes first)
+            const pendingDeletions: Promise<void>[] = [];
+            for (const { deletions } of toBeDeleted.reverse()) {
+                for (const deletion of deletions) {
+                    pendingDeletions.push(
+                        this.query(deletion).catch((err) => log.error(`[PeriodicDbDeleter] sync error`, err)),
+                    );
                 }
             }
-        }
+            await Promise.all(pendingDeletions);
+        };
+        repeat(doSync, 30000); // deletion is never time-critical, so we should ensure we do not spam ourselves
     }
-    protected async collectRowsToBeDeleted(table: TableDescription): Promise<{ table: string, deletions: string[] }> {
+    protected async collectRowsToBeDeleted(table: TableDescription): Promise<{ table: string; deletions: string[] }> {
         try {
             await this.query(`SELECT COUNT(1) FROM ${table.name}`);
         } catch (err) {
@@ -59,11 +56,13 @@ export class PeriodicDbDeleter {
         }
 
         const { deletionColumn, primaryKeys } = table;
-        const markedAsDeletedQuery = `SELECT ${primaryKeys.join(', ')} FROM ${table.name} WHERE ${deletionColumn} = true ;`;
+        const markedAsDeletedQuery = `SELECT ${primaryKeys.join(", ")} FROM ${
+            table.name
+        } WHERE ${deletionColumn} = true ;`;
         const rows = await this.query(markedAsDeletedQuery);
 
-        const whereClauseFn = (row: any) => primaryKeys.map(pk => `${pk}='${row[pk]}'`).join(" AND ");
-        for(const i in rows) {
+        const whereClauseFn = (row: any) => primaryKeys.map((pk) => `${pk}='${row[pk]}'`).join(" AND ");
+        for (const i in rows) {
             const row = rows[i];
             const whereClause = whereClauseFn(row);
             deletions.push(`DELETE FROM ${table.name} WHERE ${whereClause};`);
@@ -81,6 +80,4 @@ export class PeriodicDbDeleter {
     protected get connection() {
         return this.typeORM.getConnection();
     }
-
 }
-

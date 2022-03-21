@@ -21,13 +21,29 @@ import (
 	"github.com/gitpod-io/gitpod/supervisor/pkg/terminal"
 )
 
-var skipCommand = "echo \"skip\""
-var failCommand = "exit 1"
+var (
+	skipCommand = "echo \"skip\""
+	failCommand = "exit 1"
+)
 
-var testEnv = &map[string]interface{}{
-	"object": map[string]interface{}{"baz": 3},
+var exampleEnvVarInputs = &map[string]interface{}{
+	"JSON_ENV_VAR":     map[string]interface{}{"property": "some string"},
+	"JSON_ESCAPED_VAR": "{\"property\":\"some escaped string\"}",
+	"JSON_ARRAY_VAR":   []string{"Hello", "World"},
+	"STRING_ENV_VAR":   "stringEnvironmentVariable",
+	"BOOLEAN_ENV_VAR":  false,
+	"NULL_ENV_VAR":     nil,
+	"NUMBER_ENV_VAR":   10,
 }
-var testEnvCommand = `test $object == "{\"baz\":3}"`
+var (
+	testJSONObjectCommand = `test "$JSON_ENV_VAR" == '{"property":"some string"}'`
+	testEscapedJSONObject = `test "$JSON_ESCAPED_VAR" == '{"property":"some escaped string"}'`
+	testJSONArrayCommand  = `test "$JSON_ARRAY_VAR" == "[\"Hello\",\"World\"]"`
+	testStringEnvCommand  = `test "$STRING_ENV_VAR" == "stringEnvironmentVariable"`
+	testBooleanEnvCommand = `test "$BOOLEAN_ENV_VAR" == false`
+	testNullEnvCommand    = `test "$NULL_ENV_VAR" == null`
+	testNumberEnvCommand  = `test "$NUMBER_ENV_VAR" == 10`
+)
 
 func TestTaskManager(t *testing.T) {
 	log.Log.Logger.SetLevel(logrus.FatalLevel)
@@ -105,10 +121,76 @@ func TestTaskManager(t *testing.T) {
 			},
 		},
 		{
-			Desc:        "env var parsing",
+			Desc:        "JSON object converted to plain text object",
 			Headless:    true,
 			Source:      csapi.WorkspaceInitFromOther,
-			GitpodTasks: &[]TaskConfig{{Init: &testEnvCommand, Env: testEnv}},
+			GitpodTasks: &[]TaskConfig{{Init: &testJSONObjectCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Escaped JSON converts to JSON",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testEscapedJSONObject, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "JSON array is treated as plain array",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testJSONArrayCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "String environment variable is not treated as JSON (extra quotes are stripped)",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testStringEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Boolean environment variable is treated as a boolean",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testBooleanEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Null environment variable is treated as null",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testNullEnvCommand, Env: exampleEnvVarInputs}},
+
+			ExpectedReporter: testHeadlessTaskProgressReporter{
+				Done:    true,
+				Success: true,
+			},
+		},
+		{
+			Desc:        "Number environment variable is treated as number",
+			Headless:    true,
+			Source:      csapi.WorkspaceInitFromOther,
+			GitpodTasks: &[]TaskConfig{{Init: &testNumberEnvCommand, Env: exampleEnvVarInputs}},
 
 			ExpectedReporter: testHeadlessTaskProgressReporter{
 				Done:    true,
@@ -156,7 +238,6 @@ func TestTaskManager(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 type testHeadlessTaskProgressReporter struct {
