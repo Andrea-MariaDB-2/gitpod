@@ -1,4 +1,4 @@
-image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:prs-update-dep.2
+image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:kyleb-kubecdl-qol.0
 workspaceLocation: gitpod/gitpod-ws.code-workspace
 checkoutLocation: gitpod
 ports:
@@ -12,15 +12,21 @@ ports:
     onOpen: ignore
   - port: 4000
     onOpen: ignore
+  # VNC
+  - port: 5900
+    onOpen: ignore
+  # noVNC
+  - port: 6080
+    onOpen: ignore
+  # Werft
+  - port: 7777
+    onOpen: ignore
   - port: 9229
     onOpen: ignore
   # Go proxy
   - port: 9999
     onOpen: ignore
   - port: 13001
-    onOpen: ignore
-  # Werft
-  - port: 7777
     onOpen: ignore
   # Dev Theia
   - port: 13444
